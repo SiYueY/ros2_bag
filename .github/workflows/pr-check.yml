@@ -1,0 +1,29 @@
+name: Phase 0 L1
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  humble-amd64:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Verify pinned dependencies
+        run: bash tools/verify-submodules.sh
+      - name: Check project C++ and shell style
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y clang-format-14 shellcheck
+          python3 tools/format-cpp.py --check
+          shellcheck -S warning tools/*.sh scripts/*.sh ros2_bag bag_cli bag_web
+      - name: Native Humble build and probes
+        run: bash tools/ci-platform.sh humble amd64
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: phase0-l1-${{ github.sha }}
+          path: build/ci-evidence
+          retention-days: 30

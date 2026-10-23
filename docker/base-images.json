@@ -1,0 +1,16 @@
+{
+  "humble": {
+    "image": "ros:humble-ros-base@sha256:566b87e6dfc48392189a9c32e594e84060fa9948de93b04e536f39475a1f6963",
+    "platforms": {
+      "amd64": "sha256:fea7dd1577580a53209dc2e9456cd8d6ef13704a09a8f12914e0867f6861ea9a",
+      "arm64": "sha256:49472ce5ac155365329a6366ea332610efcdb613de73c802299ac7bc6cd4454d"
+    }
+  },
+  "jazzy": {
+    "image": "ros:jazzy-ros-base@sha256:103b6c417973394659af6804d4917cd489b91e5ed22eb7bef263025a3bed2410",
+    "platforms": {
+      "amd64": "sha256:5d90c49a855d75d2a5de6b8836ca49ac2248746b0748d66da79dcaf006225d63",
+      "arm64": "sha256:d02ae40522e8eb671547efef8ab97c326a62c9efd3a25e48ff3cbe506972edd2"
+    }
+  }
+}

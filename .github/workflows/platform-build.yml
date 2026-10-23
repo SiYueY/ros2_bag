@@ -1,0 +1,35 @@
+name: Phase 0 L2 native matrix
+on:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '20 19 * * *'
+permissions:
+  contents: read
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { distro: humble, arch: amd64, runner: ubuntu-22.04 }
+          - { distro: humble, arch: arm64, runner: ubuntu-24.04-arm }
+          - { distro: jazzy, arch: amd64, runner: ubuntu-24.04 }
+          - { distro: jazzy, arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Verify native architecture and build pinned ROS container
+        run: bash tools/ci-platform.sh '${{ matrix.distro }}' '${{ matrix.arch }}'
+      - name: Record custom closure and parse without fixture interfaces
+        run: bash tools/test-ac55-platform.sh '${{ matrix.distro }}'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: phase0-${{ matrix.distro }}-${{ matrix.arch }}-${{ github.sha }}
+          path: build/ci-evidence
+          retention-days: 30

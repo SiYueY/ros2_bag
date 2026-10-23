@@ -1,0 +1,7 @@
+# Original v4.3.3 Phase 0 storage baseline.
+compression: Lz4
+compressionLevel: Fastest
+chunkSize: 786432
+noChunking: false
+noMessageIndex: false
+noSummary: false

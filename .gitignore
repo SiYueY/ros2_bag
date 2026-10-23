@@ -66,3 +66,12 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# ROS and Python generated artifacts
+install/
+log/
+__pycache__/
+*.pyc
+
+# Local validation outputs: logs, manifests, generated MCAP bags and checksums
+/docs/evidence/

@@ -1,0 +1,10 @@
+build
+build-*
+install
+log
+.cache
+__pycache__
+docs/evidence
+.agents
+.codex
+.aws

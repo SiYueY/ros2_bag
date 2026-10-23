@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Web features belong to Phase 2; never start a fake recording service.
+echo 'BLOCKED: Phase 0 skeleton; Web recording control is not implemented.' >&2
+exit 2
