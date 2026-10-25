@@ -7,10 +7,7 @@
 
 namespace ros2_bag::phase0 {
 // Throws runtime_error on a false condition; no shared state is touched.
-inline void require(
-    bool condition,
-    const std::string& description
-) {
+inline void require(bool condition, const std::string& description) {
     if (!condition) {
         throw std::runtime_error(description);
     }

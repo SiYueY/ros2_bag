@@ -2,12 +2,12 @@
 <package format="3">
   <name>ros2_bag</name>
   <version>0.0.0</version>
-  <description>Phase 0 capability probes for the ros2_bag V1.0 design.</description>
-  <maintainer email="maintainers@example.invalid">ros2_bag maintainers</maintainer>
+  <description>ROS 2 C++17 Recorder core and standalone development runtime.</description>
+  <maintainer email="zhao.dongsheng@outlook.com">SiYueY</maintainer>
   <license>Apache-2.0</license>
   <buildtool_depend>ament_cmake</buildtool_depend>
   <depend>rclcpp</depend>
-  <depend>std_msgs</depend>
+  <test_depend>std_msgs</test_depend>
   <depend>rosbag2_cpp</depend>
   <depend>rosbag2_storage</depend>
   <exec_depend>rmw_fastrtps_cpp</exec_depend>

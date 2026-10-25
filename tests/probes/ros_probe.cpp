@@ -53,28 +53,19 @@ std::shared_ptr<rclcpp::SerializedMessage> serialize(std::uint64_t sequence) {
     const std::shared_ptr<rclcpp::SerializedMessage> serialized =
         std::make_shared<rclcpp::SerializedMessage>();
     rclcpp::Serialization<std_msgs::msg::UInt64> serializer;
-    serializer.serialize_message(
-        &value,
-        serialized.get()
-    );
+    serializer.serialize_message(&value, serialized.get());
     return serialized;
 }
 
 std::uint64_t deserialize(const rclcpp::SerializedMessage& message) {
     std_msgs::msg::UInt64 value;
     rclcpp::Serialization<std_msgs::msg::UInt64> serializer;
-    serializer.deserialize_message(
-        &message,
-        &value
-    );
+    serializer.deserialize_message(&message, &value);
     return value.data;
 }
 
 void ownership_probe(PoolMode mode) {
-    const std::shared_ptr<PoolState> pool = std::make_shared<PoolState>(
-        kPoolCapacity,
-        mode
-    );
+    const std::shared_ptr<PoolState> pool = std::make_shared<PoolState>(kPoolCapacity, mode);
     const std::shared_ptr<rclcpp::Node> node = std::make_shared<rclcpp::Node>("phase0_ownership");
     const rclcpp::CallbackGroup::SharedPtr group =
         node->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
@@ -91,15 +82,11 @@ void ownership_probe(PoolMode mode) {
         [&](std::shared_ptr<rclcpp::SerializedMessage> serialized) {
             try {
                 MessageHandle handle = pool->acquire();
-                require(
-                    static_cast<bool>(handle),
-                    "ROS callback pool exhausted"
-                );
+                require(static_cast<bool>(handle), "ROS callback pool exhausted");
                 const auto& bytes = serialized->get_rcl_serialized_message();
                 require(
                     bytes.allocator.allocate != nullptr && bytes.allocator.deallocate != nullptr,
-                    "invalid callback allocator"
-                );
+                    "invalid callback allocator");
                 handle->payload_owner = serialized;
                 handle->payload_bytes = bytes.buffer_length;
                 const std::lock_guard<std::mutex> lock(capture_mutex);
@@ -112,17 +99,12 @@ void ownership_probe(PoolMode mode) {
             // on more than one callback thread, not a synthetic executor mock.
             std::this_thread::sleep_for(kCallbackOverlap);
         },
-        options
-    );
+        options);
     const rclcpp::Publisher<std_msgs::msg::UInt64>::SharedPtr publisher =
         node->create_publisher<std_msgs::msg::UInt64>(
             kTopic,
-            rclcpp::QoS(kPoolCapacity).reliable()
-        );
-    rclcpp::executors::MultiThreadedExecutor executor(
-        rclcpp::ExecutorOptions{},
-        kThreads
-    );
+            rclcpp::QoS(kPoolCapacity).reliable());
+    rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions{}, kThreads);
     executor.add_node(node);
     std::thread spinner([&executor]() { executor.spin(); });
     const auto deadline = std::chrono::steady_clock::now() + kDeadline;
@@ -150,18 +132,9 @@ void ownership_probe(PoolMode mode) {
     executor.cancel();
     spinner.join();
     executor.remove_node(node);
-    require(
-        matched,
-        "DDS reliable publisher/subscriber never matched"
-    );
-    require(
-        !callback_failed.load() && captured.size() == kSamples,
-        "lost callback messages"
-    );
-    require(
-        worker_ids.size() > 1,
-        "multiple executor callback threads not observed"
-    );
+    require(matched, "DDS reliable publisher/subscriber never matched");
+    require(!callback_failed.load() && captured.size() == kSamples, "lost callback messages");
+    require(worker_ids.size() > 1, "multiple executor callback threads not observed");
 
     std::this_thread::sleep_for(kConsumerDelay);
     std::set<std::uint64_t> sequences;
@@ -171,58 +144,40 @@ void ownership_probe(PoolMode mode) {
         const auto& bytes = serialized->get_rcl_serialized_message();
         require(
             bytes.buffer == item.buffer && bytes.buffer_length == item.length,
-            "forwarding changed payload storage"
-        );
+            "forwarding changed payload storage");
         sequences.insert(deserialize(*serialized));
     }
     require(
         sequences.size() == kSamples && *sequences.begin() == 0 &&
             *sequences.rbegin() == kSamples - 1,
-        "delayed payload content corrupt"
-    );
+        "delayed payload content corrupt");
     captured.clear();
     pool->release_thread_cache();
     const PoolSnapshot state = pool->snapshot();
     require(
         state.in_use == 0 && state.tls_free == 0 && state.global_free == kPoolCapacity &&
             state.fallback_in_use == 0 && state.internal_errors == 0,
-        "Executor TLS did not return all fixed nodes"
-    );
+        "Executor TLS did not return all fixed nodes");
     std::cout << "PASS ownership mode=" << (mode == PoolMode::Tls ? "tls" : "global_mutex")
               << " samples=" << sequences.size() << " callback_threads=" << worker_ids.size()
               << " delay_ms=500 buffer_identity=preserved allocator=valid\n";
 }
 
-void register_topic(
-    rosbag2_cpp::Writer& writer,
-    const rosbag2_storage::TopicMetadata& topic
-) {
+void register_topic(rosbag2_cpp::Writer& writer, const rosbag2_storage::TopicMetadata& topic) {
 #ifdef ROS2_BAG_JAZZY
     rosbag2_cpp::LocalMessageDefinitionSource definitions;
     const rosbag2_storage::MessageDefinition definition = definitions.get_full_text(topic.type);
-    require(
-        !definition.encoded_message_definition.empty(),
-        "empty explicit MessageDefinition"
-    );
-    writer.create_topic(
-        topic,
-        definition
-    );
+    require(!definition.encoded_message_definition.empty(), "empty explicit MessageDefinition");
+    writer.create_topic(topic, definition);
 #else
     writer.create_topic(topic);
 #endif
 }
 
-void writer_probe(
-    const std::filesystem::path& base,
-    const std::string& storage_config
-) {
+void writer_probe(const std::filesystem::path& base, const std::string& storage_config) {
     const std::filesystem::path root =
         base / std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
-    require(
-        !std::filesystem::exists(root),
-        "probe bag destination already exists"
-    );
+    require(!std::filesystem::exists(root), "probe bag destination already exists");
     std::filesystem::create_directories(root);
     const std::shared_ptr<rclcpp::SerializedMessage> payload = serialize(kExpectedPayload);
     const std::uint8_t* original = payload->get_rcl_serialized_message().buffer;
@@ -238,58 +193,38 @@ void writer_probe(
         topic.name = kTopic;
         topic.type = kType;
         topic.serialization_format = "cdr";
-        register_topic(
-            writer,
-            topic
-        );
+        register_topic(writer, topic);
         for (std::size_t index = 0; index < kSamples; ++index) {
             writer.write(
-                bind_payload(
-                    payload,
-                    kEpochNs + static_cast<std::int64_t>(index),
-                    kTopic
-                ));
+                bind_payload(payload, kEpochNs + static_cast<std::int64_t>(index), kTopic));
         }
         writer.close();
         require(
             payload->get_rcl_serialized_message().buffer == original,
-            "Writer stole original payload"
-        );
-        require(
-            deserialize(*payload) == kExpectedPayload,
-            "snapshot owner emptied by Writer"
-        );
+            "Writer stole original payload");
+        require(deserialize(*payload) == kExpectedPayload, "snapshot owner emptied by Writer");
         rosbag2_cpp::Reader reader;
         reader.open(storage);
         std::size_t count = 0;
         while (reader.has_next()) {
             const auto message = reader.read_next();
             rclcpp::SerializedMessage serialized(*message->serialized_data);
-            require(
-                deserialize(serialized) == kExpectedPayload,
-                "MCAP payload mismatch"
-            );
+            require(deserialize(serialized) == kExpectedPayload, "MCAP payload mismatch");
 #ifdef ROS2_BAG_JAZZY
             require(
                 message->recv_timestamp == kEpochNs + static_cast<std::int64_t>(count),
-                "MCAP receive timestamp mismatch"
-            );
+                "MCAP receive timestamp mismatch");
             require(
                 message->send_timestamp == message->recv_timestamp - 1,
-                "MCAP send timestamp mismatch"
-            );
+                "MCAP send timestamp mismatch");
 #else
             require(
                 message->time_stamp == kEpochNs + static_cast<std::int64_t>(count),
-                "MCAP timestamp mismatch"
-            );
+                "MCAP timestamp mismatch");
 #endif
             ++count;
         }
-        require(
-            count == kSamples,
-            "MCAP count mismatch"
-        );
+        require(count == kSamples, "MCAP count mismatch");
     }
     std::cout << "bag_root=" << root << "\n";
     std::cout << "PASS writer segments=2 messages_per_segment=100 snapshot_replay=valid\n";
@@ -298,12 +233,8 @@ void writer_probe(
 void rewrite_custom_probe(
     const std::string& source,
     const std::string& destination,
-    const std::string& storage_config
-) {
-    require(
-        !std::filesystem::exists(destination),
-        "custom probe refuses to overwrite output"
-    );
+    const std::string& storage_config) {
+    require(!std::filesystem::exists(destination), "custom probe refuses to overwrite output");
     rosbag2_storage::StorageOptions input;
     input.uri = source;
     input.storage_id = "mcap";
@@ -317,10 +248,7 @@ void rewrite_custom_probe(
     rosbag2_cpp::Writer writer;
     writer.open(output);
     for (const rosbag2_storage::TopicMetadata& topic : reader.get_all_topics_and_types()) {
-        register_topic(
-            writer,
-            topic
-        );
+        register_topic(writer, topic);
     }
     std::size_t count = 0;
     while (reader.has_next()) {
@@ -328,10 +256,7 @@ void rewrite_custom_probe(
         ++count;
     }
     writer.close();
-    require(
-        count == 20,
-        "custom fixture count mismatch"
-    );
+    require(count == 20, "custom fixture count mismatch");
     std::cout << "PASS C++ custom WriterAdapter registration/writes count=" << count << '\n';
 }
 
@@ -340,20 +265,14 @@ void transport_probe(bool publish) {
         publish ? "phase0_transport_publisher" : "phase0_transport_subscriber");
     const rclcpp::QoS qos = rclcpp::QoS(kPoolCapacity).reliable().transient_local();
     if (publish) {
-        const auto publisher = node->create_publisher<std_msgs::msg::UInt64>(
-            kTopic,
-            qos
-        );
+        const auto publisher = node->create_publisher<std_msgs::msg::UInt64>(kTopic, qos);
         const auto deadline = std::chrono::steady_clock::now() + kDeadline;
         while (publisher->get_subscription_count() == 0 &&
                std::chrono::steady_clock::now() < deadline) {
             rclcpp::spin_some(node);
             std::this_thread::sleep_for(kPoll);
         }
-        require(
-            publisher->get_subscription_count() > 0,
-            "transport QoS/discovery not matched"
-        );
+        require(publisher->get_subscription_count() > 0, "transport QoS/discovery not matched");
         for (std::size_t index = 0; index < kSamples; ++index) {
             std_msgs::msg::UInt64 value;
             value.data = index;
@@ -374,8 +293,7 @@ void transport_probe(bool publish) {
             if (sequences.insert(deserialize(*message)).second) {
                 received.push_back(std::move(message));
             }
-        }
-    );
+        });
     const auto deadline = std::chrono::steady_clock::now() + kDeadline;
     while (sequences.size() < kSamples && std::chrono::steady_clock::now() < deadline) {
         rclcpp::spin_some(node);
@@ -384,8 +302,7 @@ void transport_probe(bool publish) {
     require(
         sequences.size() == kSamples && *sequences.begin() == 0 &&
             *sequences.rbegin() == kSamples - 1,
-        "transport did not receive all unique sequences"
-    );
+        "transport did not receive all unique sequences");
     // Persist actual received CDR, not regenerated publisher values. A unique
     // directory keeps repeated network experiments independent of earlier bags.
     const std::filesystem::path bag =
@@ -401,17 +318,10 @@ void transport_probe(bool publish) {
     topic.name = kTopic;
     topic.type = kType;
     topic.serialization_format = "cdr";
-    register_topic(
-        writer,
-        topic
-    );
+    register_topic(writer, topic);
     for (std::size_t index = 0; index < received.size(); ++index) {
         writer.write(
-            bind_payload(
-                received[index],
-                kEpochNs + static_cast<std::int64_t>(index),
-                kTopic
-            ));
+            bind_payload(received[index], kEpochNs + static_cast<std::int64_t>(index), kTopic));
     }
     writer.close();
     rosbag2_cpp::Reader reader;
@@ -424,24 +334,15 @@ void transport_probe(bool publish) {
         persisted.insert(deserialize(payload));
         ++count;
     }
-    require(
-        count == kSamples && persisted == sequences,
-        "DDS MCAP count/value mismatch"
-    );
+    require(count == kSamples && persisted == sequences, "DDS MCAP count/value mismatch");
     std::cout << "PASS transport MCAP received_messages=" << count << " bag=" << bag << '\n';
     std::cout << "PASS transport subscriber unique_sequences=100 qos=reliable,transient_local\n";
 }
 }  // namespace
 }  // namespace ros2_bag::phase0
 
-int main(
-    int argc,
-    char** argv
-) {
-    rclcpp::init(
-        argc,
-        argv
-    );
+int main(int argc, char** argv) {
+    rclcpp::init(argc, argv);
     int result = 0;
     try {
         const std::string mode = argc > 1 ? argv[1] : "ownership";
@@ -449,16 +350,9 @@ int main(
             ros2_bag::phase0::ownership_probe(ros2_bag::phase0::PoolMode::Tls);
             ros2_bag::phase0::ownership_probe(ros2_bag::phase0::PoolMode::GlobalMutex);
         } else if (mode == "writer" && argc == 4) {
-            ros2_bag::phase0::writer_probe(
-                argv[2],
-                argv[3]
-            );
+            ros2_bag::phase0::writer_probe(argv[2], argv[3]);
         } else if (mode == "rewrite-custom" && argc == 5) {
-            ros2_bag::phase0::rewrite_custom_probe(
-                argv[2],
-                argv[3],
-                argv[4]
-            );
+            ros2_bag::phase0::rewrite_custom_probe(argv[2], argv[3], argv[4]);
         } else if (mode == "publish" || mode == "subscribe") {
             ros2_bag::phase0::transport_probe(mode == "publish");
         } else {

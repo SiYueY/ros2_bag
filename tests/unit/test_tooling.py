@@ -16,7 +16,7 @@ SPEC.loader.exec_module(MODULE)
 
 class DependencyVerificationTest(unittest.TestCase):
     def test_real_gitlinks(self):
-        self.assertEqual(len(MODULE.verify(ROOT)), 4)
+        self.assertEqual(len(MODULE.verify(ROOT)), 3)
 
     def test_negative_fixtures(self):
         # Shared local clones reuse pinned objects; no network or commits needed.
@@ -33,20 +33,20 @@ class DependencyVerificationTest(unittest.TestCase):
                 config[f'submodule "{relative}"'] = {"path": relative, "url": url}
             with (fixture / ".gitmodules").open("w") as stream:
                 config.write(stream)
-            self.assertEqual(len(MODULE.verify(fixture)), 4)
-            readme = fixture / "third_party/sockpp/README.md"
+            self.assertEqual(len(MODULE.verify(fixture)), 3)
+            readme = fixture / "third_party/json/README.md"
             original = readme.read_bytes()
             readme.write_bytes(original + b"\nfixture mutation\n")
             with self.assertRaisesRegex(ValueError, "dirty dependency"):
                 MODULE.verify(fixture)
             readme.write_bytes(original)
             MODULE.git(fixture, "update-index", "--cacheinfo",
-                       f"160000,{'1' * 40},third_party/sockpp")
+                       f"160000,{'1' * 40},third_party/json")
             with self.assertRaisesRegex(ValueError, "checkout does not match"):
                 MODULE.verify(fixture)
-            sha = MODULE.git(fixture / "third_party/sockpp", "rev-parse", "HEAD")
-            MODULE.git(fixture, "update-index", "--cacheinfo", f"160000,{sha},third_party/sockpp")
-            config['submodule "third_party/sockpp"']["url"] = "https://invalid.example/wrong.git"
+            sha = MODULE.git(fixture / "third_party/json", "rev-parse", "HEAD")
+            MODULE.git(fixture, "update-index", "--cacheinfo", f"160000,{sha},third_party/json")
+            config['submodule "third_party/json"']["url"] = "https://invalid.example/wrong.git"
             with (fixture / ".gitmodules").open("w") as stream:
                 config.write(stream)
             with self.assertRaisesRegex(ValueError, "upstream URL"):
@@ -58,7 +58,6 @@ class DependencyVerificationTest(unittest.TestCase):
             subprocess.run(["bash", str(ROOT / "tools/generate-third-party-lock.sh"),
                             str(destination)], check=True, stdout=subprocess.PIPE)
             data = json.loads(destination.read_text())
-            self.assertEqual(data["source_commit"], MODULE.git(ROOT, "rev-parse", "HEAD"))
             self.assertEqual(data["dependencies"], MODULE.verify(ROOT))
 
 

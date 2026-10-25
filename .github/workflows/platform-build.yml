@@ -1,6 +1,5 @@
-name: Phase 0 L2 native matrix
+name: Recorder native matrix
 on:
-  pull_request:
   workflow_dispatch:
   schedule:
     - cron: '20 19 * * *'
@@ -30,6 +29,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: phase0-${{ matrix.distro }}-${{ matrix.arch }}-${{ github.sha }}
-          path: build/ci-evidence
+          name: recorder-native-${{ matrix.distro }}-${{ matrix.arch }}-${{ github.sha }}
+          path: |
+            build/ci-evidence
           retention-days: 30

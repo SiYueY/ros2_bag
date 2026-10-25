@@ -1,8 +1,0 @@
-#!/usr/bin/env bash
-# Phase 0 dispatch skeleton; only the recorder capability marker is executable.
-set -euo pipefail
-task_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-case "${1:-}" in
-    recorder) shift; exec "$task_root/scripts/launch_recorder.sh" "$@" ;;
-    *) echo 'Phase 0 only. Usage: ros2_bag recorder --phase0-info' >&2; exit 2 ;;
-esac

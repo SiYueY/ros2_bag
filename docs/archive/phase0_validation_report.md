@@ -1,6 +1,10 @@
+> **CURRENT STATUS: HISTORICAL VALIDATION.** 本报告保留阶段性验证与未完成项，不代表当前 Recorder Only 的产品发布批准。
+
 # Phase 0 validation report
 
-Date: 2026-10-23 (Asia/Shanghai). Design: v4.3.3. Scope: Phase 0 only.
+Date: 2026-10-23 (Asia/Shanghai). Design evidence was collected before v4.3.8;
+this report is retained as Phase 0 evidence and is reviewed against v4.3.8 by
+`docs/g0_admission_review.md`. Scope: Phase 0 only.
 
 **Exit result: BLOCKED. Phase 0 has not passed; dependent Phase 1 work may not start.**
 

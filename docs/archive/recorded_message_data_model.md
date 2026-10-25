@@ -1,10 +1,12 @@
+> **CURRENT STATUS: HISTORICAL RESEARCH.** 本文保留当时 Payload / Pool 方案论证与验证边界，是否符合当前 Recorder 以代码和最新测试为准。
+
 # Phase 0 SerializedPayload decision — pending final review
 
-Date: 2026-10-23 (Asia/Shanghai). Design: ros2_bag v4.3.3.
+Date: 2026-10-24 (Asia/Shanghai). Design: ros2_bag v4.3.8.
 
 ## Decision and precise representation
 
-The **technically recommended candidate is model A**:
+The **technically recommended candidate remains model A**:
 
 ```cpp
 std::shared_ptr<rclcpp::SerializedMessage>
@@ -45,7 +47,7 @@ sizes do not constitute the robot's production size distribution.
 
 ## WriterAdapter and snapshot boundary
 
-The actual C++ writer probe writes the same retained payload into two independent
+The Phase 0 C++ writer probe writes the same retained payload into two independent
 MCAP bags, closes each and independently reads all 100 values and timestamps.
 The payload remains valid after the first close and can be replayed into the next
 bag. This specifically covers the mutable shared_ptr overload's buffer-transfer
@@ -68,6 +70,39 @@ the independent PlotJuggler loader/parser matrix without the original message pa
 The additional official Humble build exercises rosbag2_cpp 0.15.17 as well as the
 original container's 0.15.16; this is recorded separately in the final C++ logs.
 
+## Formal WriterAdapter owner boundary
+
+`WriterAdapter` no longer retains a `SerializedMessage` per segment. Its
+temporary `SerializedBagMessage` descriptor retains the original owner only for
+the duration of `Writer::write()`. This keeps one descriptor allocation but does
+not add a CDR payload copy.
+
+The production configuration requires `max_cache_size=0`. Source inspection of
+the Humble SequentialWriter implementation shows that this path directly calls
+the storage plugin rather than `MessageCache`; the MCAP plugin holds its storage
+mutex, passes the buffer to `McapWriter::write()`, and returns from that call
+before `Writer::write()` returns. Jazzy has the same configured public
+rosbag2/MCAP use path, and its installed 0.26.11 API was compiled and exercised.
+This source conclusion is backed by `writer_adapter_lifetime_test`: each of
+20,000 1 KiB-class owned CDR messages is written, its application owner is
+released immediately after `write()`, and the weak owner must expire before the
+next message. The complete MCAP file is then deserialized and compared message
+by message.
+
+Humble 0.15.17 and Jazzy 0.26.11 Debug runs passed the 20,000-message test. A
+Humble ASan run also passed with `abort_on_error=1` and `detect_leaks=0` because
+the prebuilt ROS dependency tuple has an unrelated LeakSanitizer limitation.
+The five-minute, 100 Hz Humble RSS regression is separate from CTest and uses
+the design's 1 MiB/min linear-regression threshold. The executed 30,000-message
+run measured 0.0126594 MiB/min and completed MCAP readback; this is an AMD64
+writer-path result, not a whole-Recorder performance claim.
+
+This validates that Model A has a bounded Recorder-side writer ownership
+boundary on AMD64 for the fixed `max_cache_size=0` MCAP configuration. It does
+not claim that DDS transport or MCAP compression performs zero copies, nor does
+it approve Model A for G0: native ARM64, the Humble dependency-stack TSan risk,
+and designated-reviewer decisions remain separate gates.
+
 ## Pool boundary and alternatives
 
 Pool nodes own wrappers only; A uses zero cached-payload budgets. Snapshot owners
@@ -81,9 +116,9 @@ external-library mutex diagnostics, also reproduced by a minimal ROS node withou
 our pool. This remains an unresolved validation gate, not evidence to silently
 switch to Plan B or discard the pool.
 
-B is not needed because A works and snapshots require shared ownership. C would
-add an unnecessary full-payload copy here. D has no demonstrated allocation
-bottleneck justifying a slab implementation. Neither C nor D is implemented.
+Model B is not needed for the currently supported storage path. C would add an
+unnecessary full-payload copy, and D has no demonstrated allocation bottleneck
+justifying a slab implementation. Neither C nor D is implemented.
 
 ## Evidence
 
@@ -119,4 +154,5 @@ file hashes so the baseline is not mistaken for the tested source revision.
 
 验证时源代码 SHA：当时的基线 SHA 加未提交源码清单/哈希，见构建证据；后续本地提交不改写原始证据。
 
-仍需处理问题：ARM64、实际远端 CI/Runner、Humble ROS TSan 诊断及最终评审。
+仍需处理问题：native ARM64 复现、实际远端 CI/Runner、Humble ROS TSan
+诊断及最终评审。

@@ -13,38 +13,20 @@
 #include <PlotJuggler/dataloader_base.h>
 #include <PlotJuggler/messageparser_base.h>
 
-int main(
-    int argc,
-    char** argv
-) {
-    QApplication application(
-        argc,
-        argv
-    );
+int main(int argc, char** argv) {
+    QApplication application(argc, argv);
     try {
-        ros2_bag::phase0::require(
-            argc == 3,
-            "usage: phase0_plotjuggler_probe PREFIX MCAP_FILE"
-        );
+        ros2_bag::phase0::require(argc == 3, "usage: phase0_plotjuggler_probe PREFIX MCAP_FILE");
         const QString prefix = QString::fromLocal8Bit(argv[1]);
         QPluginLoader parser_loader(prefix + "/lib/plotjuggler/libParserROS2.so");
         QPluginLoader mcap_loader(prefix + "/lib/plotjuggler/libDataLoadMCAP.so");
         PJ::ParserFactoryPlugin* parser =
             qobject_cast<PJ::ParserFactoryPlugin*>(parser_loader.instance());
         PJ::DataLoader* loader = qobject_cast<PJ::DataLoader*>(mcap_loader.instance());
-        ros2_bag::phase0::require(
-            parser != nullptr,
-            parser_loader.errorString().toStdString()
-        );
-        ros2_bag::phase0::require(
-            loader != nullptr,
-            mcap_loader.errorString().toStdString()
-        );
+        ros2_bag::phase0::require(parser != nullptr, parser_loader.errorString().toStdString());
+        ros2_bag::phase0::require(loader != nullptr, mcap_loader.errorString().toStdString());
         PJ::ParserFactories factories;
-        const PJ::ParserFactoryPtr parser_reference(
-            parser,
-            [](PJ::ParserFactoryPlugin*) {}
-        );
+        const PJ::ParserFactoryPtr parser_reference(parser, [](PJ::ParserFactoryPlugin*) {});
         const QStringList encodings = QString::fromUtf8(parser->encoding()).split(';');
         for (const QString& encoding : encodings) {
             factories[encoding] = parser_reference;
@@ -54,40 +36,16 @@ int main(
         info.filename = QString::fromLocal8Bit(argv[2]);
         QDomElement root = info.plugin_config.createElement("plugin");
         QDomElement parameters = info.plugin_config.createElement("parameters");
-        parameters.setAttribute(
-            "use_timestamp",
-            0
-        );
-        parameters.setAttribute(
-            "use_mcap_log_time",
-            1
-        );
-        parameters.setAttribute(
-            "clamp_large_arrays",
-            0
-        );
-        parameters.setAttribute(
-            "max_array_size",
-            1000
-        );
-        parameters.setAttribute(
-            "selected_topics",
-            "/phase0/custom;/phase0/mixed"
-        );
+        parameters.setAttribute("use_timestamp", 0);
+        parameters.setAttribute("use_mcap_log_time", 1);
+        parameters.setAttribute("clamp_large_arrays", 0);
+        parameters.setAttribute("max_array_size", 1000);
+        parameters.setAttribute("selected_topics", "/phase0/custom;/phase0/mixed");
         root.appendChild(parameters);
         info.plugin_config.appendChild(root);
-        ros2_bag::phase0::require(
-            loader->xmlLoadState(root),
-            "MCAP plugin rejected saved options"
-        );
+        ros2_bag::phase0::require(loader->xmlLoadState(root), "MCAP plugin rejected saved options");
         PJ::PlotDataMapRef data;
-        ros2_bag::phase0::require(
-            loader->readDataFromFile(
-            &info,
-            data
-        ),
-            "MCAP loader failed"
-        );
+        ros2_bag::phase0::require(loader->readDataFromFile(&info, data), "MCAP loader failed");
         // Each expected scalar/array element is checked for every sample, not
         // merely the presence of a Topic or one successfully parsed field.
         std::map<std::string, std::pair<double, double>> expected;
@@ -109,64 +67,44 @@ int main(
         expected["/phase0/mixed/stamp/nanosec"] = {987654321.0, 0.0};
         ros2_bag::phase0::require(
             data.numeric.size() == expected.size(),
-            "numeric field set mismatch"
-        );
+            "numeric field set mismatch");
         constexpr std::size_t kSamples = 10;
         constexpr double kEpochSeconds = 1700000000.0;
         constexpr double kIntervalSeconds = 0.1;
         for (const auto& field : expected) {
             const auto found = data.numeric.find(field.first);
-            ros2_bag::phase0::require(
-                found != data.numeric.end(),
-                "missing field: " + field.first
-            );
+            ros2_bag::phase0::require(found != data.numeric.end(), "missing field: " + field.first);
             const PJ::PlotData& series = found->second;
-            ros2_bag::phase0::require(
-                series.size() == kSamples,
-                "parsed field count mismatch"
-            );
+            ros2_bag::phase0::require(series.size() == kSamples, "parsed field count mismatch");
             for (std::size_t index = 0; index < kSamples; ++index) {
                 const double sample = static_cast<double>(index);
                 const double value = field.second.first + sample * field.second.second;
                 ros2_bag::phase0::require(
                     std::abs(series.at(index).y - value) < 1e-9,
-                    "field value mismatch: " + field.first
-                );
+                    "field value mismatch: " + field.first);
                 ros2_bag::phase0::require(
                     std::abs(series.at(index).x - (kEpochSeconds + sample * kIntervalSeconds)) <
                         1e-5,
-                    "MCAP log timestamp mismatch: " + field.first
-                );
+                    "MCAP log timestamp mismatch: " + field.first);
             }
             std::cout << "PASS field=" << field.first << " samples=" << series.size() << '\n';
         }
-        ros2_bag::phase0::require(
-            data.strings.size() == 2,
-            "string field set mismatch"
-        );
+        ros2_bag::phase0::require(data.strings.size() == 2, "string field set mismatch");
         for (const std::string key :
              {"/phase0/custom/joints[0]/name", "/phase0/mixed/robot/joints[0]/name"}) {
             const auto found = data.strings.find(key);
-            ros2_bag::phase0::require(
-                found != data.strings.end(),
-                "missing joint name"
-            );
+            ros2_bag::phase0::require(found != data.strings.end(), "missing joint name");
             const PJ::StringSeries& series = found->second;
-            ros2_bag::phase0::require(
-                series.size() == kSamples,
-                "string sample count mismatch"
-            );
+            ros2_bag::phase0::require(series.size() == kSamples, "string sample count mismatch");
             for (std::size_t index = 0; index < kSamples; ++index) {
                 ros2_bag::phase0::require(
                     series.getString(series.at(index).y) == "joint_alpha",
-                    "string field mismatch"
-                );
+                    "string field mismatch");
                 ros2_bag::phase0::require(
                     std::abs(
                         series.at(index).x -
                         (kEpochSeconds + static_cast<double>(index) * kIntervalSeconds)) < 1e-5,
-                    "string timestamp mismatch"
-                );
+                    "string timestamp mismatch");
             }
             std::cout << "PASS field=" << key << " samples=" << series.size() << '\n';
         }

@@ -74,4 +74,3 @@ __pycache__/
 *.pyc
 
 # Local validation outputs: logs, manifests, generated MCAP bags and checksums
-/docs/evidence/

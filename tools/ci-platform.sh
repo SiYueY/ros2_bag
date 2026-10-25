@@ -17,9 +17,11 @@ task_image="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sy
     "$task_root/docker/base-images.json" "$task_distro")"
 mkdir -p "$task_root/build/ci-evidence"
 docker build --build-arg "BASE_IMAGE=$task_image" --build-arg "ROS_DISTRO=$task_distro" \
-    -f "$task_root/docker/Dockerfile" -t "ros2-bag-phase0:$task_distro-$task_arch" "$task_root" \
+    -f "$task_root/docker/Dockerfile" -t "ros2-bag:$task_distro-$task_arch" "$task_root" \
     2>&1 | tee "$task_root/build/ci-evidence/$task_distro-$task_arch-build.txt"
-docker image inspect "ros2-bag-phase0:$task_distro-$task_arch" \
+docker image inspect "ros2-bag:$task_distro-$task_arch" \
     > "$task_root/build/ci-evidence/$task_distro-$task_arch-image.json"
-docker run --rm "ros2-bag-phase0:$task_distro-$task_arch" \
+docker run --rm "ros2-bag:$task_distro-$task_arch" \
     2>&1 | tee "$task_root/build/ci-evidence/$task_distro-$task_arch-tests.txt"
+
+echo "PASS Recorder-only native validation: $task_distro/$task_arch"

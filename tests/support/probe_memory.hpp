@@ -68,8 +68,7 @@ public:
     PoolState(
         std::size_t capacity,
         PoolMode mode,
-        std::size_t fallback_limit = kDefaultFallbackLimit
-    )
+        std::size_t fallback_limit = kDefaultFallbackLimit)
     : storage_(std::make_unique<Node[]>(capacity)),
       capacity_(capacity),
       mode_(mode),
@@ -104,10 +103,7 @@ public:
 
     // Validates and returns a borrowed node; called only by its unique owner.
     // No I/O; noexcept. Invalid input is diagnosed and not blindly freed.
-    void release(
-        RecordedMessage* message,
-        Node* cookie
-    ) noexcept;
+    void release(RecordedMessage* message, Node* cookie) noexcept;
 
 private:
     struct LocalCache {
@@ -185,50 +181,31 @@ inline MessageHandle PoolState::acquire() {
         }
     }
     if (node != nullptr) {
-        require(
-            !node->borrowed.exchange(true),
-            "duplicate node acquisition"
-        );
+        require(!node->borrowed.exchange(true), "duplicate node acquisition");
         in_use_.fetch_add(1);
-        return MessageHandle(
-            &node->message,
-            MessageDeleter{shared_from_this(), node}
-        );
+        return MessageHandle(&node->message, MessageDeleter{shared_from_this(), node});
     }
     std::size_t count = fallback_in_use_.load();
     while (count < fallback_limit_) {
-        if (fallback_in_use_.compare_exchange_weak(
-            count,
-            count + 1
-        )) {
+        if (fallback_in_use_.compare_exchange_weak(count, count + 1)) {
             try {
                 std::unique_ptr<RecordedMessage> fallback = std::make_unique<RecordedMessage>();
                 fallback_count_.fetch_add(1);
                 return MessageHandle(
                     fallback.release(),
-                    MessageDeleter{shared_from_this(), nullptr}
-                );
+                    MessageDeleter{shared_from_this(), nullptr});
             } catch (const std::bad_alloc&) {
                 fallback_in_use_.fetch_sub(1);
-                return MessageHandle(
-                    nullptr,
-                    MessageDeleter{}
-                );
+                return MessageHandle(nullptr, MessageDeleter{});
             }
         }
     }
-    return MessageHandle(
-        nullptr,
-        MessageDeleter{}
-    );
+    return MessageHandle(nullptr, MessageDeleter{});
 }
 
 inline void PoolState::release_thread_cache() { caches_.erase(this); }
 
-inline void PoolState::release(
-    RecordedMessage* message,
-    Node* cookie
-) noexcept {
+inline void PoolState::release(RecordedMessage* message, Node* cookie) noexcept {
     if (cookie == nullptr) {
         // Probe fallback was allocated by make_unique; restore the matching RAII
         // deleter rather than exposing explicit delete in the data path.
@@ -267,10 +244,7 @@ inline void PoolState::release(
 
 inline void MessageDeleter::operator()(RecordedMessage* message) const noexcept {
     if (state) {
-        state->release(
-            message,
-            node_cookie
-        );
+        state->release(message, node_cookie);
     } else if (node_cookie == nullptr) {
         const std::unique_ptr<RecordedMessage> fallback(message);
     }
@@ -287,12 +261,8 @@ struct BudgetSnapshot {
 class QueueBudget {
 public:
     // Initializes immutable byte/message limits before concurrent access.
-    QueueBudget(
-        std::size_t max_bytes,
-        std::size_t max_messages
-    )
-    : max_bytes_(max_bytes),
-      max_messages_(max_messages) {}
+    QueueBudget(std::size_t max_bytes, std::size_t max_messages)
+    : max_bytes_(max_bytes), max_messages_(max_messages) {}
 
     // Atomically reserves one message and bytes; false means no mutation.
     bool try_acquire(std::size_t bytes) {
@@ -341,33 +311,22 @@ public:
     BudgetLease() = default;
 
     // Adopts exactly one successful reservation; caller must not adopt twice.
-    BudgetLease(
-        std::shared_ptr<QueueBudget> owner,
-        std::size_t bytes
-    )
-    : owner_(std::move(owner)),
-      bytes_(bytes) {}
+    BudgetLease(std::shared_ptr<QueueBudget> owner, std::size_t bytes)
+    : owner_(std::move(owner)), bytes_(bytes) {}
 
     BudgetLease(const BudgetLease&) = delete;
     BudgetLease& operator=(const BudgetLease&) = delete;
 
     // Transfers ownership without releasing; noexcept, requires exclusive access.
     BudgetLease(BudgetLease&& other) noexcept
-    : owner_(std::move(other.owner_)),
-      bytes_(std::exchange(
-          other.bytes_,
-          0
-      )) {}
+    : owner_(std::move(other.owner_)), bytes_(std::exchange(other.bytes_, 0)) {}
 
     // Releases any old reservation then adopts other's; same concurrency rule.
     BudgetLease& operator=(BudgetLease&& other) noexcept {
         if (this != &other) {
             reset();
             owner_ = std::move(other.owner_);
-            bytes_ = std::exchange(
-                other.bytes_,
-                0
-            );
+            bytes_ = std::exchange(other.bytes_, 0);
         }
         return *this;
     }

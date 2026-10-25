@@ -1,4 +1,4 @@
-# Phase 0 reproducible native build/test image. BASE_IMAGE is pinned by CI.
+# Recorder development native build/test image. BASE_IMAGE is pinned by CI.
 ARG BASE_IMAGE=ros:humble-ros-base
 FROM ${BASE_IMAGE}
 ARG BASE_IMAGE
@@ -17,9 +17,9 @@ RUN if [[ "${INSTALL_DEPS}" == 1 ]]; then \
     fi
 WORKDIR /work
 COPY . /work
-# Git verifies the actual gitlinks; untracked Phase 0 sources are permitted locally.
+# Git verifies the actual gitlinks; local development may include uncommitted source files.
 RUN git config --global --add safe.directory '*' && \
     source /opt/ros/${ROS_DISTRO}/setup.bash && \
-    ROS2_BAG_BASE_IMAGE=${BASE_IMAGE} bash tools/run-phase0.sh docker-native
+    ROS2_BAG_BASE_IMAGE=${BASE_IMAGE} bash tools/run-phase0.sh docker-native none
 ENTRYPOINT []
 CMD ["bash", "-lc", "source /opt/ros/$ROS_DISTRO/setup.bash && ctest --test-dir /work/build/docker-native/main --output-on-failure"]

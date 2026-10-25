@@ -1,4 +1,4 @@
-name: Phase 0 L1
+name: Recorder PR validation
 on: [push, pull_request, workflow_dispatch]
 permissions:
   contents: read
@@ -18,12 +18,12 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y clang-format-14 shellcheck
           python3 tools/format-cpp.py --check
-          shellcheck -S warning tools/*.sh scripts/*.sh ros2_bag bag_cli bag_web
+          shellcheck -S warning tools/*.sh
       - name: Native Humble build and probes
         run: bash tools/ci-platform.sh humble amd64
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: phase0-l1-${{ github.sha }}
+          name: recorder-pr-${{ github.sha }}
           path: build/ci-evidence
           retention-days: 30

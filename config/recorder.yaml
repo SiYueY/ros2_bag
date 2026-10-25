@@ -1,0 +1,73 @@
+recording:
+  mode: normal
+  segment_duration_sec: 60
+  retention_duration_sec: 600
+  output_root: ./recordings
+
+executor:
+  # Humble Fast DDS can dereference an invalid wait-set entry when a dynamic
+  # GenericSubscription is destroyed while several executor workers wait.
+  # Keep production lifecycle work single-threaded until the upstream runtime
+  # issue has a verified fix; the Writer runs separately.
+  thread_count: 1
+
+topics:
+  discovery_timeout_ms: 2000
+  allow_empty_topics: false
+  max_active_topics: 64
+  max_distinct_topics: 256
+  recent_removed_instances: 32
+
+queue:
+  max_bytes: 67108864
+  max_messages: 65536
+  batch_size: 256
+  wait_timeout_ms: 20
+  overflow_policy: drop_newest
+
+pool:
+  enabled: true
+  mode: tls
+  capacity_factor: 1.25
+  max_capacity: 1000000
+  max_fallback_in_use: 1024
+  local_capacity: 64
+  batch_size: 64
+  max_cached_payload_bytes: 0
+  max_per_node_buffer_bytes: 0
+
+writer:
+  control_queue_capacity: 64
+  max_control_batch: 8
+
+cleanup:
+  queue_capacity: 16
+  warning_timeout_sec: 30
+
+storage:
+  storage_id: mcap
+  max_cache_size: 0
+  config_file: mcap.yaml
+
+snapshot:
+  max_total_bytes: 16777216
+
+resource:
+  enabled: true
+  sample_interval_sec: 2
+
+disk:
+  check_interval_sec: 2
+  max_sample_age_sec: 10
+  unknown_after_failures: 3
+  warning_percent: 80
+  pause_percent: 90
+  resume_percent: 85
+  min_free_gb: 2
+  auto_resume: false
+  resume_stable_sec: 10
+
+status:
+  # Recorder Topic rate statistics (not HTTP/SSE publication).
+  frequency_window_sec: 1.0
+  frequency_bucket_ms: 10

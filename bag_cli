@@ -1,4 +1,0 @@
-#!/usr/bin/env bash
-# CLI features belong to Phase 2; never simulate a successful control operation.
-echo 'BLOCKED: Phase 0 skeleton; CLI recording control is not implemented.' >&2
-exit 2

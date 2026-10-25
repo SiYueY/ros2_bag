@@ -1,4 +1,4 @@
-# Phase 0 native builds
+# Native development and validation builds
 
 `base-images.json` pins multi-architecture ROS base manifests and records both
 AMD64/ARM64 child digests. `tools/ci-platform.sh DISTRO ARCH` refuses an architecture
@@ -12,10 +12,10 @@ bash tools/ci-platform.sh humble amd64
 bash tools/ci-platform.sh jazzy amd64
 ```
 
-The image builds the independent message fixture first, then the C++17 probes,
-and runs CTest. `docker run --rm IMAGE` repeats the runtime probes. This is a
-development/test image, not the V1.0 product. The recorder binary is a Phase 0
-skeleton with `--phase0-info`, not a functioning recorder.
+The image builds the independent message fixture first, then the C++17 probes
+and Recorder implementation, and runs CTest. This is a development/test image,
+not the V1.0 product. Old CLI/Web release packaging and the product runtime image
+have been removed in Recorder-only closeout.
 
 PR workflows have read-only permissions, no publishing, no robot access and no
 host network/IPC sharing. The explicitly trusted local DDS experiment is run by

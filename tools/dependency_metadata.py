@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 0 gitlink verification and release dependency metadata (stdlib only)."""
+"""Pinned gitlink verification and dependency metadata (stdlib only)."""
 import argparse
 import configparser
 import json
@@ -8,7 +8,6 @@ import subprocess
 
 DEPENDENCIES = {
     "concurrentqueue": "https://github.com/cameron314/concurrentqueue.git",
-    "sockpp": "https://github.com/fpagliughi/sockpp.git",
     "json": "https://github.com/nlohmann/json.git",
     "yaml-cpp": "https://github.com/jbeder/yaml-cpp.git",
 }
@@ -25,7 +24,7 @@ def verify(root):
     expected_paths = {f"third_party/{name}" for name in DEPENDENCIES}
     actual_paths = {config[section].get("path") for section in config.sections()}
     if actual_paths != expected_paths or len(config.sections()) != len(DEPENDENCIES):
-        raise ValueError(".gitmodules must declare exactly four expected independent paths")
+        raise ValueError(".gitmodules must declare exactly three expected independent paths")
     shas = {}
     for name, url in DEPENDENCIES.items():
         relative = f"third_party/{name}"
@@ -58,8 +57,7 @@ def main():
     try:
         shas = verify(args.root.resolve())
         if args.output:
-            data = {"schema_version": 1, "source_commit": git(args.root, "rev-parse", "HEAD"),
-                    "dependencies": shas}
+            data = {"schema_version": 1, "dependencies": shas}
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(data, indent=2) + "\n")
         print(json.dumps({"status": "PASS", "dependencies": shas}, sort_keys=True))

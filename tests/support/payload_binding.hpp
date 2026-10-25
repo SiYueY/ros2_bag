@@ -16,8 +16,7 @@ namespace ros2_bag::phase0 {
 inline std::shared_ptr<rosbag2_storage::SerializedBagMessage> bind_payload(
     const std::shared_ptr<rclcpp::SerializedMessage>& owner,
     std::int64_t timestamp,
-    const std::string& topic
-) {
+    const std::string& topic) {
     // Only the small rcutils descriptor is copied. Its bytes remain owned by
     // owner, captured by the descriptor deleter. No release() and no payload copy.
     const auto descriptor =
@@ -26,8 +25,7 @@ inline std::shared_ptr<rosbag2_storage::SerializedBagMessage> bind_payload(
         std::make_shared<rosbag2_storage::SerializedBagMessage>();
     bag->serialized_data = std::shared_ptr<rcutils_uint8_array_t>(
         descriptor.get(),
-        [owner, descriptor](rcutils_uint8_array_t*) {}
-    );
+        [owner, descriptor](rcutils_uint8_array_t*) {});
     bag->topic_name = topic;
 #ifdef ROS2_BAG_JAZZY
     bag->recv_timestamp = timestamp;

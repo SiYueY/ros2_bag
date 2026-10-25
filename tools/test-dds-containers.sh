@@ -17,14 +17,14 @@ if [[ ! "$task_domain" =~ ^[0-9]+$ ]] || (( task_domain < 1 || task_domain > 230
 fi
 task_cross_domain=$((task_domain + 1))
 task_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-task_logs="$task_root/docs/evidence/phase0"
+task_logs="$task_root/build/local-dds-evidence"
 task_network="$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$task_container")"
 task_ipc="$(docker inspect --format '{{.HostConfig.IpcMode}}' "$task_container")"
 if [[ "$task_network" != host || "$task_ipc" != host ]]; then
     echo 'BLOCKED: this experiment requires an explicitly trusted host-network/IPC container' >&2
     exit 3
 fi
-mkdir -p "$task_logs"
+mkdir -p "$task_logs" "$task_root/build/host-dds-logs"
 # Both participants inside one container.
 docker exec --user "$(id -u):$(id -g)" -e "ROS_DOMAIN_ID=$task_domain" -e "ROS_LOG_DIR=/tmp/phase0-dds-logs-$(id -u)" \
     "$task_container" bash -lc 'source /opt/ros/$ROS_DISTRO/setup.bash; exec "$@"' -- \

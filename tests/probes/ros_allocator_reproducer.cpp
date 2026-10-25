@@ -6,15 +6,9 @@
 
 #include <rclcpp/rclcpp.hpp>
 
-int main(
-    int argc,
-    char** argv
-) {
+int main(int argc, char** argv) {
     try {
-        rclcpp::init(
-            argc,
-            argv
-        );
+        rclcpp::init(argc, argv);
         {
             const std::shared_ptr<rclcpp::Node> node =
                 std::make_shared<rclcpp::Node>("phase0_ros_baseline");

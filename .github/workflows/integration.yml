@@ -1,0 +1,26 @@
+name: Recorder integration
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '35 20 * * *'
+permissions:
+  contents: read
+jobs:
+  humble-amd64:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Build the pinned native integration image
+        run: bash tools/ci-platform.sh humble amd64
+      - name: Run Recorder, Writer and recovery integration subset
+        run: bash tools/run-l3-integration.sh humble amd64
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: l3-humble-amd64-${{ github.sha }}
+          path: build/ci-evidence
+          retention-days: 30

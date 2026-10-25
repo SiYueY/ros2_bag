@@ -13,7 +13,9 @@ case "$(uname -m)" in
     aarch64) task_arch=arm64 ;;
     *) echo 'Unsupported native architecture' >&2; exit 2 ;;
 esac
-task_recording="ros2-bag-phase0:$task_distro-$task_arch"
+# ci-platform.sh owns this tag.  Keeping the consumer on the same tag lets the
+# L2 job exercise the exact image that completed its native build and tests.
+task_recording="ros2-bag:$task_distro-$task_arch"
 task_analysis="${2:-ros2-bag-ci-analysis:$task_distro-$task_arch}"
 task_output="$(mktemp -d "$task_root/build/ac55-$task_distro-$task_arch-XXXXXX")"
 mkdir -p "$task_root/build/ci-evidence"

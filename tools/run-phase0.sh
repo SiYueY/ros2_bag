@@ -25,6 +25,7 @@ mkdir -p "$ROS_LOG_DIR"
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-173}"
 ctest --test-dir "$task_build/main" --output-on-failure
-"$task_build/main/ros2_bag_recorder" --phase0-info
-python3 "$task_root/tools/build-manifest.py" "$task_build/main/ros2_bag_recorder" \
-    "$task_build/main/build-manifest.json" --base-image "${ROS2_BAG_BASE_IMAGE:-not-recorded}"
+python3 "$task_root/tools/build-manifest.py" \
+    "$task_build/main/ros2_bag_recorder" \
+    "$task_build/main/build-manifest.json" \
+    --base-image "${ROS2_BAG_BASE_IMAGE:-not-recorded}"
