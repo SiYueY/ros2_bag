@@ -9,7 +9,7 @@
 | 项目名称 | ros2_bag |
 | 文档版本 | v4.2.1 |
 | 文档类型 | 系统级技术选型规范 |
-| 文档状态 | REVIEW |
+| 文档状态 | DRAFT（开发中，技术选择可调整） |
 | 目标产品版本 | V1.0 |
 | 编制日期 | 2026-10-25 |
 | 目标操作系统 | Ubuntu 22.04 / 24.04 LTS |
@@ -293,6 +293,8 @@ Fast DDS 的共享内存能力不代表 Recorder 自动实现端到端零拷贝�
 - 降低自行维护 Bag Writer 的成本。
 
 不自行开发通用 MCAP Writer，也不通过 Python 对录制消息进行二次写入。
+
+**Humble/Jazzy Schema 适配是选型的一部分，而不是实现时再决定：** Jazzy 使用 rosbag2_cpp 的 MessageDefinition 能力；Humble 0.15.x 的 Writer API没有显式 MessageDefinition 参数，因此 Recorder 的 Humble Adapter 在 Topic/Segment 注册前调用**同版本 `rosbag2_storage_mcap` 导出的 MessageDefinitionCache**做完整定义 preflight/hash 校验，再使用标准 Writer API，让 MCAP Plugin 写 Schema。定义缺失时插件自身会容忍并产生空/不可用 Schema，因此 Recorder 的 preflight 是满足“自包含自定义消息”需求的强制安全门。项目不复制插件的定义解析算法，也不直接维护通用 MCAP 写入栈。由于 Humble Resolver 属于插件内部 namespace，rosbag2_storage_mcap 必须作为编译和运行时共同锁定的目标平台依赖；接口漂移通过编译/平台验证暴露。
 
 ## 3.5 存储文件格式
 
@@ -1245,8 +1247,8 @@ Docker 是构建与验证技术，不要求最终用户必须在容器中运行 
 | yaml-cpp | 静态 |
 | concurrentqueue | 编译期集成 |
 | nlohmann/json | 编译期集成 |
-| ROS 2 / RMW / rosbag2 | 动态 |
-| MCAP Storage Plugin | 目标 ROS 2 环境提供 |
+| ROS 2 / RMW / rosbag2 | 动态、按目标发行版锁定 |
+| MCAP Storage Plugin | 目标 ROS 2 环境提供并锁定；Humble Adapter 还在编译期使用同版本 Schema Resolver 接口 |
 | glibc / libstdc++ | 系统动态库 |
 
 该策略不要求完全静态链接 Linux 可执行文件。

@@ -1,6 +1,6 @@
 # Humble Fast DDS / TSan risk record
 
-Document version: v4.3.8
+Document version: development risk log
 
 Status: OPEN
 

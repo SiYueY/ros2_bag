@@ -92,37 +92,24 @@ python3 tools/format-cpp.py --check
 python3 tests/unit/test_tooling.py
 ```
 
-## Documentation status
+## Current design documents (development stage)
 
-The current top-level documentation contains only the technology selection,
-Recorder recovery behavior and still-open Humble TSan risk. Previous design,
-research and validation records are stored separately under docs/archive/.
-No new architecture or layer-specific design documents were created by this
-cleanup.
+All design documents are **DRAFT**: architecture and APIs may be changed as development or review uncovers defects. There is no backward-compatibility obligation to unreleased UDS/Session/status.json designs. Superseded drafts and one-off reports have been removed from the working tree; Git history remains available. Current code still contains a Recorder-only prototype, not the planned Drogon Runtime or Python SDK.
 
-| Document | Role |
+| Document | Responsibility |
 |---|---|
-| [System technology selection](docs/system_technology_selection.md) | Future four-layer technology choices, not an implementation claim |
-| [Recorder recovery](docs/recovery.md) | Current recovery and output ownership rules |
-| [Humble TSan risk](docs/humble_tsan_risk.md) | Unresolved ROS 2/Fast DDS TSan validation risk |
-| [Historical v4.3.8 design](docs/archive/ros2_bag.md) | Superseded UDS/CLI/Web development contract |
-| [Recorded message research](docs/archive/recorded_message_data_model.md) | Historical payload and ownership evidence |
-| [Historical implementation notes](docs/archive/implementation_notes.md) | Engineering history |
-| [Phase 0 validation](docs/archive/phase0_validation_report.md) | Historical tests and limitations |
-| [Phase 1 validation](docs/archive/phase1_validation_report.md) | Historical tests and limitations |
+| [Requirements](docs/requirements.md) | Current feature set, constraints, acceptance criteria |
+| [Architecture](docs/architecture.md) | Single-process layers, ownership, lifecycle, shutdown |
+| [Recorder](docs/recorder.md) | C++ domain APIs, data path, Queue/Pool, MCAP, recovery, disk safety |
+| [Protocol](docs/protocol.md) | HTTP/JSON/SSE routes, identities, outcomes and schemas |
+| [Server](docs/server.md) | Drogon, dispatch, status publication, SSE resource limits |
+| [Client](docs/client.md) | Python HTTPX sync/async SDK, UNKNOWN and SSE state tracking |
+| [Technology choices](docs/system_technology_selection.md) | Runtime libraries, versions, alternatives, deployment risks |
+| [Verification](docs/verification.md) | Reproducible functional, performance and failure-injection tests |
+| [Release](docs/release.md) | CI, toolchains, dependency locks, packaging, platform gates |
+| [Humble TSan risk](docs/humble_tsan_risk.md) | Unresolved ROS2/Fast DDS concurrency warning and evidence |
 
-Old G0-G3 reviews and the old CLI/Web deployment guide were removed from
-the current tree, but remain recoverable through Git history. The local
-docs/evidence/phase0 results were archived outside the repository before being
-cleared; Git never tracked them. New temporary evidence belongs in build/.
-
-Historical approvals cannot be transferred automatically to the current
-implementation or future HTTP/SSE system. ARM64, remote CI, sanitizers and
-complete V1.0 release readiness require separate evidence.
-
-The tests/performance/standard_profile.json file describes a proposed load
-profile; it does **not** have an automated benchmark runner or accepted
-performance results.
+Historical approvals cannot establish current implementation correctness. Source-level validation, four-platform execution, MCAP standalone decoding, security and performance gates must be measured on the actual implementation. The tests/performance/standard_profile.json is a proposed profile, not an automated benchmark or a PASS report.
 
 ## Recorder-only closeout verification
 
