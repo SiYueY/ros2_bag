@@ -120,6 +120,35 @@ flowchart TB
 
 ## 3.1 Recorder 与 Runtime
 
+### C++ 工程组织与实现基线（冻结）
+
+下一代 C++ 工程按完整 Runtime 系统组织，而不是按历史 Recorder-only 原型组织：
+
+```text
+include/ros2_bag/result.hpp
+include/ros2_bag/recorder/
+src/recorder/
+src/server/
+src/runtime/
+```
+
+`ros2_bag::Result<T, E>` 是项目级基础 vocabulary，精确语义、文件组织和测试要求以
+`result.md` 的 **FROZEN** 契约为准；所有新 C++ 代码和本文档中的 C++ 示例以
+`cpp_coding_guidelines.md` 为规范基线。Recorder 公共 API 位于
+`ros2_bag::recorder`，其 private implementation 留在 `src/recorder/` 或受限的
+implementation header；Server 位于 `ros2_bag::server`；Runtime 位于
+`ros2_bag::runtime`。
+
+Server 只能依赖 Recorder 稳定 public API，不能包含其 private implementation 或访问
+Writer、Queue、持久化内部对象。Runtime 同时拥有 Recorder 与 Server，并负责它们的
+构造、启动、关闭和共享进程资源。不得建立没有实际职责的 `common/`、`utils/`、`core/`
+或 `protocol/` C++ 子系统；Protocol 是文档定义的跨语言 wire contract，不是 C++
+子系统。历史上含义模糊的 `ros2_bag_core` 不再使用。
+
+未来 CMake target 应反映真实依赖方向：Recorder implementation 可被一个内部 Recorder
+target 承载，Server target 依赖其 public API，Runtime executable 组合二者。是否拆出
+target 必须由链接边界、编译隔离或可测试性证明；不得为了目录对称性预先创建空 target。
+
 Recorder 通过原生 C++ 接口提供录制启动、定时启动、停止、暂停、恢复、动态 Topic 管理、状态快照及 Shutdown。接口契约可由 `RecordingCoordinator` 等录制领域对象承载；精确 C++ 签名、返回语义和线程约束由 `recorder.md` 定义。
 
 Recorder 内部管理 Topic 订阅、队列预算、消息池、Writer、快照缓存、清理与资源监测。录制状态至少区分 `Idle / Recording / Paused / Stopping / Failed`；具体状态转换及错误返回属于 Recorder 接口契约。
@@ -135,7 +164,7 @@ Recorder 内部管理 Topic 订阅、队列预算、消息池、Writer、快照�
 5. 保留 `manifest.json`、`topic_events.jsonl`、`recovery.json` 的存储领域语义。网络协议的事件序列或缓存不自动具备相同的持久性保证。
 6. Recorder 内部的定时 Stop、Rolling 轮转与磁盘保护回调不由 HTTP 请求触发。Server 必须允许这些内部事件与外部控制安全交错，不得将对外请求的串行化误认为 Recorder 内部全部状态变化都通过 Server 发生。
 
-Runtime 必须遵守“**先取得输出目录所有权锁，再执行恢复**”的顺序。输出目录进程级互斥由 Runtime 负责，不得隐含为 Recorder Core 的自动行为；其他嵌入 Recorder Core 的宿主同样必须保证输出目录所有权。
+Runtime 必须遵守“**先取得输出目录所有权锁，再执行恢复**”的顺序。输出目录进程级互斥由 Runtime 负责，不得隐含为 Recorder 的自动行为；其他嵌入 Recorder 的宿主同样必须保证输出目录所有权。
 
 **Recorder 内部时间事件的执行域：** ROS Executor Timer 只发布有界触发事件，不在回调线程完成可能阻塞的 Timed Stop、Rolling Rotate、磁盘保护收尾。**RecorderControlSequencer 是所有 Task/Topic/Writer mutation 的唯一领域线性化执行域**：Server 的独立 ControlWorker 只负责网络 Admission、外部 FIFO 和等待 Recorder `ControlHandle`，它把请求提交给 Sequencer，不能与 Sequencer 形成第二个“关闭权”裁决点。唯一例外是不会推进领域状态机的**无阻塞安全 Gate**：Producer 准入可在自身线性化点因 Timed steady deadline 或磁盘危险原子拒绝新准入，并仅向 Sequencer 提交合并事件；Writer Close、Topic 状态、Manifest 终态仍只能由 Sequencer 协调。Writer 本身始终由独立 Writer Thread 独占。Stop/Shutdown 必须真实等待 Sequencer/Handle 所代表的领域工作结束后再回收 Recorder 和 ROS Context。
 
@@ -286,6 +315,16 @@ Recorder 恢复语义要求保留 `INCOMPLETE` 片段，对未能证明成功的
 # 5. 工程约束与演进
 
 ## 5.1 技术与部署约束
+
+### Runtime 配置组织（冻结）
+
+Runtime 是唯一进程入口，因此最终配置使用一个 Runtime 根配置（建议
+`config/runtime.yaml`），在同一加载/校验路径下承载 `runtime:`、`recorder:`、`server:`
+和 storage profile 引用或内嵌配置。`recorder.yaml` 与 `server.yaml` 不是独立进程配置，
+不作为最终发布布局；历史 `config/recorder.yaml` 已删除。保留 `config/mcap.yaml` 作为
+MCAP storage profile 是合理的，但它必须由 Runtime 配置显式引用并在启动时冻结。
+直接 C++ 构造与 YAML 装载必须走同一份 Runtime/Recorder/Server 配置校验，而不是由
+Server 或 Recorder 各自重新读取文件。
 
 技术选型以 `docs/system_technology_selection.md` 为权威来源，本文只规定跨层使用关系，不重复候选比较或锁定版本。V1.0 技术组合：
 

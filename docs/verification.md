@@ -71,6 +71,10 @@ MCAP 的录制端与分析端两维 2×2（H→H、H→J、J→H、J→J）独�
 
 # 2. Recorder 算法、并发与数据完整性
 
+## 2.0 C++ 基线契约
+
+新增实现必须验证 `Result<T, E>`、`Result<void, E>` 的 FROZEN contract、compile-time/compile-fail、fail-fast death test、public header self-contained compile、C++17、clang-format、clang-tidy/warnings。还必须验证 Recorder Handle 的 `optional<Result<T, RecorderError>>` 生命周期，以及 enum/function/member naming、新目录与 target 依赖方向；此节不替代 result.md 的完整测试设计，也不降低以下 Recorder/MCAP/Recovery 验收。
+
 ## 2.1 Pool、Queue 与 ProducerToken（V-REC-POOL、V-REC-QUEUE）
 
 | ID | 前置条件/注入 | 精确断言 | 关联 |

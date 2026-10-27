@@ -248,76 +248,58 @@ Recorder 的公共领域接口在 V1.0 采用以下**目标模型**。
 
 ```cpp
 enum class RecordingMode {
-    kNormal,
-    kTimed,
-    kRolling
+    Normal,
+    Timed,
+    Rolling
 };
 
 // V1.0 只支持 Recorder receive time；
 // 保留枚举用于未来受评审的扩展。
 enum class TimestampPolicy {
-    kReceive
+    Receive
 };
 
 enum class CompressionMode {
-    kNone,
-    kLz4
+    None,
+    Lz4
 };
 
 enum class DiskSafetyState {
-    kNormal,
-    kWarning,
-    kCritical,
-    kUnknown
+    Normal,
+    Warning,
+    Critical,
+    Unknown
 };
 
 enum class PersistentTaskState {
-    kInitializing,
-    kRecording,
-    kFinalizing,
-    kCompleted,
-    kFailed,
-    kIncomplete
+    Initializing,
+    Recording,
+    Finalizing,
+    Completed,
+    Failed,
+    Incomplete
 };
 
 enum class PauseReason : std::uint8_t {
-    kUser = 1,
-    kDiskCritical = 2,
-    kDiskUnknown = 4,
-    kDiskRecoveryPending = 8,
+    User = 1,
+    DiskCritical = 2,
+    DiskUnknown = 4,
+    DiskRecoveryPending = 8,
 };
 
 enum class RecorderPhase {
-    kValidation,
-    kTaskCreate,
-    kSchemaPreflight,
-    kWriterOpen,
-    kTopicRegister,
-    kSubscriptionCreate,
-    kIngress,
-    kProducerDrain,
-    kExecutorDetach,
-    kWriterDrain,
-    kWriterClose,
-    kDataSync,
-    kManifestCommit,
-    kTopicEventCommit,
-    kCleanup,
-    kRecovery,
-    kShutdown,
+    Validation, TaskCreate, SchemaPreflight, WriterOpen, TopicRegister,
+    SubscriptionCreate, Ingress, ProducerDrain, ExecutorDetach, WriterDrain,
+    WriterClose, DataSync, ManifestCommit, TopicEventCommit, Cleanup, Recovery, Shutdown,
 };
 
 enum class ControlHandleState {
-    kPending,
-    kStarted,
-    kWaitingNative,
-    kDone,
-    kCancelledNotStarted,
+    Pending, Started, WaitingNative, Done, CancelledNotStarted,
 };
 
 struct StartCommand {
     std::string recording_id;
-    RecordingMode mode = RecordingMode::kNormal;
+    RecordingMode mode = RecordingMode::Normal;
     std::optional<std::chrono::milliseconds> duration;
     std::optional<std::chrono::seconds> segment_duration;
     std::optional<std::chrono::seconds> retention_duration;
@@ -329,7 +311,7 @@ struct EffectiveTaskConfig {
     std::optional<std::chrono::seconds> segment_duration;
     std::optional<std::chrono::seconds> retention_duration;
     CompressionMode compression;
-    TimestampPolicy timestamp_policy = TimestampPolicy::kReceive;
+    TimestampPolicy timestamp_policy = TimestampPolicy::Receive;
 };
 
 struct RecordingTargetGuard {
@@ -344,34 +326,17 @@ struct TopicTargetGuard {
 };
 
 enum class DomainEffects {
-    kNone,
-    kPossible,
-    kConfirmedPartial
+    None,
+    Possible,
+    ConfirmedPartial
 };
 
 enum class RecorderErrorCode {
-    kInvalidArgument,
-    kNotFound,
-    kTopicNotFound,
-    kTypeConflict,
-    kTypeSupportUnavailable,
-    kSchemaUnavailable,
-    kUnsupportedQos,
-    kInvalidState,
-    kAlreadyPaused,
-    kAlreadyFinished,
-    kRecordingExists,
-    kStaleRecording,
-    kStaleTopicEpoch,
-    kResourceExhausted,
-    kDiskFull,
-    kDiskStateUnknown,
-    kWriterError,
-    kStorageUnavailable,
-    kEventCommitFailed,
-    kDrainTimeout,
-    kExecutorUnavailable,
-    kGenerationViolation,
+    InvalidArgument, NotFound, TopicNotFound, TypeConflict, TypeSupportUnavailable,
+    SchemaUnavailable, UnsupportedQos, InvalidState, AlreadyPaused, AlreadyFinished,
+    RecordingExists, StaleRecording, StaleTopicEpoch, ResourceExhausted, DiskFull,
+    DiskStateUnknown, WriterError, StorageUnavailable, EventCommitFailed, DrainTimeout,
+    ExecutorUnavailable, GenerationViolation,
 };
 
 struct RecorderError {
@@ -381,22 +346,16 @@ struct RecorderError {
     std::string message;
 };
 
-struct RecorderOperationResult {
-    bool ok = false;
-    std::optional<RecorderError> error;
-};
-
-template <class Result>
+template <class T>
 class RecorderControlHandle {
 public:
-    bool wait_for(
-        std::chrono::milliseconds timeout) const;
+    bool wait_for(std::chrono::milliseconds timeout) const;
 
     ControlHandleState state() const noexcept;
 
     bool done() const noexcept;
 
-    std::optional<Result> result() const;
+    std::optional<ros2_bag::Result<T, RecorderError>> result() const;
 
     bool cancel_if_not_started();
 };
@@ -410,50 +369,45 @@ public:
 
     bool done() const noexcept;
 
-    std::optional<RecorderOperationResult>
-        result() const;
+    std::optional<ros2_bag::Result<void, RecorderError>> result() const;
 
 private:
     std::shared_ptr<ShutdownCompletion>
         completion_;
 };
 
-struct StartResult {
-    bool ok = false;
+struct StartInfo {
     std::string recording_id;
     std::uint64_t recording_generation = 0;
     EffectiveTaskConfig effective_config;
-    std::optional<RecorderError> error;
 };
 
-struct TopicOperationResult {
-    bool ok = false;
+struct TopicOperationInfo {
     TopicId topic_id = kInvalidTopicId;
     std::uint64_t topic_epoch = 0;
-    std::optional<RecorderError> error;
 };
 
-class RecordingCoordinator {
+class Recorder {
 public:
-    RecorderControlHandle<StartResult>
+    RecorderControlHandle<StartInfo>
     start(const StartCommand&);
 
-    RecorderControlHandle<RecorderOperationResult>
+    RecorderControlHandle<void>
     stop(const RecordingTargetGuard&);
 
-    RecorderControlHandle<RecorderOperationResult>
+    RecorderControlHandle<void>
     pause(const RecordingTargetGuard&);
 
-    RecorderControlHandle<RecorderOperationResult>
+    RecorderControlHandle<void>
     resume(const RecordingTargetGuard&);
 
-    RecorderControlHandle<TopicOperationResult>
+    RecorderControlHandle<TopicOperationInfo>
     add_topic(
         const RecordingTargetGuard&,
         TopicInfo,
         const OperationId&);
 
-    RecorderControlHandle<TopicOperationResult>
+    RecorderControlHandle<TopicOperationInfo>
     remove_topic(
         const TopicTargetGuard&,
         const OperationId&);
@@ -592,7 +546,7 @@ Recorder 内部只对当前请求及其 Lease 保留共享 Completion。
 
 Server Control Worker 必须在取得 Handle 后继续观察其真实 DONE，网络 ResponseSink 可以更早超时/释放。
 
-`RecorderOperationResult`、`StartResult`、`TopicOperationResult` 均为**有界轻量值对象**。
+`StartInfo` 与 `TopicOperationInfo` 是**有界轻量成功值对象**。`RecorderError`、`RecorderErrorCode`、`RecorderPhase` 和 `DomainEffects` 仅作为 `Result<T, RecorderError>` 的领域错误，不再定义第二套 Result-like 状态。
 
 V1.0 不允许 Control Result 持有：
 
@@ -606,8 +560,10 @@ V1.0 不允许 Control Result 持有：
 因此：
 
 ```cpp
-std::optional<Result> result() const;
+std::optional<Result<T, RecorderError>> result() const;
 ```
+
+`optional` 表示领域 Result 尚未或已经产生；产生后 Result 只能是 Value 或 Error。`CancelledNotStarted` 是 Handle 生命周期终态，不伪造成 Recorder Error；caller wait timeout 不产生虚假 Result。Protocol `UNKNOWN` 是 observer deadline/断线的 wire 语义，不是 Result 的第三态。可恢复失败的只读接口同样使用 `Result<T, RecorderError>`，纯快照和 predicate 不机械包装 Result。
 
 按值返回快照是正式 API 语义，不引入第二层 `shared_ptr<const Result>` 生命周期。
 
@@ -3683,11 +3639,11 @@ enum class WriterCommand {
     Close
 };
 
-struct WriterCommandResult {
-    bool ok;
-    RecorderErrorCode code;
+struct WriterCommandInfo {
     std::string detail;
 };
+
+// Writer completion is Result<WriterCommandInfo, RecorderError>.
 
 struct WriterRequest {
     WriterCommand command;
@@ -6225,7 +6181,7 @@ STARTED 必须保留 Lease。
 只有：
 
 ```text
-RecorderControlHandle == DONE
+RecorderControlHandle == Done
 且
 Result == DRAIN_TIMEOUT
 ```

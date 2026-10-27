@@ -22,7 +22,7 @@
 | Server | Drogon v1.9.14、Trantor 及其动态依赖与许可证 | lock、动态链接闭包 |
 | Python | Python 3.10/3.12、httpx 0.28.1、httpx-sse 0.4.3 | lockfile/hash、isolated wheel install |
 | Security | Bearer Credential/Scope、TLS direct/trusted-proxy、证书/代理信任边界、Web Session/CSRF | Config 校验、Secret 泄漏检查与 AC-18 攻击用例 |
-| Runtime Config | recorder.yaml、mcap.yaml、server.yaml 的实际内容与 SHA | 与 Direct C++ 构造默认值的单测 |
+| Runtime Config | runtime.yaml 与其引用的 mcap.yaml 的实际内容与 SHA | 与 Direct C++ 构造默认值的单测 |
 
 构建/打包的任何临时 patch 必须进入受控 Source Commit，不允许“开发机器上手工改过才成功”的无法再现制品。ROS 2/RMW 若为系统依赖，Manifest 应记录版本与先决条件而非私自将整个 ROS 安装目录复制进 tar。
 
@@ -141,7 +141,7 @@ CI 最低执行固定版本 clang-format、Clang 静态检查及 `-Wall -Wextra 
 
 | 对象 | 规则 | CI/Review 判据 |
 |---|---|---|
-| 类型、enum class | PascalCase；enum 枚举值按既有 `kName` 惯例 | 不混用相似名字表示不同领域状态 |
+| 类型、enum class | PascalCase；enum enumerator 也为 PascalCase | 不混用相似名字表示不同领域状态 |
 | 函数、局部变量 | snake_case | 保持 API 命名一致，不临时创造别名掩盖迁移 |
 | 类成员 | snake_case_ | 私有成员不得借裸指针破坏生命周期 |
 | 编译期常量 | kConstantName 或显式 C++17 constexpr | 配置参数/单位不得藏为 magic number |

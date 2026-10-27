@@ -92,7 +92,7 @@ Server 只依赖 Recorder 的**稳定原生 API / 值对象快照**。Protocol �
 
 ## 1.4 关键数据对象与交接接口
 
-下列类型提供**语义草案**，不是强制的 C++ ABI；实现可以依照项目已有错误/Value Object 风格选取 C++17 明确签名，不能因选择 `Result<T,E>` 或不同模板改变协议完成语义。
+下列类型提供**语义草案**，不是强制的 C++ ABI；新 C++ 可恢复错误统一遵循 `docs/result.md`，并遵守 `docs/cpp_coding_guidelines.md` 与 `ros2_bag::recorder`、`ros2_bag::server`、`ros2_bag::runtime` 的职责边界，不能因模板细节改变协议完成语义。
 
 ```cpp
 struct RequestContext {
@@ -316,8 +316,8 @@ V1.0 初始执行预算建议：
 2. **先获得全局 HTTP 响应槽，再获得控制类别配额，最后取得 FIFO 等待槽**；操作必须可原子提交或回滚，避免两个不同预算分别占满造成漏计。额外保留 read/SSE 握手响应能力；任一 Admission 限额拒绝时均明确未执行（effects:NONE）。
 3. 操作进入 owned FIFO 时标记 QUEUED，原子取得唯一入队序号；HTTP 接收顺序本身不是执行顺序。
 4. Control Worker 从队列取出时，先原子标记 STARTED，再在**实际进入 Recorder 之前**复核 Runtime ID、recording_id + generation、Topic epoch 与 Shutdown gate。Recorder 领域仍进行最终状态裁定。
-5. 从此处调用 Recorder mutation 只取得共享 `RecorderControlHandle<Result>`；**Handle 返回不等于领域完成**。Control Worker 保持唯一外部 mutation 执行槽并等待该 Handle 的 `DONE`，直到最终 Result 已捕获前不得提交下一项外部状态变更。
-6. HTTP ResponseSink 的 deadline/断线与 Recorder Handle 生命周期独立：Sink 可以先结束并向 Client 返回/形成 UNKNOWN，但 Worker 仍等待 Handle DONE。只有 Handle DONE 后，结果可用于安全日志/状态刷新，且 Worker 才能消费下一项队列任务。
+5. 从此处调用 Recorder mutation 只取得共享 `RecorderControlHandle<T>`；**Handle 返回不等于领域完成**。Control Worker 保持唯一外部 mutation 执行槽并等待该 Handle 的 `Done`，直到最终 `Result<T, RecorderError>` 已捕获前不得提交下一项外部状态变更。
+6. HTTP ResponseSink 的 deadline/断线与 Recorder Handle 生命周期独立：Sink 可以先结束并形成 Protocol UNKNOWN，但 Worker 仍等待 Handle Done。Result Value 是领域成功，Result Error 是领域失败；observer deadline/disconnect 且 Handle 尚未产生 Result 才是 UNKNOWN。不得给 Result 增加 UNKNOWN 第三态、将 HTTP timeout 写入 RecorderErrorCode，或混合 transport lifecycle 与 domain Result。
 7. 如果某请求的网络 deadline 已过，它的最终领域 Result 可用于日志和状态重新采样，但不能在未经可信关联的其他连接中“补回”一个成功的操作回执。
 
 推荐状态图（只有 Server 队列内存，**不是持久 Operation Registry**）：
@@ -392,7 +392,7 @@ HttpApi/ProtocolMapper 的唯一外部规范是 `protocol.md`，尤其 §1.2/§2
 
 - 顶层 `api_version:"1.0"`；GET 的 request_id + data、POST 的 request_id + operation_id + outcome；JSON snake_case；int64 身份/计数采用十进制字符串，不被 JsonCpp/JavaScript 转为失精度 double。
 - Start 成功的 `effective_config.compression` 使用 Recorder 确认的实际生效枚举，禁用时为 NONE；非适用 segment/retention 时长为 null；Timed 总时长和剩余期限有权威 Recorder 来源。
-- Start Mapper 只构造 Recorder `StartCommand(recording_id, mode, duration, segment_duration, retention_duration)`；HTTP 不接受 compression/timestamp/QoS Profile 覆盖。`effective_config` 逐字段取 Recorder `StartResult.effective_config`，不得重新读取 server.yaml/mcap.yaml 猜测实际值。
+- Start Mapper 只构造 Recorder `StartCommand(recording_id, mode, duration, segment_duration, retention_duration)`；HTTP 不接受 compression/timestamp/QoS Profile 覆盖。`effective_config` 逐字段取 Recorder `StartInfo.effective_config`，不得重新读取 Runtime 配置或 mcap profile 猜测实际值。
 - Pause/Resume 响应原样映射 Recorder `PauseReasons`；Resume SUCCESS 不保证 state=RECORDING，系统磁盘原因仍存在时必须返回 PAUSED + 剩余原因。
 - Recorder Status 的 `written_live`、`replayed_to_new_segment` 分开；不得把 Snapshot Replay 加入 live；`cleanup_queue_depth`、`cleanup_pending_total`、`cleanup_queue_full_count` 各表达不同来源，不能在 Server 调整字段统计含义。
 - 缺失/不可信资源采样采用 null + valid/diagnostic；不可把 CPU 未采样写 0，或把 History INCOMPLETE/UNKNOWN 写 COMPLETE。
@@ -683,7 +683,7 @@ Drogon `send()` 返回失败可作为关闭线索，但**成功不代表对端�
 
 ## 6.2 ServerConfig、默认预算与配置校验
 
-V1.0 使用独立的 `config/server.yaml`，由 RuntimeHost 与 `config/recorder.yaml`、`config/mcap.yaml` 一并装载；文件内保留顶层 `server:` 命名空间。Server 配置不属于 Recorder Task Config，**运行期间不允许通过 HTTP 未授权热更改**。C++ 直接构造与 YAML 装载必须经过同一 `ServerConfig` 默认值和校验逻辑。下列 YAML 是可实现的**初始建议**，不是已测试的最终发布配置：
+V1.0 由 Runtime 从单一 `config/runtime.yaml` 装载 `server:`、`recorder:` 与 MCAP profile 引用；Server 配置不属于 Recorder Task Config，**运行期间不允许通过 HTTP 未授权热更改**。C++ 直接构造与 YAML 装载必须经过同一 `ServerConfig` 默认值和校验逻辑。下列 YAML 是可实现的**初始建议**，不是已测试的最终发布配置：
 
 ```yaml
 server:
