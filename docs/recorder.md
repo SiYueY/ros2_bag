@@ -2,7 +2,7 @@
 
 | 属性 | 内容 |
 |---|---|
-| 文档版本 | v0.2.5 |
+| 文档版本 | v0.2.7 |
 | 文档状态 | **DRAFT — V1.0 开发阶段，随时修订；规范尚未批准用于完整实施** |
 | 范围 | C++17 Recorder 领域接口、录制数据面、持久化与恢复 |
 | 上位规范 | docs/architecture.md、docs/requirements.md（开发稿，可直接联动修改） |
@@ -65,7 +65,7 @@ flowchart LR
 
 V1.0 不允许“每个调用线程拿 Coordinator mutex 后各自推进状态机”。Recorder 自己拥有一个**单线程、独立于 ROS Executor 与 Writer Thread 的领域控制执行域** `RecorderControlSequencer`，所有会修改 Task/Topic/Writer 生命周期的动作最终都在该执行域中决定线性化顺序：
 
-- 外部 `Start/Stop/Pause/Resume/Add/Remove`：公共同步 API 只负责构造拥有自身数据的 ControlRequest、提交到有界外部队列并等待自己的 Completion；请求被 Sequencer 取走前可确定取消，取走后不能因调用方 HTTP/线程超时取消领域执行。
+- 外部 `Start/Stop/Pause/Resume/Add/Remove`：公共领域 API 构造拥有自身数据的 ControlRequest、尝试提交到有界外部队列并立即返回共享 `ControlHandle<Result>`。调用方可以等待 Handle，但**等待超时只结束调用方等待，不结束领域操作**；只有 Handle 的 `cancel_if_not_started()` 在线性化地完成 `PENDING -> CANCELLED_NOT_STARTED` 时才能证明没有进入 Recorder。Server 一旦把请求交给 Recorder，不得因为 HTTP Sink 超时调用该取消入口；取走后的请求必须继续到真实 DONE。
 - 内部 `TimedStop/DiskSafety/RollingRotate/WriterFailure`：ROS Timer、ResourceMonitor、Writer 线程只提交**绑定 recording_generation 的内部事件**并立即返回，不在原执行域里等待 Sequencer。相同代际的 TimedStop、DiskReevaluate、Rotate 可以按事件种类合并，WriterFailure/Shutdown 不得被丢弃。
 - Sequencer 是唯一可以把 Recorder State 从一个稳定/内部阶段推进到下一阶段、取得 Task Lease、关闭/开放 ingress、发起 Writer 控制事务的执行域；其他线程只读 immutable/原子状态或提交事件。
 - Writer I/O、ROS Executor 上的 Subscription create/remove、fsync/Manifest Commit 可以由 Sequencer 发起并锁外等待，但 Completion 必须回到同一个 ControlRequest/Task Lease；等待期间不得让另一个变更请求越过尚未提交的领域事务。实现可以把当前请求标记为 `WAITING_NATIVE`，而不是持 Coordinator mutex。
@@ -80,10 +80,10 @@ V1.0 不允许“每个调用线程拿 Coordinator mutex 后各自推进状态�
 ```text
 PENDING --Sequencer claim--> STARTED --> WAITING_NATIVE --> DONE
    │
-   └--caller timeout + CAS cancel succeeds--> CANCELLED_NOT_STARTED
+   └--ControlHandle.cancel_if_not_started() CAS succeeds--> CANCELLED_NOT_STARTED
 ```
 
-只有 `PENDING -> CANCELLED_NOT_STARTED` 成功才能确定本次没有进入 Recorder 副作用。`STARTED/WAITING_NATIVE` 后调用线程超时，公共 API 可以返回“领域终态尚未取得”的错误/未知，但 Sequencer 和相关 Task/Topic/Writer/Executor Lease 必须继续存活到真实 DONE；不得把栈上的 `std::string* error`、Promise 或裸对象指针交给迟到回调。
+只有 `PENDING -> CANCELLED_NOT_STARTED` 成功才能确定本次没有进入 Recorder 副作用。`STARTED/WAITING_NATIVE` 后任意调用方停止等待，Sequencer 和相关 Task/Topic/Writer/Executor Lease 仍必须继续存活到真实 DONE；Handle 只在 DONE 后暴露最终 `Result`。不得把栈上的 `std::string* error`、Promise 或裸对象指针交给迟到回调，也不得把“某个 waiter 超时”编码成领域 `DRAIN_TIMEOUT`。
 
 ## 1.3 领域 API 与所有权
 
@@ -93,7 +93,12 @@ Recorder 的公共领域接口在 V1.0 采用以下**目标模型**。实现可�
 enum class RecordingMode { kNormal, kTimed, kRolling };
 enum class TimestampPolicy { kReceive };
 enum class CompressionMode { kNone, kLz4 };
-enum class PauseReason : std::uint8_t { kUser = 1, kDiskCritical = 2, kDiskUnknown = 4 };
+enum class PauseReason : std::uint8_t {
+    kUser = 1,
+    kDiskCritical = 2,
+    kDiskUnknown = 4,
+    kDiskRecoveryPending = 8,
+};
 
 struct StartCommand {
     std::string recording_id;
@@ -116,6 +121,32 @@ struct RecordingTargetGuard { std::string recording_id; std::uint64_t recording_
 struct TopicTargetGuard { RecordingTargetGuard recording; TopicId topic_id; std::uint64_t topic_epoch; };
 enum class DomainEffects { kNone, kPossible, kConfirmedPartial };
 
+enum class RecorderErrorCode {
+    kInvalidArgument,
+    kNotFound,
+    kTopicNotFound,
+    kTypeConflict,
+    kTypeSupportUnavailable,
+    kSchemaUnavailable,
+    kUnsupportedQos,
+    kInvalidState,
+    kAlreadyPaused,
+    kAlreadyFinished,
+    kRecordingExists,
+    kStaleRecording,
+    kStaleTopicEpoch,
+    kResourceExhausted,
+    kDiskFull,
+    kDiskStateUnknown,
+    kWriterError,
+    kStorageUnavailable,
+    kEventCommitFailed,
+    kDrainTimeout,
+    kExecutorUnavailable,
+    kGenerationViolation,
+    kPoolFatal,
+};
+
 struct RecorderError {
     RecorderErrorCode code;
     RecorderPhase phase;
@@ -124,6 +155,16 @@ struct RecorderError {
 };
 
 struct RecorderOperationResult { bool ok = false; std::optional<RecorderError> error; };
+
+template <class Result>
+class RecorderControlHandle {
+public:
+    bool wait_for(std::chrono::milliseconds timeout) const;
+    bool done() const noexcept;
+    std::optional<Result> result() const;  // value only after DONE
+    bool cancel_if_not_started();          // only PENDING -> CANCELLED_NOT_STARTED
+};
+
 class RecorderShutdownHandle {
 public:
     bool wait_for(std::chrono::milliseconds timeout) const;
@@ -146,12 +187,14 @@ struct TopicOperationResult {
 
 class RecordingCoordinator {
 public:
-    StartResult start(const StartCommand&);
-    RecorderOperationResult stop(const RecordingTargetGuard&);
-    RecorderOperationResult pause(const RecordingTargetGuard&);
-    RecorderOperationResult resume(const RecordingTargetGuard&);
-    TopicOperationResult add_topic(const RecordingTargetGuard&, TopicInfo, const OperationId&);
-    TopicOperationResult remove_topic(const TopicTargetGuard&, const OperationId&);
+    RecorderControlHandle<StartResult> start(const StartCommand&);
+    RecorderControlHandle<RecorderOperationResult> stop(const RecordingTargetGuard&);
+    RecorderControlHandle<RecorderOperationResult> pause(const RecordingTargetGuard&);
+    RecorderControlHandle<RecorderOperationResult> resume(const RecordingTargetGuard&);
+    RecorderControlHandle<TopicOperationResult> add_topic(
+        const RecordingTargetGuard&, TopicInfo, const OperationId&);
+    RecorderControlHandle<TopicOperationResult> remove_topic(
+        const TopicTargetGuard&, const OperationId&);
     RecorderStatus status() const;
     TopicDiscoveryResult discover_topics(const TopicDiscoveryQuery&) const;
     HistoryPage query_history(const HistoryQuery&) const;
@@ -165,6 +208,8 @@ public:
 **Recording ID 规范。** `recording_id` 同时是协议身份与任务目录单一组件，V1.0 统一采用 ASCII `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`（1～64 字节，区分大小写）；不允许空格、点号、斜杠、反斜杠、百分号或 Unicode。Recorder 是最终权威校验者，Server/Client 可以提前执行同一校验但不能放宽。任务目录使用原值作为单层目录名；目录已存在一律返回 `RECORDING_EXISTS`，不做 Unicode/大小写/路径归一化后的“同名修正”。
 
 **Shutdown 是 Runtime 生命周期控制，不是普通外部 Control。** `request_shutdown()` 必须 O(1)、幂等：关闭 Recorder 外部 mutation admission，对当前 Task generation 原子关闭 ingress gate，并向 RecorderControlSequencer 的保留系统槽提交一次 Shutdown；重复调用返回同一个共享 Completion。Runtime 持续强持有 Recorder，并在独立管理/deadline 执行域等待 `RecorderShutdownHandle`。Sequencer 合并已在途 Stop，随后向 Writer/CleanupWorker/ResourceMonitor 发停止请求；只有对应线程已真实退出后才 join/释放对象并完成 Handle。若 Worker 永久卡在 Writer I/O、`remove_all()` 或 `statvfs()`，Handle 保持未完成，Runtime 超时进入 `UNSAFE_TO_DESTROY` 并保留整个对象图，禁止进入 Recorder 普通析构。
+
+`RecorderControlHandle` 是**进程内完成对象，不是 Operation Registry**：它不持久化、不提供跨进程查询，也不改变 Protocol 的 UNKNOWN 规则。Recorder 内部只对当前请求及其 Lease 保留共享 Completion；所有 waiter 消失后，已经 STARTED 的请求仍继续到 DONE。Server Control Worker 必须在取得 Handle 后继续观察其真实 DONE，网络 ResponseSink 可以更早超时/释放。
 
 `StartCommand` 是**唯一任务模式输入**。Runtime `RecorderConfig` 不再保存“当前 recording.mode”；它只保存 output_root、Rolling 默认 segment/retention、允许范围、StorageProfile、QoS 默认及全局资源预算。Server 将 Protocol Start 解析为 StartCommand，Recorder 在 Sequencer 内验证并生成 `EffectiveTaskConfig`：
 
@@ -203,7 +248,7 @@ Stop 和 Shutdown 的“幂等”是**安全意义的幂等**：重复请求不�
 
 ### 1.3.1 原生控制目标守卫的线性化接口（跨 Server/Recorder 阻断项）
 
-Server 的 Control Worker 可以在入队、出队、native 入口前反复验证 `expected_runtime_instance_id + recording_id + recording_generation`，**但仅在 Server 中前置读取 status() 不能构成 Recorder 层线性化目标守卫**：Timed Stop/Disk Protection/Stop 完成后，另一个 Task 可能在 Server 校验与实际 native `stop()/pause()/resume()` 之间切换。现有 C++ 方法 `stop(error) / pause(error) / resume(error) / remove_topic(name,operation_id)` **没有显式目标代际参数**，本补全稿明确将此列为实施阻断项，而非声称代码已安全。
+Server 的 Control Worker 可以在入队、出队、native 入口前反复验证 `expected_runtime_instance_id + recording_id + recording_generation`，**但仅在 Server 中前置读取 `status()` 不能构成 Recorder 层线性化目标守卫**：Timed Stop/Disk Protection/Stop 完成后，另一个 Task 可能在 Server 校验与实际 native mutation 之间切换。因此 V1.0 对 Server 暴露的 Stop/Pause/Resume/Add/Remove 领域 API **必须显式接收 Recording/Topic Guard**；不带目标代际的便利入口不得作为跨层正式接口。该 Guard 契约与 RecorderControlSequencer 是 Server 控制面实施的前置条件。
 
 领域目标守卫使用 §1.3 已定义的 `RecordingTargetGuard / TopicTargetGuard`；其线性化要求如下：
 
@@ -247,7 +292,7 @@ stateDiagram-v2
 |---|---|---|
 | Start | Idle、合法 StartCommand、磁盘安全、StorageProfile 可用、任务目录不存在 | 原子生成 Generation + EffectiveTaskConfig，Writer/Manifest 初始化完成后才开放 ingress；失败不得宣称 Recording |
 | Pause | Recording，或 Paused 且 reasons 中尚无 USER | 原子增加 USER；若本来 Recording 则先关闭 ingress，若已因系统原因 Paused 则保持关闭。已接纳数据不可静默丢弃；已有 USER 时返回 ALREADY_PAUSED/effects:NONE |
-| Resume | Paused 且 reasons 中存在 USER | 只移除 USER；之后重新计算所有系统原因。仍有 DISK_CRITICAL/DISK_UNKNOWN 时 SUCCESS 但保持 Paused；原因集合为空且未进入 Timed deadline/Stopping/Failed 才开放 ingress 并进入 Recording。没有 USER 时返回 INVALID_STATE/effects:NONE |
+| Resume | Paused，且 reasons 中存在 USER 或 DISK_RECOVERY_PENDING | 先取得新鲜磁盘安全样本；移除 USER，并在磁盘已安全且稳定期满足时移除 DISK_RECOVERY_PENDING。活动的 DISK_CRITICAL/DISK_UNKNOWN **绝不由 Resume 清除**。清理后 reasons 为空且未进入 Timed deadline/Stopping/Failed 才开放 ingress；如果仅存在仍有效的系统保护原因且没有可清除的 USER/PENDING，则按保护原因返回 `DISK_FULL` 或 `DISK_STATE_UNKNOWN` / effects:NONE |
 | Stop | Recording/Paused/可安全收尾的 Failed | 禁止新接入、在途 Producer 屏障、排空/故障诊断、Writer 关闭、持久化终态；反复 Stop 不得重放危险副作用 |
 | Add/Remove Topic | Recording/Paused 且实例状态允许 | Topic 终态成功依据订阅实际状态与持久化证据，不能以 PREPARED 代替 |
 | Status/Discover/History | 存活期 | 不改变录制状态、存储事实或清理意图 |
@@ -255,11 +300,12 @@ stateDiagram-v2
 
 状态转移必须在明确同步点生效；跨线程并发读到的 Snapshot 可以反映一个合法中间观察时刻，不应暴露半初始化的 Writer 指针或失效对象。失败后的重启应优先保留原始证据、进行安全收尾与新任务初始化；不得凭 `Failed` 直接覆盖失败任务目录。
 
-暂停归因使用**集合/位掩码** `PauseReasons`，允许同时包含 `USER / DISK_CRITICAL / DISK_UNKNOWN`。RecorderStatus 对外始终转为 `paused_reasons[]`；没有原因时为空数组，不存在会覆盖其他原因的标量。
+暂停归因使用**集合/位掩码** `PauseReasons`，允许同时包含 `USER / DISK_CRITICAL / DISK_UNKNOWN / DISK_RECOVERY_PENDING`。RecorderStatus 对外始终转为 `paused_reasons[]`；没有原因时为空数组，不存在会覆盖其他原因的标量。
 - 外部 Pause 在 reasons 尚无 USER 时增加 USER；Recording 状态先关闭 ingress，系统原因已使任务 Paused 时只增加归因，不重复执行关闭动作。已有 USER 的重复 Pause 明确拒绝且无副作用。
-- Disk CRITICAL/UNKNOWN 分别增加对应系统原因，绝不清除 USER；系统状态变化只更新相应系统原因，不能通过布尔赋值覆盖另一个原因。
-- 外部 Resume 的前置条件是 USER 存在；成功只移除 USER 并重新检查磁盘/Writer。若仍有系统原因，本次操作 SUCCESS 但 Recorder 保持 PAUSED；若没有 USER 则拒绝，不能借 Resume 清除系统保护。
-- 自动恢复只移除被新鲜安全样本证明解除的系统原因；仅 reasons 为空、Timed deadline 尚未触发且 Task 未 Stopping/Failed 时 Sequencer 才重新开放 ingress。
+- Disk CRITICAL/UNKNOWN 分别表示**当前仍生效的危险条件**，绝不由用户 Resume 直接清除，也绝不覆盖 USER。
+- 当磁盘重新达到安全阈值并持续 `resume_stable_sec`：若 `auto_resume=true`，Sequencer 移除已解除的 DISK_CRITICAL/DISK_UNKNOWN；若 `auto_resume=false`，Sequencer 将已解除的磁盘危险原因替换为 `DISK_RECOVERY_PENDING`，保持 ingress 关闭，明确表示“环境已安全但等待人工恢复”。
+- 外部 Resume 可在 USER 或 DISK_RECOVERY_PENDING 存在时调用：先复核新鲜磁盘样本，再移除 USER；只有安全稳定条件仍成立时才移除 DISK_RECOVERY_PENDING。活动 DISK_CRITICAL/DISK_UNKNOWN 保持不变。若最终 reasons 为空且 Timed deadline 未触发、Task 未 Stopping/Failed，才重新开放 ingress。
+- 仅存在仍有效的 DISK_CRITICAL/DISK_UNKNOWN 保护原因、没有 USER/PENDING 时直接 Resume 按保护原因返回 Recorder `DISK_FULL` 或 `DISK_STATE_UNKNOWN` / effects:NONE；Protocol 再统一映射为 `DISK_UNSAFE`。瞬时磁盘采样若已改善但稳定期尚未满足，不得把错误详情伪装成当前采样仍为 CRITICAL。用户无需先做一次人为 Pause 才能恢复系统暂停。
 - Failed/Stopping 的收尾可清空集合，但绝不触发恢复。
 
 **状态转移线性化与竞态矩阵**
@@ -301,7 +347,7 @@ stateDiagram-v2
 
 **优先级与状态保护：** STOP/SHUTDOWN、安全磁盘暂停优先于普通 Rotate；在本次任务已经 Stopping/Failed 时 Rotate 必须跳过。涉及磁盘 CRITICAL/UNKNOWN 的保护**先以无阻塞原子 Gate 禁止新准入**，随后 Sequencer 完成领域状态/诊断，不能等普通 Rotate 结束才关闭 ingress。外部 Server ControlWorker 仍只串行外部请求；二者都需经过 Recorder 的 Task 线性化 Guard，任何同一 Task 的 Stop Finalize 只能有一个所有者，独立线程不意味着允许并发 Writer 关闭。Sequencer 生命周期受 Runtime 关闭屏障约束：先停止 Timer 产生新事件、清空或安全完成在途命令，等待它真实退出，然后才能析构 Topic/Queue/Writer 和停止必需的 Executor/Context。
 
-**Timed 截止的硬准入边界。** Timed Task 创建 Timer 时捕获该 Task 的 generation-bound `TaskIngressGate`，而不是把“当前任务”作为裸指针概念。steady deadline 到达的 O(1) Timer 回调先对**该代际自己的 ingress gate**设置 `accepting=false`，再提交/合并 `TimedStop(generation)`。因此 Sequencer 即使正在等待另一个 Native 操作，也不会继续接纳截止点之后才尝试进入的新消息；截止前已经越过准入线性化点的 Producer 可以完成一次 enqueue，并由 Stop Drain。旧代际 Timer 迟到只会关闭旧 gate，Sequencer 发现 generation 不匹配后丢弃事件，绝不能关闭新 Task。Timer 回调不做 Writer Close/fsync，也不直接把状态伪装成 Idle；最终 `Stopping/Idle/Failed` 仍由 Sequencer 根据真实收尾推进。
+**Timed 截止的硬准入边界。** Timed Task 的 generation-bound `TaskIngressState` 保存**不可变 steady deadline**。每个 Producer 在 `try_enter()` 的同一个准入线性化操作中联合检查 `accepting`、Task/Topic generation 与 `SteadyClock::now() < deadline`；一旦观察到 `now >= deadline`，该 Producer 必须拒绝准入，并以无阻塞方式将本代际 gate 标为 deadline-expired/`accepting=false`、提交或合并 `TimedStop(generation)`。因此 **Timer 只是提前唤醒/收尾触发器，不承担截止正确性**：即使 ROS Executor 忙碌导致 Timer 晚执行 5 秒，截止后的新 Producer 仍不能越过准入点。截止前已经成功取得 ProducerToken 的消息可以随后 enqueue/Drain，即使实际 Writer write 发生在 deadline 之后；截止语义按**准入线性化时刻**而不是最终写盘时刻裁定。旧代际 Timer 或 Producer 只能触碰旧 TaskIngressState，绝不能关闭新 Task。Timer 回调不做 Writer Close/fsync，也不直接把状态伪装成 Idle；最终 `Stopping/Idle/Failed` 仍由 Sequencer 根据真实收尾推进。
 
 Rolling 的 `segment_duration` 不采用“硬停止 ingress”语义：它是**目标轮转周期**。deadline 到达只提交/合并 Rotate；若 Sequencer 正在执行更高优先级控制，当前 Segment 可以安全延长，宁可延迟轮转也不能并发关闭 Writer 或丢弃已接纳数据。状态/诊断应记录 rotation lag，不能把 `segment_duration` 宣传为物理文件严格最大时长。
 
@@ -334,7 +380,7 @@ Rolling 的 `segment_duration` 不采用“硬停止 ingress”语义：它是**
 
 ### 2.2.1 QoS 决策矩阵、Type Hash 与动态变化
 
-V1.0 对外 QoS 白名单严格为 `reliability`、`durability`、`history`、`depth`。不得接受并悄悄丢弃 `deadline`、`lifespan`、`liveliness`、`liveliness_lease_duration` 等未支持字段；明确返回字段路径和 `INVALID_ARGUMENT`。`depth` 必须是正整数且与 history 的语义一致；KEEP_ALL 不得伪造“depth 限制可靠性”的效果。RepeatPolicy 与 TopicQoS 相互独立，单 Topic 快照按 `max_messages/max_bytes` 双限制。
+V1.0 对外 QoS 白名单严格为 `reliability`、`durability`、`history`、`depth`。不得接受并悄悄丢弃 `deadline`、`lifespan`、`liveliness`、`liveliness_lease_duration` 等未支持字段；明确返回字段路径和 `INVALID_ARGUMENT`。`reliability` 只允许 `RELIABLE/BEST_EFFORT`，`durability` 只允许 `VOLATILE/TRANSIENT_LOCAL`，`history` 只允许 `KEEP_LAST/KEEP_ALL`；KEEP_LAST 的 `depth` 必须为 **1..10000**，KEEP_ALL 不接受有意义的 depth。RepeatPolicy 与 TopicQoS 相互独立：`enabled=false` 不接受 max 字段；`enabled=true` 要求 `max_messages=1..65536`、`max_bytes=1..16777216`，且还受 `snapshot.max_total_bytes` 等 Runtime 更严格预算。Direct C++ Add 与 Protocol Add 必须执行同一归一化/验证，不能由 C++ 入口绕过网络值域。
 
 **选取优先级**：显式用户 QoS > 当前发布者的兼容集合 > 已验证默认值。EXPLICIT 不因订阅连接不上而偷偷改成 AUTO。AUTO 在创建前使用 ROS Graph 发布端 endpoint profile 推断，与 RMW 的 requested/offered 兼容关系逐字段判断，而不是把所有发布者简单当相同服务端。典型优先策略：只要存在 BestEffort 发布者，应选 BestEffort 以兼容该组；只有当前全部已知发布者都提供 Reliable 时才可选 Reliable。TransientLocal 订阅只匹配能够提供相应 Durability 的 Publisher；存在 Volatile 时默认 Volatile。发布者集合为空、Unknown/系统默认 QoS 或有冲突策略时采用经配置验证的安全默认值并标注适配不确定性，不能返回伪造的确定兼容结论。History/Depth 的取值应在 Topic 创建时固定；不能仅依据 Publisher 当前 Offered History 推断实际 Buffer 不会溢出。
 
@@ -359,6 +405,8 @@ Hash 比较前须确认规范、算法与值的可比性；跨发行版不同哈
 ```
 
 `recording_generation` 区分连续任务；`topic_id` 标识任务内逻辑 Topic；`topic_epoch` 区分同名 Topic 的订阅创建世代。同名重添加可以复用 topic_id，但**必须有新的 topic_epoch**；Writer 统计、Snapshot、最近移除记录均按 ID/Epoch 关联。`operation_id` 则关联**一次 Topic 变更**，不自动等于 HTTP Request ID 或 SSE 事件 ID。
+
+**同名 Topic 的任务级存储签名不可变化。** V1.0 在同一个 recording task 内，以 Topic name 维护 `TopicStorageSignature = normalized_type + serialization_format + schema_encoding + schema_sha256`。第一次通过 Schema preflight 的 Add 建立该 name 的绑定；之后即使旧 Epoch 已 REMOVED，同名重添加也只能使用完全相同的 StorageSignature。类型名变化、serialization format 变化、schema encoding 变化，或同一类型名解析出的完整 Schema SHA-256 变化，均在创建新 Subscription、注册新 Writer Channel、写 `TOPIC_ADD_PREPARED` 之前拒绝为 `TYPE_CONFLICT/SCHEMA_UNAVAILABLE`，不得依赖新的 topic_epoch 让不同 CDR/Schema 混入同一任务。V1.0 **不实现“换类型时自动切新 Segment”**；需要类型变化时必须结束当前 recording 并 Start 新任务。Type hash 仅作可用时的附加诊断，不替代完整 Schema SHA-256。
 
 实例状态及其合法演进：
 
@@ -596,8 +644,9 @@ void on_serialized_message(
     std::shared_ptr<rclcpp::SerializedMessage> owner,
     const TopicInstanceToken& topic)
 {
-    // token captures Task/Topic generation and keeps lifetime guarded.
-    auto producer = task_ingress_.try_enter(topic);
+    // The admission linearization checks accepting + task/topic generation
+    // + the immutable Timed steady deadline in one guarded operation.
+    auto producer = task_ingress_.try_enter(topic, SteadyClock::now());
     if (!producer) { count_paused_or_stale(topic); return; }
 
     const auto bytes = serialized_size(*owner);
@@ -731,7 +780,7 @@ Writer 公平性要用故障注入验证：在大量高速消息持续入队时�
 
 **Normal：** 显式 Start/Stop。零消息可以合法结束；如没有形成实际 Segment，持久化记录准确表示空 Segment 集合；如果空 Segment 已打开，应安全关闭并如实记录。不得周期性生成无意义空 Segment。
 
-**Timed：** 调用者给定正持续时间，以 steady/monotonic 时间计算到期，暂停时间**仍计入期限**。deadline 到达时先关闭该 Task Generation 的 ingress gate；截止前已经获得准入的消息允许完成写入，随后 Sequencer 执行完整 Stop/Drain，因此任务进入 Idle 的时刻可以晚于 deadline。录制诊断区分 `elapsed_wall_sec`、`elapsed_active_sec`、`paused_total_sec`；它们不等于消息时间戳的 ROS Clock。到期行为完全由 Recorder 内部触发，不能因 UI/Client 断开失效。
+**Timed：** 调用者给定正持续时间，以 steady/monotonic 时间计算不可变 deadline，暂停时间**仍计入期限**。**每次 Producer 准入都在 TaskIngressState 的线性化点检查该 steady deadline**；Timer 仅负责尽早提交 TimedStop，Timer 调度延迟不允许扩大录制接入窗口。截止前已经获得 ProducerToken 的消息允许完成 enqueue/write，随后 Sequencer 执行完整 Stop/Drain，因此任务进入 Idle 的时刻可以晚于 deadline。录制诊断区分 `elapsed_wall_sec`、`elapsed_active_sec`、`paused_total_sec`；它们不等于消息时间戳的 ROS Clock。到期行为完全由 Recorder 内部触发，不能因 UI/Client 断开失效。
 
 **Rolling：** 单任务按分段时长轮转，形成可独立 rosbag2 读取的 Segment；retention 使用 Segment 完成时间计算清理资格。每次轮转在关闭前一个 Writer、打开新 Segment、重注册 Topic 与重放 Snapshot 后才重新开放 ingress。Writer 操作失败不得强行恢复接入或继续宣称正常 Recording。
 
@@ -757,7 +806,9 @@ output_root/
 
 **Rolling 长期保留与磁盘容量边界**
 
-Rolling 的保留策略需要明确三个时间概念：**分段时长**决定何时尝试创建新 Segment；**完成时刻**决定该完整 Segment 的保留年龄；**保留时长**决定 Cleanup 的最早删除资格。超时并不立即保证文件删除完成，删除由 CleanupWorker 的有界工作队列与持久化意图推进。
+Rolling 的保留策略需要明确三个时间概念：**分段时长**决定何时尝试创建新 Segment；**完成时刻**记录可展示的 UTC 事实并建立本进程的 steady 完成点；**保留时长**决定 Cleanup 的最早删除资格。超时并不立即保证文件删除完成，删除由 CleanupWorker 的有界工作队列与持久化意图推进。
+
+**Retention 删除授权不使用墙钟差值。** Segment 在本进程完成时同时记录 `completed_at_utc_ns`（持久化/展示）和内存中的 `completed_at_steady`；只用 `completed_at_steady + retention_duration` 判断本进程内何时可从 COMPLETE 授权为 DELETING。系统 UTC 前跳、回跳、NTP 校时或 ROS/use_sim_time 变化均不得提前产生删除授权。跨 Runtime 重启时 steady 时间不可比较：对尚为 durable COMPLETE 的 Segment，Recovery **从本次启动发现该 Segment 的 steady 时刻重新计满一个完整 retention_duration** 后才允许新建 DELETING 授权，因此可能保留更久但绝不因墙钟跳变提前删除；对崩溃前已经 durable DELETING 的 Segment，删除授权已经持久化，Recovery 可以按幂等规则继续删除，不重新等待 retention。墙钟只用于 History 显示/筛选，不是 Cleanup 权限来源。
 
 **保留窗口示例：** Segment 时长 60 s、保留 600 s 的任务运行 20 分钟。一个 Segment 在第 60 秒完成后，直到达到所记录完成时间加 600 秒才有删除资格；它进入 DELETING 之前必须仍处于 COMPLETE。暂停第 5 分钟并不暂停此窗口，因此第 11 分钟以后该已完成 Segment 可以被删除；处于当前打开的 Segment 不具备清理资格。保留策略不能直接用“目前 Segment 总数 × 时长”来推断所有分段可删。
 
@@ -771,14 +822,14 @@ Rolling 的保留策略需要明确三个时间概念：**分段时长**决定�
 
 **V1.0 实施规则：**
 
-1. Start 对于没有 Topic 数据的任务允许打开**最多一个空的 Writer Segment**以完成元数据/Channel 注册；其物理 Segment 是否存在必须在 Manifest 如实记录。与当前源码中 Start 立即 open 的做法相容。空 Segment 不等于本 Task 已录入消息。
+1. Start 对于没有 Topic 数据的任务允许打开**最多一个空的 Writer Segment**以完成元数据/Channel 注册；其物理 Segment 是否存在必须在 Manifest 如实记录。空 Segment 不等于本 Task 已录入消息。
 2. `window_deadline` 到期，如果当前 Segment **从未成功写入 Live 消息，且不存在必须独立持久化的 Topic Event/Schema 证据**，只按 steady clock 推进逻辑窗口（可一次跳过多个过期窗口，时间复杂度 O(1)）；不 close/open Writer，不分配新的 segment_id，不对单纯 Snapshot 重放创建物理空段。保留这个已打开的空 Segment 最多一份，避免长时 Pause/零消息导致磁盘无限增长。
 3. 第一条可合法接纳的 Live 消息抵达时，若仍有空 Writer，则将它作为该物理 Segment 的第一条 Live 数据，**同时把有效 Segment 窗口起点重置为首条 Live 写入时刻**；不能拿 Start 时刻作为其唯一有效数据窗口而在这条消息写入前立即旋转。若没有已打开 Writer，先在 Writer Thread 安全 open/register 再 write，不能让回调直接进入 rosbag2。
 4. 对已有至少一条 Live 消息的 Segment，到期需要关闭 ingress → 等 Producer Drain → Writer Queue Drain → Finalize/Close + Manifest 完成持久化 → 新 Segment 的 open/register/Snapshot Replay → 开放 ingress。下一段可以延迟到首条新 Live 消息再打开；若采用延迟打开，不得在无 Writer 时接纳任何无法保证写入的消息。**最简单的 V1.0 路径是：关闭旧段后只建立一个空的后继 Writer，后续空窗口继续抑制轮转。**
 5. Snapshot Replay 只在真实创建一个新物理 Segment 后执行一次，必须保持 Topic Epoch/原始接收时间戳；**禁止为了在空闲期反复重放 Snapshot 而每个周期创建新 Segment**。Replay 后没有新的 Live 消息也不应再次因到期创建 Segment。对“只有 Replay 的后继段”应记录它曾写入 Replay，但空闲判定仍以 `written_live` 为准，并确保不会误删携带真实可读 Replay 数据的物理段。
 6. Stop、Topic Remove/ARMED、Pause/Resume、Writer 故障必须以真实 Writer/Manifest/Event 文件状态收尾；物理 Segment 未持久化 COMPLETE 不得出现虚构的逻辑完成项，完成文件为空也不得伪造 written_live。
 
-**实施差异：** 当前 `RecordingCoordinator::start_impl()` 会立即 open `segment_000000`，`rolling_timer_` 到期直接 `rotate_segment()`，尚未实现上述无 Live 数据时的轮转抑制；而且内部 current_segment_id=1 对应 path `segment_000000`，与本文更直观的 0-based ID/Name 同一规则不同，须同步修改实现、Manifest 与测试（项目尚未发布，无须保存历史编号兼容）。必须根据这套规则修改 Recorder/Writer 状态机，并以 FakeSteadyClock 和实际 MCAP Reader 验证：零消息持续 1000 个窗口、暂停 1000 个窗口、首次消息在长空闲之后、Replay-only 段以及时限边界与 Stop 交错。Timer 回调只能提交受控控制请求，不在 Executor 回调或 Coordinator Mutex 中同步等待 Writer 的同一执行域。
+**验证要求：** 必须以 FakeSteadyClock 和实际 MCAP Reader 验证零消息持续 1000 个窗口、暂停 1000 个窗口、首次消息在长空闲之后、Replay-only 段以及时限边界与 Stop 交错；物理 Segment ID 必须从 0 连续递增且目录名与 ID 一致。Timer 回调只能提交受控控制请求，不在 Executor 回调或 Coordinator Mutex 中同步等待 Writer 的同一执行域。
 
 ## 4.2 WriterAdapter、控制公平性与 Segment 边界
 
@@ -837,7 +888,9 @@ struct WriterRequest {
 
 **Stop 性能与有界性**不是给 Stop 任意设置很短的超时然后丢弃队列。应先在上游关闭 ingress，终止新增负载，再让 Writer 按批次推进直到 Queue 空或遇到明确异常。Stop Duration 可测量并告警。**在没有证据证明 Writer Close、Drain 与 Manifest 收尾完成时，Recorder 必须保留 `Stopping`（操作仍可能完成）或在已经确认不可恢复的领域故障后进入 `Failed`，并附 `DRAIN_TIMEOUT/WRITER_ERROR` 等诊断；不得转为 Idle/COMPLETE。** 底层同步 MCAP I/O 可能永久阻塞，同进程不能安全强制抢占；超时不能释放仍被使用的 Writer/Pool、不能伪造退出。Server 已确认 Recorder 返回 DRAIN_TIMEOUT 时可报告明确失败；**HTTP 超时、取消或失联而没有本次请求结果证据时仍返回操作 `UNKNOWN`**，后续状态刷新不能替代终态。不可自动重试有副作用的 Stop。**Runtime Shutdown 跨层约束：** Recorder 的 Stop/Shutdown 若在预设有限等待预算内仍停留 `Stopping`，应记录 `DRAIN_TIMEOUT`、关闭新的控制入口，并把“Recorder 尚未安全终结”明确上报 Runtime；可以独立收尾不再被 Writer/Recorder 引用的 Server 连接与诊断资源（仅指不持有 Recorder 对象引用、不依赖 Writer/Queue/Pool 生命周期的 Server 侧日志、连接和已脱离 Recorder 的缓存快照）；**正在执行的 `status()` 或其他持有 Recorder 对象引用的调用，必须在 Recorder 析构前完成或满足可验证的安全隔离/生命周期保护条件**，不得仅关闭 HTTP 连接就释放 Recorder。**不允许因为超时就 detach 仍使用 Recorder 数据的 Writer 线程、销毁其 Pool/Task/Writer 对象、停掉其仍依赖的 Executor/ROS Context，或释放仍可能写入的输出根目录锁**。若同步 Writer I/O 永久不可中断，不能承诺同进程内安全继续完成全部对象析构；Runtime 的有限等待、失败退出和受控异常进程终止策略由 `architecture.md` 的关闭屏障与 `server.md` 具体定义。正常清理无法完成时不得写 COMPLETE/EXITED；异常进程终止的未完成文件交由下次启动 Recovery 保守处理。
 
-**Writer Close 的“成功”分级**：完成 `rosbag2_writer.close()`、完成必要 metadata、Manifest 持久化终态，三者不可互相替代。Metadata 成功但 Manifest 持久化失败时，Segment 的数据可能完整，但任务完成事实仍未知；反过来 Manifest 预写成功却 Writer Close 失败时，不能用 Manifest 声称 MCAP 完整。只有所有必要阶段完成才能由 Recorder 返回成功的 Stop。
+**Writer Close 的“成功”分级**：完成 `rosbag2_writer.close()`、完成必要 metadata、数据/目录同步、Manifest 持久化终态，四者不可互相替代。Metadata 成功但 Manifest 持久化失败时，Segment 的数据可能完整，但任务完成事实仍未知；反过来 Manifest 预写成功却 Writer Close 或数据同步失败时，不能用 Manifest 声称 MCAP 完整。只有所有必要阶段完成才能由 Recorder 返回成功的 Stop。
+
+**V1.0 `COMPLETE` 是有条件的断电持久化承诺。** 支持范围限定为本地 POSIX 文件系统及存储栈正确实现 `fsync`/目录 `fsync`/原子 rename 和写屏障的部署；不对违反这些语义的硬件、控制器缓存或网络文件系统作额外保证。Segment 从 FINALIZING 提交 COMPLETE 的顺序固定为：① 停止准入并 Drain 已接纳消息；② Writer Thread 成功 `close()`，取得最终 MCAP/metadata 文件集合；③ 对该 Segment 所有必须持久化的普通文件执行平台适配的 `fsync`（可在 Writer close 后重新安全打开文件描述符），任一失败即不得 COMPLETE；④ `fsync(segment_directory)` 固化文件名/metadata 目录项；⑤ 若 Segment 目录是新创建项，先 `fsync(task_directory)` 固化该目录项；⑥ 才按 §4.5 的 temp-file → file fsync → rename → task-directory fsync 提交 Manifest 中该 Segment 的 COMPLETE。Start 创建新的 task 目录后，在首个 durable Manifest 引用它之前还必须 `fsync(output_root)`。任何 data/metadata/directory sync 失败都进入 FAILED/INCOMPLETE 证据路径，不删除相关文件，也不以 Reader 暂时可打开替代持久化证明。
 
 
 ## 4.3 MCAP Schema、CDR、时间戳和独立分析
@@ -887,7 +940,7 @@ Schema 编码范围至少应覆盖：
 - 多层自定义 package 消息以及同名类型不同 package；
 - 固定数组、无界/有界动态序列、字符串与复杂嵌套；
 - 类型定义资源缺失、循环依赖或无法解析时明确失败或标记不完整；
-- 一个 Segment 中 Topic 重添加的 type_hash/Schema 一致性验证。
+- 同一 recording task 内 Remove A → 同名 Add A 仅在完整 StorageSignature 相同才允许；Remove A → 同名 Add B、以及同类型名但 Schema SHA-256 变化均必须在新 Writer/Subscription 副作用前拒绝。
 
 **验证策略必须同时覆盖两类失败。** 录制端创建 Writer/Topic 时的失败，应直接阻止不安全写入；分析端独立解码失败，说明系统没有满足 FR-DAT-02，即便录制端 Writer 没有返回错误也不能算通过。Humble/Jazzy 的 2×2 录制端×分析端验证需要保存原 MCAP、Topic 元数据、解码结果及消息字段对照，以避免依赖分析设备偶然安装了原始消息包。
 
@@ -955,7 +1008,7 @@ Snapshot 重放需要与 Rolling 语义一致：
 
 Manifest 至少表达：`schema_version`、`recording_id`、`recording_generation`、`effective_config`、recording_state、topic_events_file、last_error、secondary_errors、segments、cleanup_pending；Segment 至少包含 segment_id、path、state、完成时刻（允许未知值）。要支持历史索引的起止时间、消息统计等信息时，应由 Recorder 确保来源可验证；缺失字段返回 Unknown/Absent 而不伪造零。若新增字段，应做版本和向后可读性评审。
 
-Manifest 持久化采用**写临时文件 → fsync 文件 → atomic rename → fsync 父目录**的 POSIX 模式，并保持同目录/同文件系统约束；不能将 rename 单独等同于完整断电持久化。同步状态更新与磁盘写入失败须有确定处理，不允许旧异步写入覆盖较新的 Segment 状态。
+Manifest 持久化采用**写临时文件 → fsync 文件 → atomic rename → fsync 父目录**的 POSIX 模式，并保持同目录/同文件系统约束；不能将 rename 单独等同于完整断电持久化。**Manifest 的 COMPLETE 只能在对应 Segment 的 MCAP、metadata 与必要目录项已经按 §4.2 成功同步之后提交**；Manifest fsync 只证明 Manifest 自身提交，不替代数据文件的 fsync。同步状态更新与磁盘写入失败须有确定处理，不允许旧异步写入覆盖较新的 Segment 状态。
 
 Topic Events 使用按行独立 JSON 的 append-only 形式，关键字段包括：
 
@@ -1162,7 +1215,7 @@ ResourceMonitor 提供**磁盘安全**与**进程遥测**两组独立语义，�
 
 磁盘采样失败保留最近可用数字作为历史诊断，但状态可能因陈旧变为 UNKNOWN，不能伪造“空间为 0”。磁盘状态年龄和保护超时使用 steady clock；Recorder 不应在持有状态锁时等待 `statvfs`。采样系统调用被底层磁盘拖住时，控制线程依然能够检测样本过期，避免将旧安全样本当成最新状态。
 
-**保护性暂停：** CRITICAL/UNKNOWN 时先阻止新接入，再通过 Producer/Writer 的安全边界处置已接纳消息；安全最终关闭无法完成时保留 INCOMPLETE/FAILED 证据，不能虚报 COMPLETE。USER Pause 不因磁盘变好自动解除；人工 Resume 必须重新检查有效磁盘样本。仅系统原因暂停允许在 `auto_resume=true` 且安全持续 `resume_stable_sec`、没有 Timed 到期/Failed 时自动 Resume。
+**保护性暂停：** CRITICAL/UNKNOWN 时先阻止新接入，再通过 Producer/Writer 的安全边界处置已接纳消息；安全最终关闭无法完成时保留 INCOMPLETE/FAILED 证据，不能虚报 COMPLETE。USER Pause 不因磁盘变好自动解除；人工 Resume 必须重新检查有效磁盘样本。仅系统原因暂停在安全持续 `resume_stable_sec` 后进入“可恢复”阶段：`auto_resume=true` 时移除系统危险原因并在无其他原因时自动恢复；默认 `auto_resume=false` 时把已解除的危险原因转换为 `DISK_RECOVERY_PENDING`，继续保持 ingress 关闭，等待用户**一次直接 Resume** 清除此 pending latch。Resume 永不清除仍处于 CRITICAL/UNKNOWN 的活动危险原因。
 
 参考默认配置（用于工程配置，不是适用于任意硬件的性能保证）：
 
@@ -1197,7 +1250,7 @@ used_percent = 100 * (total_bytes - usable_bytes) / total_bytes
 | NORMAL | 使用率超过 warning_percent | WARNING，记录持续状态与警告 |
 | NORMAL/WARNING | 使用率达到 pause_percent、或 usable_bytes 低于 min_free_bytes | CRITICAL，执行保护性暂停 |
 | CRITICAL | 采样恢复正常但尚未低于 resume_percent 或稳定期不足 | 继续 CRITICAL/系统暂停，不允许抖动式反复 Resume |
-| CRITICAL/UNKNOWN | 安全恢复、满足稳定期且 USER Pause 不存在 | 可转 NORMAL，是否自动 Resume 还受 auto_resume 与 Writer 可用性限制 |
+| CRITICAL/UNKNOWN | 安全恢复并满足稳定期 | Resource 状态可转 NORMAL；`auto_resume=true` 时移除对应系统原因，`auto_resume=false` 时替换为 DISK_RECOVERY_PENDING。只有 reasons 为空才自动重开 ingress；否则等待显式 Resume |
 | Paused(USER) | 任意磁盘恢复 | 保留 USER 暂停意图，不能仅凭恢复样本自动 Resume |
 
 采样有效性通常由 steady clock 的最近成功单调时间计算；磁盘样本展示给外部的时间戳可使用墙钟。若系统进入 suspend/resume 或 ROS 仿真时间改变，数据采样新鲜度不应依赖仿真时钟。ResourceMonitor 停止或挂死时，Controller/Status 不得无限等待其 mutex；应有可读的最近快照和显式有效性。
@@ -1231,7 +1284,7 @@ ResourceMonitor 永久阻塞在 statvfs 时，已有样本超过 steady freshnes
 
 ## 5.2 RecorderStatus：线程安全、语义与成本
 
-`RecordingCoordinator::status()` 提供按值返回的**只读 Recorder Snapshot**，包括：稳定状态、任务 ID/Generation/目录、不可变 `EffectiveTaskConfig`、错误与有界二级错误、`PauseReasons`、运行/活动/暂停时长、Queue/Pool、磁盘/进程样本、活跃 Topic、有限最近移除 Topic、Topic 收发/写入/丢弃、QoS/Publisher 与频率状态。
+`RecordingCoordinator::status()` 提供按值返回的**只读 Recorder Snapshot**，包括：稳定状态、任务 ID/Generation/目录、不可变 `EffectiveTaskConfig`、错误与有界二级错误、`PauseReasons`、运行/活动/暂停时长、Queue/Pool、磁盘/进程样本、活跃 Topic、有限最近移除 Topic、Topic 收发/写入/丢弃、QoS/Publisher 与频率状态。V1.0 `secondary_errors` 最多保留最近 8 项；单个 ErrorRef 的字符串/details 必须满足 `protocol.md` 的有界网络结构，Recorder 内部更详细的第三方异常只能进入受保护日志，不能让 Status 无界增长。
 
 跨层一致性分为：
 
@@ -1310,7 +1363,9 @@ Recorder 领域对 output_root 内任务提供只读列表、按 ID/名称/时�
 
 **并发访问语义：** 正在 Recording 的 Task 可能更新 Manifest，Rolling 可能把 Segment 从 COMPLETE 转成 DELETING/REMOVED。历史查询不允许在无锁/无版本验证条件下混合两个 Manifest 版本的字段；原子 rename 后一次文件打开要么读到完整前一版本，要么读到完整新版本，不应拼成半个 JSON。对同一 Page 内多个 Task，不保证全局单一时刻一致，但每条 Entry 的来源与有效性必须自洽。
 
-**分页规则：** V1.0 只支持 offset/limit BEST_EFFORT 分页，不提供 Cursor。目录增删可能导致跨页重复/漏项，Client 需要强一致的用户视图时从 offset=0 完整刷新。Recorder 不维护常驻历史数据库或分页快照。搜索过滤、最大扫描条目/字节、排序结果和 diagnostics 都必须有上限，防止远程请求迫使 Recorder 分配或扫描无界历史。
+**分页规则：** V1.0 任务列表只支持 offset/limit BEST_EFFORT 分页，不提供 Cursor。目录增删可能导致跨页重复/漏项，Client 需要一致列表时从 offset=0 完整刷新。单任务 Segment 详情同样必须分页：`segment_offset` 非负、`segment_limit` 默认 100/最大 200；一次 `get_history()` 不得物化无限 `segments[]`。Recorder 不维护常驻历史数据库或分页快照。搜索过滤、最大扫描条目/字节、排序结果和 diagnostics 都必须有上限，防止远程请求迫使 Recorder 分配或扫描无界历史。
+
+**长期 Rolling 的 Manifest 元数据也必须有界。** RuntimeConfig 提供 `history.max_segment_records_per_task`（V1.0 初始默认 4096）。在创建下一物理 Segment 前，Recorder 可以只压缩**最老且已 durable REMOVED 的连续前缀记录**，将其归并为 `segment_history_summary = {segments_created_total, segments_removed_total, removed_segments_compacted_total, compacted_through_segment_id}`；任何 WRITING/FINALIZING/COMPLETE/DELETING/INCOMPLETE/FAILED 记录都不得为节省空间而丢弃。`segments[]` 因而只保存未压缩的真实 Segment 记录，详情 API 明确返回 compacted summary，不能假装这些历史从未存在。若达到上限且没有足够 REMOVED 前缀可安全压缩，则**禁止创建下一 Segment、关闭 ingress 并返回 Recorder `RESOURCE_EXHAUSTED`，诊断 `message/details` 明确 `METADATA_CAPACITY`**，而不是让 Manifest/Recovery 内存无界增长或丢弃仍有意义的记录。
 
 **只读契约严格性：** `list_history()`、`get_history()` 必须不触发写入、fsync、Recovery 或 Segment 删除；如果需要读取很大的历史目录，应与 status() 分离，由有界查询执行环境完成，而不是占用 ROS Executor 或 Writer Thread。Server 可施加超时和请求容量限制，但不能为方便 Web 查询自行解码完整 MCAP 来补造 Manifest 缺失的数据。
 
@@ -1318,29 +1373,36 @@ Recorder 领域对 output_root 内任务提供只读列表、按 ID/名称/时�
 
 Recorder 的失败分类须使操作结果可诊断且保持安全：
 
-| 类别 | 含义 | 必要效果 |
+| RecorderErrorCode | 典型含义 | 必要效果 |
 |---|---|---|
-| INVALID_ARGUMENT / NOT_FOUND / TYPE_CONFLICT | 参数、Topic/类型发现错误 | 明确拒绝，不能隐式修改已录制数据 |
-| INVALID_STATE | 当前录制状态不允许操作 | 返回合法状态诊断，不创建第二活动任务 |
-| RESOURCE_EXHAUSTED | Queue/Pool/Topic/控制容量耗尽 | 有界拒绝、增加正确计数；普通资源压力不一律 fail-fast |
-| DISK_FULL / DISK_STATE_UNKNOWN | 磁盘不安全 | Start/Resume 禁止，活动接入保护 |
-| WRITER_ERROR / STORAGE_UNAVAILABLE | 写入或持久化失败 | 关闭危险路径，保留错误与恢复证据 |
-| DRAIN_TIMEOUT / EXECUTOR_UNAVAILABLE | 不能保证销毁或写入完成 | 不虚报成功，保留 Failed/Unknown |
-| GENERATION_VIOLATION / POOL_FATAL | 严重身份/所有权协议破坏 | 拒绝污染数据；确认的 Pool 结构损坏使用 fail-fast |
+| `INVALID_ARGUMENT` | 参数/closed-schema/范围非法 | 副作用前拒绝，effects:NONE |
+| `NOT_FOUND / TOPIC_NOT_FOUND` | 任务或目标 Topic 不存在 | 副作用前拒绝，effects:NONE |
+| `TYPE_CONFLICT / TYPE_SUPPORT_UNAVAILABLE / SCHEMA_UNAVAILABLE / UNSUPPORTED_QOS` | Topic 类型、类型支持、完整 Schema 或 QoS 不满足 | Add 副作用前拒绝，effects:NONE |
+| `INVALID_STATE / ALREADY_PAUSED / ALREADY_FINISHED` | 当前状态或重复操作不允许 | 不伪造幂等成功；无新副作用时 effects:NONE |
+| `RECORDING_EXISTS / STALE_RECORDING / STALE_TOPIC_EPOCH` | 任务目录已存在或目标身份过期 | 必须在本次 mutation 副作用前拒绝 |
+| `RESOURCE_EXHAUSTED` | Queue/Pool/Topic/控制/历史元数据容量耗尽 | 有界拒绝或安全停止接入；普通资源压力不一律 fail-fast |
+| `DISK_FULL / DISK_STATE_UNKNOWN` | 磁盘不安全或样本不可信 | Start/Resume 禁止；活动任务按保护规则关闭 ingress |
+| `WRITER_ERROR / STORAGE_UNAVAILABLE` | Writer/MCAP/metadata/fsync/目录持久化失败 | 关闭危险路径，保留 INCOMPLETE/FAILED 与恢复证据 |
+| `EVENT_COMMIT_FAILED` | Topic Event durable 终态提交失败 | 不把可见但未可信提交的 Event 当成功；effects 可为 POSSIBLE/CONFIRMED_PARTIAL |
+| `DRAIN_TIMEOUT / EXECUTOR_UNAVAILABLE` | 已开始操作无法在领域安全边界内确认 Drain/Executor 完成 | 返回明确 FAILURE 与真实 effects；不得伪造完成，且不等同 HTTP 504 |
+| `GENERATION_VIOLATION / POOL_FATAL` | 严重身份/所有权协议破坏 | 拒绝污染数据；确认的 Pool 结构损坏使用 fail-fast |
+
+上述集合是 **V1.0 RecorderErrorCode 的穷尽集合**。新增枚举必须同时更新 `protocol.md` §4.2.1、Server Mapper、Client Parser/错误模型和参数化契约测试；不得在网络层使用“default: INTERNAL_ERROR”隐藏新增领域码。
 
 诊断至少带时间、组件、严重度、关键任务/Topic 身份、相关错误；凭证及敏感 payload 不写入普通状态、API 或日志。二级错误日志/状态有界，不能覆盖首个关键失败原因。Recorder 不直接构造 HTTP 错误模型。
 
-配置采用分组：`recording`、`executor`、`control`、`topics`、`queue`、`pool`、`writer`、`cleanup`、`storage`、`snapshot`、`resource`、`disk`、`status`。不支持的 YAML 键或不安全取值应校验拒绝，避免悄悄忽略影响数据正确性的参数。
+配置采用分组：`recording`、`executor`、`control`、`topics`、`queue`、`pool`、`writer`、`cleanup`、`storage`、`snapshot`、`history`、`resource`、`disk`、`status`。不支持的 YAML 键或不安全取值应校验拒绝，避免悄悄忽略影响数据正确性的参数。
 
 | 分组 | 重点边界 |
 |---|---|
-| recording | mode、output_root、segment/retention 时长正数、安全路径 |
+| recording | output_root、Rolling 默认 segment/retention 时长正数及允许范围；**不含当前 mode**，任务 mode 只来自 StartCommand |
 | control | RecorderControlSequencer 外部请求队列容量，默认 64；内部安全事件使用独立固定槽，不由该容量挤占 |
 | topics | discovery timeout、max_active_topics、max_distinct_topics、recent_removed_instances |
 | queue | max_bytes、max_messages、batch_size、wait_timeout_ms、overflow_policy=drop_newest |
 | pool | global_mutex 正式模式的 capacity_factor/max_capacity/max_fallback；TLS/local/batch 仅实验配置，不进入正式 YAML |
 | writer/cleanup | 有界控制容量、控制/数据公平性、单线程清理告警；`cleanup.queue_capacity=16`、`cleanup.retry_interval_sec=2` 由已有 CleanupWorker 线程完成定时退避 |
 | storage/snapshot | storage_id=mcap、config_file、max_cache_size=0、全局/Topic Snapshot 限额 |
+| history | `max_segment_records_per_task` 默认 4096，Segment detail limit 默认 100/最大 200；只压缩 durable REMOVED 前缀 |
 | resource/disk/status | 普通遥测与磁盘安全独立，采样时间、有效性、频率窗口 |
 
 参考配置为 `queue.max_bytes=64 MiB`、`max_messages=65536`、`batch_size=256`、`writer.control_queue_capacity=64`、`snapshot.max_total_bytes=16 MiB`、`recording.default_segment_duration_sec=60`、`recording.default_retention_duration_sec=600`。这些是可调整的初始参数，**不是任意 Camera/LiDAR 载荷或 CPU/RSS 的统一性能保证**。相对配置文件与输出路径须规定解析基准；任务运行中不热应用模式、保留、压缩或默认 QoS。
@@ -1352,8 +1414,9 @@ Recorder 的失败分类须使操作结果可诊断且保持安全：
 | `StartCommand.mode/duration` | NORMAL duration=null；TIMED duration>0；ROLLING duration=null；只存在一个 `start(StartCommand)` 入口 | INVALID_ARGUMENT / effects:NONE |
 | `StartCommand.segment_duration / retention_duration` | 仅 ROLLING 有意义；缺省取 Runtime defaults，最终均>0 且在 chrono 范围 | INVALID_ARGUMENT；任务启动后不可更改 |
 | `queue.max_messages / max_bytes` | 均为正；批次上限不大于有界处理范围；计算预估容量防溢出 | ConfigError |
+| `history.max_segment_records_per_task / segment_detail_*` | records 上限 >0；detail default/max 均 >0 且 default<=max<=records 上限 | ConfigError |
 | `pool.capacity_factor × max_messages` | 计算需检查浮点有效、ceil、整型转换溢出和 max_capacity；固定节点容量不足时明确 fallback/拒绝策略 | ConfigError；绝不无界分配 |
-| TLS 实验参数 `pool.local_capacity / batch_size` | 正式 global_mutex 配置不得依赖这两个值；实验构建启用 TLS 时二者须为正且有界 | 正式配置出现 TLS-only 参数可拒绝或明确忽略并诊断；实验配置非法则 ConfigError |
+| TLS 实验参数 `pool.local_capacity / batch_size` | 正式 global_mutex 配置不得依赖这两个值；实验构建启用 TLS 时二者须为正且有界 | 正式 V1.0 配置出现 TLS-only 参数直接 ConfigError；实验配置非法同样 ConfigError，不允许静默忽略 |
 | `topics.max_active / max_distinct` | active 不超过 distinct 且有上限；最近移除记录有独立固定界 | ConfigError |
 | `writer.max_control_batch` | 大于零，控制队列容量和停止唤醒策略配套 | ConfigError |
 | `cleanup.queue_capacity / retry_interval_sec` | 容量正数，重试间隔正数，作为已有 CleanupWorker 唤醒/退避周期；待删 claim 批量不得超过 Queue 剩余容量，不新增线程/Coordinator Timer | ConfigError |
@@ -1374,60 +1437,30 @@ Recorder 的失败分类须使操作结果可诊断且保持安全：
 
 
 
-### 5.4.1 配置默认值、Cleanup 重试与当前代码偏差
+### 5.4.1 RecorderConfig 完整初值表与双入口验收
 
-这是**实施前置清单**，不是修改 C++ 源码后的已验证结论。配置从 YAML 和直接构造 `RecorderConfig` 必须逐字段使用同一默认值与共用 validate；正式代码/API 与 `config/recorder.yaml` 不一致时不得视为实施完成。
-
-| 契约 | 当前源码基线（本轮核对） | 处理条件 |
-|---|---|---|
-| ControlSequencer | 当前 mutation 仍由多个调用线程直接进入 Coordinator；Timer 回调可同步进入 Stop/Rotate | 新增单线程 RecorderControlSequencer；外部请求有界，内部安全事件独立保留/合并 |
-| TaskConfig 来源 | 当前 RecorderConfig.recording.mode 决定 start/start_timed 分支，和 HTTP per-Start mode 目标冲突 | 改为单一 start(StartCommand)；RuntimeConfig 只提供默认/范围，Task 保存 EffectiveTaskConfig |
-| StorageProfile 冻结 | Writer 每次 open_segment 当前直接引用全局 storage_config_uri | Runtime 启动解析配置，Start 物化 task-local storage_config；Rolling 不重读全局文件 |
-| PauseReasons | 当前 paused_by_user_/paused_by_disk_ 二值会互相覆盖，Status 仅单字符串 | 使用 PauseReasons 集合；Resume 只清 USER，系统原因独立 |
-| Executor Bridge | Add/Remove/clear_task 当前用 1 ms Timer + future wait；回调 STARTED 后 timeout 仍可能迟到执行 | 引入 ExecutorCallState CAS；clear_task 未 DONE 时 Stop 不得释放 Task |
-| Start 磁盘 Gate | start_impl() 当前同步调用 ResourceMonitor::sample()/statvfs | 改为等待 Worker 首采样状态；Sequencer 不直接执行 statvfs |
-| Task 目录唯一性 | 当前 create_directories(task_directory_) 接受已存在目录 | 使用 no-replace 单目录创建并返回 RECORDING_EXISTS |
-| 接收时间戳 | process_message() 当前使用 node_->now()，受 use_sim_time 影响 | 使用 system_clock Unix 接收时间；期限/窗口使用 steady_clock |
-| ProducerToken 生命周期 | TopicRuntime 的 TaskIngress 已间接强持有 Queue，但 ProducerToken 自身只存 MessageQueue*，安全依赖成员关系 | ProducerToken 直接持 shared_ptr<MessageQueue>，将生命周期不变量局部化 |
-| Pool 默认模式 | C++/YAML 当前默认 TLS，Coordinator 没有每 Task flush 长寿命 Executor TLS Cache 的安全路径 | V1.0 改为 global_mutex；TLS 仅实验 |
-| 内部 Topic operation_id | clear_task_on_executor() 当前多个 Topic 复用字符串 shutdown | Event 使用 origin=INTERNAL/cause，operation_id=null；Evidence 仅聚合 EXTERNAL UUID |
-| `executor.thread_count=1` | `config/recorder.yaml` 为 1，但 `include/ros2_bag/config.hpp` 仍为 4 | 直接构造改为 1，新增双入口单元测试；多 Worker 仍需 RMW 安全证据 |
-| `cleanup.retry_interval_sec=2` | C++ CleanupConfig 与 YAML 均尚无 retry_interval 字段，仅 Rolling Timer 会扫描部分 COMPLETE，尚无通用失败重试 | 配置模型与加载/校验补齐，由 CleanupWorker 单线程 wake+claim 执行有界重试 |
-| 清理队列拒绝入队 | `schedule_retention_cleanup()` 忽略 enqueue(false)，扫描仅 COMPLETE | 读取 durable pending 并重试，无重复入队，不丢原意图 |
-| Cleanup 失败 | `complete_cleanup()` 在失败时仍擦除 cleanup_pending | 删除失败继续保留 durable DELETING/pending，待重试 |
-| 频率 Gap 连续窗口 | `TopicManager::update_frequency_snapshot()` 每次跨 10ms slot 即可增长 low counter | 每个独立完整评估周期最多推进一次；按 §5.2.1 和 verification.md 的 V-REC-FREQ 系列测试 |
-| Writer 计数 | 内部 `written` 累加真实/Replay 的历史实现需迁移 | `written_live` / `replayed_to_new_segment` 分开，Status/Protocol/AC-10/16 对齐 |
-| Rolling 空段 | 现有 Timer 可按固定间隔调用 rotate_segment() | 按 §4.1.1 决策实现有界空 Segment 策略，不损失首次消息/Topic Epoch |
-
-**实施事实：** 当前 CleanupWorker 线程已经存在，但没有上述定时 claim/重试机制；`schedule_retention_cleanup()` 只扫描 COMPLETE 且忽略 enqueue(false)，`complete_cleanup()` 在失败时擦掉 pending，这都是必须修复的代码缺陷。新实现应在 CleanupWorker 的单线程循环内完成退避唤醒，与 Coordinator 的 durable pending 身份 claim/结果提交配合，不能在 Recorder 的 ROS Executor 回调里 fsync Manifest 或等待 remove_all。配置从 YAML 与直接 RecorderConfig 构造使用统一 validate。
-
-实现与测试的直接依据是本文、`requirements.md` 和 `verification.md`；发现 API/算法存在缺陷时直接修改设计，涉及网络字段则同步更新 `protocol.md`/`server.md`/`client.md`。不要将已经废弃的方案或历史测试编号当作现行开发任务。
-
-
-
-### 5.4.2 RecorderConfig 完整初值表与双入口验收
-
-以下是**目标 V1.0 默认值**，不是声称目前 `include/ros2_bag/config.hpp` 和 `config/recorder.yaml` 已保持一致。配置表的具体名称以代码构造/YAML 映射的统一规则定义；不能凭本表自动变更录制中 Task 的冻结配置。
+以下是 **V1.0 规范性默认值**。C++ 直接构造与 YAML 装载必须形成同一个归一化 `RecorderConfig`，并通过共用校验逻辑；任一实现入口与本表不一致均视为未满足设计。配置表的具体名称以代码构造/YAML 映射的统一规则定义；不能凭本表自动变更录制中 Task 的冻结配置。
 
 | 组 | 配置与默认 | 必须验证 |
 |---|---|---|
 | recording | `output_root=./recordings`、`default_segment_duration_sec=60`、`default_retention_duration_sec=600` | Runtime 不保存 active mode；StartCommand 决定 mode，Rolling 缺省值从这里复制到 EffectiveTaskConfig；Output Root 正规化且进程独占 |
 | control | `queue_capacity=64`；内部 Stop/WriterFailure/Shutdown 使用固定系统事件槽 | 外部 admission 有界；内部安全事件不因外部队列满而丢失 |
 | executor | `thread_count=1` | YAML/Direct C++ 一致、Humble RMW 多 Worker 前安全验证 |
-| topics | `discovery_timeout_ms=2000`、`allow_empty_topics=false`、`max_active_topics=64`、`max_distinct_topics=256`、`recent_removed_instances=32` | 容量/身份不可复用、未知发布端不伪造 |
+| topics | `discovery_timeout_ms=2000`、`allow_empty_topics=false`、`max_active_topics=64`、`max_distinct_topics=256`、`recent_removed_instances=32` | 容量/身份不可复用、未知发布端不伪造；QoS/RepeatPolicy 采用 §2.2.1 的 V1.0 硬值域 |
 | queue | `max_bytes=67108864`、`max_messages=65536`、`batch_size=256`、`wait_timeout_ms=20`、`overflow_policy=drop_newest` | 双预算不会溢出，失败一次性归还 |
 | pool | `enabled=true`、`mode=global_mutex`、`capacity_factor=1.25`、`max_capacity=1000000`、`max_fallback_in_use=1024`、两个 Payload Cache=0；TLS 参数只用于实验构建 | pool capacity ceil 后检查 overflow/NaN/Inf/Index 上限；正式配置不接受 TLS，除非未来重新通过设计与性能准入 |
 | writer | `control_queue_capacity=64`、`max_control_batch=8` | Stop/Rotate 控制公平；数据继续被消费 |
 | cleanup | `queue_capacity=16`、`warning_timeout_sec=30`、`retry_interval_sec=2`（需同步实现 C++/YAML） | 使用 CleanupWorker 线程 wait_for 退避；durable pending 每次失败保留 |
 | storage | `storage_id=mcap`、`compression=LZ4`、`compression_level=FASTEST`、`chunk_size=786432`、`max_cache_size=0`；启动时解析 `config/mcap.yaml` | 仅 NONE/LZ4；Start 时物化 task-local storage_config，后续 Segment 不重新读取全局文件 |
 | snapshot | `max_total_bytes=16777216` | 加单 Topic max_messages/max_bytes 双约束 |
+| history | `max_segment_records_per_task=4096`、`segment_detail_default_limit=100`、`segment_detail_max_limit=200` | 仅 durable REMOVED 连续前缀可压缩；达到上限且无法安全压缩时拒绝继续创建 Segment |
 | resource | `enabled=true`、`sample_interval_sec=2` | 只决定普通遥测；Disk Protection 仍强制工作 |
 | disk | `check_interval_sec=2`、`initial_sample_timeout_ms=2000`、`max_sample_age_sec=10`、`unknown_after_failures=3`、`warning_percent=80`、`pause_percent=90`、`resume_percent=85`、`min_free_gb=2`、`auto_resume=false`、`resume_stable_sec=10` | 首采样等待有界；升降阈值、steady 稳定时间、磁盘真实 age，UNKNOWN 拒绝 |
 | status | `frequency_window_sec=1.0`、`frequency_bucket_ms=10` | Ring slot+2 后容量 ≤1000；gap 独立 W 周期评价 |
 
 **配置来源与一致性测试：** ① 使用空/最小 YAML 装载所有默认；② 直接构造 `RecorderConfig{}` 并调用统一 validate；③ 对每个支持字段配置相同覆盖值并比较归一化后的值对象；④ 对未知键、负数转 unsigned、整数溢出、NaN/Inf 容量因子、时长/百分比关系、UTF-8/文件路径穿越分别注入 ConfigError；⑤ Runtime 启动后修改磁盘 YAML 不得改变当前或下一 Task；安全重启 Runtime 后才重新加载并影响新 Task。Path 规则需明确：Output Root 相对 Runtime 工作目录，Storage 插件 config_file 相对配置文件自身目录，二者不可混淆；无配置文件的 C++ 直接构造须有确定、可验证的 Storage Path 基准。
 
-**当前代码已观察到的违例**：C++ `ExecutorConfig.thread_count=4`、YAML=1；C++ `CleanupConfig` 尚无 `retry_interval_sec`；当前 `validate_recorder_config` 对非有限的 capacity_factor 等异常输入的覆盖需专项测试；Frequency Slot 与 Gap 两次完整评价周期不一致。这些均不得以“配置已默认正确”结论跳过。
+**双入口一致性是强制验收项**：`ExecutorConfig.thread_count`、Cleanup 重试字段、非有限/溢出数值校验、Frequency Window/Gap 等所有配置都必须在直接构造与 YAML 路径得到同一归一化结果和同一错误语义；不得以某一个入口“默认正确”替代逐字段测试。
 
 # 6. 可靠性验证与契约追踪
 

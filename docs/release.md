@@ -2,7 +2,7 @@
 
 | 属性 | 内容 |
 |---|---|
-| 版本 | v0.1.0 |
+| 版本 | v0.1.2 |
 | 状态 | **DRAFT — 发布方案仍可调整，未产出 Release Artifact** |
 | 需求 | requirements.md NFR-COMP-01～04 / AC-19～21，及 verification.md 的 V-* 测试 |
 | 验证 | verification.md；任何历史测试结论都不代替当前代码的真实测试 |
@@ -21,7 +21,7 @@
 | Storage | rosbag2、mcap plugin、LZ4、Schema/Writer 配置 | plugin load trace，Reader + 独立解码 |
 | Server | Drogon v1.9.14、Trantor 及其动态依赖与许可证 | lock、动态链接闭包 |
 | Python | Python 3.10/3.12、httpx 0.28.1、httpx-sse 0.4.3 | lockfile/hash、isolated wheel install |
-| Security | 本机 Loopback、远程 OPEN-04 决策、证书/代理信任边界 | Config 校验和攻击用例 |
+| Security | Bearer Credential/Scope、TLS direct/trusted-proxy、证书/代理信任边界、Web Session/CSRF | Config 校验、Secret 泄漏检查与 AC-18 攻击用例 |
 | Runtime Config | recorder.yaml、mcap.yaml、server.yaml 的实际内容与 SHA | 与 Direct C++ 构造默认值的单测 |
 
 构建/打包的任何临时 patch 必须进入受控 Source Commit，不允许“开发机器上手工改过才成功”的无法再现制品。ROS 2/RMW 若为系统依赖，Manifest 应记录版本与先决条件而非私自将整个 ROS 安装目录复制进 tar。
@@ -123,14 +123,14 @@ sha256sum -c SHA256SUMS
 2. 检验 Config 文件可读、unknown key 或不安全端口配置被拒绝，Recorder output_root 归一化、权限、两进程 lock 互斥；
 3. 用真实 ROS 2 Publisher 发有序消息、Start/Add/Stop，验证 MCAP CDR/Schema 和 Manifest/Event，一段可以独立读回；
 4. 通过 Python wheel 发受保护 GET/控制 POST、消费 SSE、故障模拟 UNKNOWN/断线/重连，SDK 无 rclpy 强依赖；
-5. CLI/TUI/Web 的 MUST 接口实际启动，显示 UNKNOWN/INCOMPLETE/Topic Graph/History，Web 身份/CSRF、TLS/远程方案符合 OPEN-04；
+5. CLI/TUI/Web 的 MUST 接口实际启动，显示 UNKNOWN/INCOMPLETE/Topic Graph/History；Runtime Bearer Scope、TLS/受信代理及 Web Session/CSRF 通过 AC-18；
 6. 退出并核对 Writer/Reader/Pool/Server Stream 均无悬挂内存/FD/活跃写入，保留允许的数据目录和恢复证据。
 
 每个平台需要 Install Log、Dependency Tree、Plugin Trace、Config/Artifact SHA、原始 MCAP、验收输出、Owner 签审；不能把插件“能找到”替代“确实从该路径加载”。
 
 ## 3.2 统一编码规范/静态检查
 
-保留§D 的意图但不复制历史 UDS 布局：C++17 头文件/实现/namespace/符号命名成体系，include guard 和 ABI/所有权清楚；高频回调禁止磁盘/HTTP/长锁；Raw Pointer 不得暗示强所有权；Mutex、Atomics、exception/noexcept、Fatal/Recoverable 区分；不使用 Debug-only assert 作为生命周期安全保障。
+统一代码质量合同：C++17 头文件/实现/namespace/符号命名成体系，include guard 和 ABI/所有权清楚；高频回调禁止磁盘/HTTP/长锁；Raw Pointer 不得暗示强所有权；Mutex、Atomics、exception/noexcept、Fatal/Recoverable 区分；不使用 Debug-only assert 作为生命周期安全保障。
 
 CI 最低执行固定版本 clang-format、Clang 静态检查及 `-Wall -Wextra -Wpedantic`；项目现有 .clang-format 若缺失须经代码评审建立，不能悄悄格式化所有来源文件当成“通过质量验收”。Python 基础 Client 在 Python 3.10/3.12 的语法、导出、Typed DTO、sync/async Close、MockTransport 与 HTTP/SSE Parser 测试均需实际执行；基础 SDK 不引入 ROS Python ABI/应用依赖。检查器应只检查或生成 Diff，未经审查不得自动改写实现并宣布 PASS。
 
@@ -165,21 +165,22 @@ CI 最低执行固定版本 clang-format、Clang 静态检查及 `-Wall -Wextra 
 
 | Gate | 文件 | 最低合格证据 | Gate 结果 |
 |---|---|---|---|
-| G0 | docs/g0_admission_review.md | Pool/Queue/DataModel 结构、Schema Fixture、项目自有 ASan/TSan、Humble 外部 RMW 风险复现及责任记录 | ALLOWED / BLOCKED，条件准入仅允许继续开发 |
+| G0 | docs/g0_admission_review.md | Pool/Queue/DataModel 结构、Schema Fixture、项目自有 ASan/TSan、Humble 外部 RMW 风险复现及责任记录 | ALLOWED / ALLOWED_WITH_CONDITIONS / BLOCKED；条件准入仅允许继续开发 |
 | G1 | docs/g1_review.md | Recorder/Writer/Recovery/HTTP/Client/SSE 的故障注入、首轮标准负载和问题登记 | ALLOWED / BLOCKED |
 | G2 | docs/g2_review.md | Humble/Jazzy × AMD64/ARM64 原生运行、2×2 MCAP 自包含解码、依赖链接验证 | ALLOWED / BLOCKED |
-| G3 | docs/g3_release_review.md | AC-01～27 及当前 V-* 测试、OPEN-01/02/04、TSan 最终处置、发布包/哈希/干净安装 | APPROVED / REJECTED |
+| G3 | docs/g3_release_review.md | AC-01～27 及当前 V-* 测试、OPEN-01/02、AC-18 Security、TSan 最终处置、发布包/哈希/干净安装 | APPROVED / REJECTED |
 
-G0 的 APPROVED_WITH_CONDITIONS 不等于 G3 可发布。当前 Humble Fast DDS TSan 风险仍 OPEN；必须使用实际 Humble RMW/FastDDS/spdlog 插桩与最小 ROS Reproducer，记录传播栈、缓解/修复证据。即使确认某个告警来自外部依赖，也不说明项目自有 C++ 代码无竞态。确认数据损坏、UAF 或严重并发失效不得凭签字跳过。可以单人同时担任 Tech Lead/Project Owner，但需要如实记录，不能伪造独立审查人。
+G0 的 ALLOWED_WITH_CONDITIONS 不等于 G3 可发布。当前 Humble Fast DDS TSan 风险仍 OPEN；必须使用实际 Humble RMW/FastDDS/spdlog 插桩与最小 ROS Reproducer，记录传播栈、缓解/修复证据。即使确认某个告警来自外部依赖，也不说明项目自有 C++ 代码无竞态。确认数据损坏、UAF 或严重并发失效不得凭签字跳过。可以单人同时担任 Tech Lead/Project Owner，但需要如实记录，不能伪造独立审查人。
 
 ## 4.2 发布判定的机器门禁
 
 ```text
 G3 RELEASE APPROVED only if:
   all current V1.0 MUST features implemented
-  AND new AC-01..27 per required platform PASS
+  AND AC-01..27 per required platform PASS
   AND all required verification.md V-* cases evidenced
-  AND OPEN-01, OPEN-02, OPEN-04 formally closed
+  AND OPEN-01, OPEN-02 formally closed
+  AND AC-18 V1.0 Security PASS
   AND Humble FastDDS TSan risk disposition evidenced and approved
   AND MCAP standalone custom Schema 2x2 PASS
   AND native AMD64/ARM64 runs, sanitizers, 600s standard load PASS
@@ -187,7 +188,7 @@ G3 RELEASE APPROVED only if:
   AND artifacts can clean-install without development source tree
   AND build-manifest, dependency lock, SHA256SUMS, licenses, evidence index exist
   AND Release Owner explicitly records APPROVED.
-Otherwise: BLOCKED.
+Otherwise: REJECTED.
 ```
 
 CI/发布脚本要拒绝缺测试 ID、PENDING/NOT_RUN 伪装为 PASS、找不到的证据文件、Hash 不匹配或未审核的替代测试。修改源码、依赖、Config 或 Docker Base Image 后，受影响的验证证据必须重跑，不能无条件继承Release Candidate 的 PASS。正式发布不是复制文档里曾写过的 FROZEN 字样。

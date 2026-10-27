@@ -2,14 +2,14 @@
 
 | 属性 | 内容 |
 |---|---|
-| 文档版本 | v0.1.5 |
+| 文档版本 | v0.1.7 |
 | 文档状态 | **DRAFT — V1.0 开发阶段，随时修订；规范尚未批准用于完整实施** |
 | 适用范围 | Recorder Runtime 的 HTTP/1.1、JSON、SSE 跨语言协议 |
 | 架构依据 | docs/architecture.md（开发稿，可直接联动修改） |
 | 产品需求 | docs/requirements.md（开发稿，可直接联动修改） |
 | 领域依据 | docs/recorder.md（开发稿，可直接联动修改） |
 | 技术选型 | `docs/system_technology_selection.md`；Drogon、HTTPX、httpx-sse |
-| 下游文档 | `docs/server.md`、`docs/client.md`；CLI/TUI/Web 设计文件尚未编写，在对应 Application 实现前补齐 |
+| 下游文档 | `docs/server.md`、`docs/client.md`；CLI/TUI/Web 的 Application 契约在对应实现前补齐，可统一或按应用拆分 |
 
 # 1. 协议范围与通用约定
 
@@ -30,6 +30,7 @@ V1.0 不提供：通用 Operation Registry、异步任务调度 API、幂等重�
 | 传输 | HTTP/1.1，TCP；远程访问必须受 TLS 保护；默认仅限本机监听 |
 | 控制与查询 | JSON，`Content-Type: application/json; charset=utf-8`；UTF-8 |
 | 通知 | HTTP SSE，`Content-Type: text/event-stream; charset=utf-8` |
+| 认证 | 所有 Runtime HTTP/SSE 使用 `Authorization: Bearer <opaque-token>`；Token 对应 `read` 或 `control` scope，`control` 包含 `read` |
 | API Prefix | `/api/v1`；该主版本决定路由与不兼容变更边界 |
 | JSON 版本 | 顶层 `api_version: "1.0"`；不等同 Runtime/Recorder/Schema 版本 |
 | 请求 ID | 每次 HTTP 请求独立的 `request_id`，用于传输诊断 |
@@ -111,7 +112,7 @@ HTTP GET、POST 控制与 SSE 共用清晰的版本/授权/过载语义。Server
 
 对外状态模型是 Reporter 的**权威观察快照**，不是 Manifest 文件的替代、不是持久操作结果表。HTTP Status 可以由 Server 取得 Recorder 快照并映射；SSE 由有界采样与变化通知驱动。HTTP 当前状态的版本必须由 Server 发布协调器统一管理，不能让并发 GET 在背后独立制造一套不一致的 revision。
 
-不得在 Cookie/浏览器会话中隐式推定 Recorder 控制面已获授权。Web 必须通过其 Server 后端访问同一 Protocol/Client，Web 会话与 CSRF 由 Web 单独承担。远程访问认证方案与 TLS 部署仍属于需求 OPEN-04 的发布前决策，见 §6.1 和 §6.4。
+不得在 Cookie/浏览器会话中隐式推定 Recorder 控制面已获授权。Web 必须通过其 Server 后端访问同一 Protocol/Client，Web 会话与 CSRF 由 Web 单独承担。V1.0 Runtime API 的认证方案已由 OPEN-04 裁定为预共享不透明 Bearer Token + `read/control` scope；远程访问强制 TLS，部署与攻击验证见 §6.1、`server.md` 与 AC-18。
 
 # 2. HTTP 资源与状态变更操作
 
@@ -208,11 +209,11 @@ Server 在真正调用 Recorder 前验证 **Runtime 身份、任务 ID、Generat
 |---|---|---|
 | `stop` | 关闭 ingress、Producer/Writer Drain、Writer Close 与必要 Manifest 终态完成 | `state: IDLE`、本次已完成 `recording_id` |
 | `pause` | 不再允许新消息接入、暂停归因已发布；已接纳数据可以继续安全写入 | `state: PAUSED`、`paused_reasons` |
-| `resume` | 仅清除本任务 USER 暂停意图并完成安全复核；系统暂停原因不由用户请求清除 | 返回真实 `state` 与 `paused_reasons`；只有原因集合为空时才为 RECORDING |
+| `resume` | 清除本任务 USER 暂停意图，并在磁盘已安全且稳定期满足时确认 `DISK_RECOVERY_PENDING`；活动系统危险原因不由用户请求清除 | 返回真实 `state` 与 `paused_reasons`；只有原因集合为空时才为 RECORDING |
 
 Stop 的 200/SUCCESS 不表示用户还能从 HTTP 重新开始原来的 recording_id，也不能在失败时强行将 INCOMPLETE 标为 COMPLETE。发生 `DRAIN_TIMEOUT` 时，若 Server 确实取得 Recorder 的领域错误结果，可返回 `FAILURE + DRAIN_TIMEOUT`，其 `effects: POSSIBLE`；若网络已经超时且没有可信领域结果，则本次请求是 `UNKNOWN`。Recorder 可能仍为 `STOPPING`，状态不能当成调用结果的替代。
 
-Paused 原因值域固定为 `USER / DISK_CRITICAL / DISK_UNKNOWN`，使用集合语义。Pause 在尚无 USER 时增加 USER，即使任务已经因磁盘原因 PAUSED 也可 SUCCESS；已有 USER 再 Pause 返回 `ALREADY_PAUSED / effects:NONE`。Resume 的前置条件是 USER 存在，只移除 USER：若移除后仍有 DISK_CRITICAL/DISK_UNKNOWN，Resume 为 SUCCESS 但状态保持 PAUSED；只有原因集合为空、Timed deadline 未触发且 Task 未进入 Stopping/Failed 才重新开放 ingress。若 USER 原本不存在，Resume 返回 `INVALID_STATE / effects:NONE`，绝不清除系统原因。Server 不得自行增加或删除原因。
+Paused 原因值域固定为 `USER / DISK_CRITICAL / DISK_UNKNOWN / DISK_RECOVERY_PENDING`，使用集合语义。错误响应中的 `details.protection_reason` 表示仍阻止 Resume 的保护锁存原因，不等同于 Status 中最新的 `disk.state`。Pause 在尚无 USER 时增加 USER，即使任务已经因磁盘原因 PAUSED 也可 SUCCESS；已有 USER 再 Pause 返回 `ALREADY_PAUSED / effects:NONE`。`DISK_CRITICAL/DISK_UNKNOWN` 表示对应系统保护仍然生效：可能是当前采样仍危险，也可能是瞬时采样已改善但 `resume_stable_sec` 尚未满足，因此不能把 paused reason 当成最新 `disk.state` 的别名。`DISK_RECOVERY_PENDING` 表示默认 `auto_resume=false` 下危险已经解除并满足稳定期、但 ingress 继续关闭等待人工确认。Resume 可在 USER 或 DISK_RECOVERY_PENDING 存在时调用：移除 USER，并仅在 Recorder 用新鲜安全样本再次确认后移除 DISK_RECOVERY_PENDING；仍生效的 DISK_CRITICAL/DISK_UNKNOWN 永不由 Resume 清除。最终 reasons 为空且 Timed deadline 未触发、Task 未 Stopping/Failed 时才重新开放 ingress。仅有仍生效的系统保护且无 USER/PENDING 时返回 `DISK_UNSAFE / effects:NONE`。Server 不得自行增加、替换或删除任何暂停原因。
 
 **重复操作规则：** 在 Recorder 明确已完成且当前状态非法时返回相应 INVALID_STATE/ALREADY_FINISHED 诊断；“安全上可以再次调用 Stop”不等于对外无条件幂等或自动返回 SUCCESS。Client 不应在请求 UNKNOWN 后自动发第二次 Stop/Pause/Resume。
 
@@ -233,7 +234,16 @@ Paused 原因值域固定为 `USER / DISK_CRITICAL / DISK_UNKNOWN`，使用集�
 }
 ```
 
-字段要求：`name` 是 ROS 2 绝对 Topic 名，不是文件路径；`type` 可以省略，唯有 Graph 当前发现唯一类型时才能解析；多类型冲突拒绝并给出候选类型诊断。`qos.mode=AUTO` 由 Recorder 依据可见发布端选择兼容策略；`qos.mode=EXPLICIT` 则需显式 reliability、durability、history、depth 等经支持的参数，不允许一半显式一半默默自动推断。`repeat_policy.enabled=true` 时按 Recorder 要求提供正数 `max_messages` / `max_bytes` 等限额，仍受全局 Snapshot Budget 约束。
+字段要求：`name` 是 ROS 2 绝对 Topic 名，不是文件路径；`type` 可以省略，唯有 Graph 当前发现唯一类型时才能解析。**如果当前 Graph 对同名 Topic 观察到多个类型，则无论请求是否显式提供 `type` 都必须拒绝 `TOPIC_TYPE_CONFLICT`**；V1.0 不允许用请求中的 type 从多类型 Graph 中“选择一个”。显式 `type` 只用于约束唯一可见类型/类型支持必须与调用者预期一致。Recorder 还必须执行任务级 TopicStorageSignature 检查：同一 recording task 内该 name 曾成功绑定不同 type/serialization/schema 时，在任何新 Writer/Subscription/PREPARED 副作用前拒绝。
+
+**TopicAdd 子对象是 closed schema，并具有明确值域：**
+
+- `qos.mode=AUTO` 时 `qos` 只允许 `mode`，不得同时携带 EXPLICIT 字段；Recorder 根据当前 Publisher endpoint profiles 与冻结默认值求兼容配置。
+- `qos.mode=EXPLICIT` 必须给出 `reliability=RELIABLE|BEST_EFFORT`、`durability=VOLATILE|TRANSIENT_LOCAL`、`history=KEEP_LAST|KEEP_ALL`。`KEEP_LAST` 必须给 `depth`，范围 **1..10000**；`KEEP_ALL` 禁止携带有意义的 depth（省略或 null）。不支持字段如 deadline/lifespan/liveliness 一律 `INVALID_ARGUMENT`，不能忽略。
+- `repeat_policy.enabled=false` 时禁止 `max_messages/max_bytes`；`enabled=true` 时两者都必填，`max_messages` 为 **1..65536** 的 JSON integer，`max_bytes` 为 **1..16777216** 的 JSON integer，并且仍不得超过 Runtime 当前 `snapshot.max_total_bytes` 等更严格预算。超界为 `INVALID_ARGUMENT/effects:NONE`。
+- `type`、Topic name、QoS/Repeat 字段还受通用 JSON 字符串/Body 大小限制；Server 与 Client 不自行扩大 Recorder 允许值域。
+
+这些上限是 V1.0 协议安全上界，不等同于性能保证；Recorder 可以因当前 Runtime 更小的资源预算进一步拒绝，但不能静默截断请求。
 
 Add 成功的数据：
 
@@ -479,7 +489,9 @@ Remove 按**具体 Topic Epoch** 执行，不允许只按名称删除“当前�
 | `cleanup.cleanup_queue_full_count` | 满队列导致的累计拒绝，绝不等于删除失败次数 |
 | `disk.state` | `NORMAL / WARNING / CRITICAL / UNKNOWN`，安全判断不以旧 sample 数字代替 |
 | `process.valid` | 未采样/初始差分不足/关闭时标记 false；CPU、RSS、FD 等不可得数据使用 null |
-| `last_error / secondary_errors` | 结构化 ErrorRef，有 code、message、phase、发生时间和可选关联 ID；容量有界 |
+| `last_error / secondary_errors` | 结构化 ErrorRef；`secondary_errors` 最多 8 项，Recorder 只保留最新有界诊断；不得因列表增长使 Status 无界 |
+
+**ErrorRef V1.0 结构边界：** 非 null ErrorRef 必须包含 `code`、`message`、`phase`、`at`；`code/phase` 为协议已定义 ASCII 枚举/标识且各不超过 64 bytes，`message` 为 UTF-8 且最多 1024 bytes，`at` 为 RFC3339 UTC。可选 `recording_id/topic_id/topic_epoch/operation_id` 必须遵守各自身份格式。`details` 最多 16 个键、编码后最多 4096 bytes；键为受限 ASCII 标识，值仅允许 string/boolean/integer/null 或协议对该 ErrorCode 明确定义的有界小数组，不允许任意递归 JSON。Server 负责在网络边界验证/映射，不能把 C++ exception text、栈、路径或第三方任意对象原样塞入 ErrorRef。
 
 **只有两个 V1.0 规范性写入计数**，不公开含混的 `written` 别名。`written_live + replayed_to_new_segment` 可表示 API 已报告的两类成功写入次数之和，但**不表示独立 Publisher 消息数、没有丢失或 Segment 已 durable COMPLETE**。未采集 CPU 等指标不以 0 冒充采集；未知系统状态不静默归为 NORMAL。
 
@@ -534,7 +546,7 @@ Remove 按**具体 Topic Epoch** 执行，不允许只按名称删除“当前�
 
 ## 3.4 历史录制列表与详情
 
-`GET /api/v1/recordings?limit=100&offset=0&name_prefix=run_&started_after=...&started_before=...`，以及 `GET /api/v1/recordings/{recording_id}`。查询仅返回允许展示的元信息，不包含 MCAP 原始数据或物理文件内容。路径仅可作为 Recorder 受控输出根目录内的展示信息；远程只读角色是否允许看绝对路径属于安全策略，不应向未授权用户暴露宿主目录布局。
+`GET /api/v1/recordings?limit=100&offset=0&name_prefix=run_&started_after=...&started_before=...`，以及 `GET /api/v1/recordings/{recording_id}?segment_limit=100&segment_offset=0`。查询仅返回允许展示的元信息，不包含 MCAP 原始数据或物理文件内容。路径仅可作为 Recorder 受控输出根目录内的展示信息；远程只读角色是否允许看绝对路径属于安全策略，不应向未授权用户暴露宿主目录布局。
 
 列表参数：
 
@@ -543,6 +555,7 @@ Remove 按**具体 Topic Epoch** 执行，不允许只按名称删除“当前�
 - `started_after / started_before` 可选 RFC 3339 UTC，含义为起始时间范围；只要指定任一时间过滤，缺失 start_time 的任务就从 items 排除，并在 diagnostics 中报告 `unknown_start_time_excluded` 数量，不伪造 1970 年数据。
 - 未指定时间过滤时，排序固定为：已知开始时间倒序，时间相同时按 recording_id 字典序；所有 start_time 未知的任务排在已知组之后，并按 recording_id 字典序。
 - `has_more` 表示本次只读扫描观察到的后续结果；动态新任务/清理会影响跨页一致性，不能称为全局冻结快照。
+- 单任务详情的 `segment_limit` 默认 100、最大 200，`segment_offset` 非负；它只分页**尚未被安全压缩的 Segment 明细**。Recorder 可能把最老的 durable REMOVED 连续前缀压缩为历史汇总，因此详情必须同时返回 `segment_history_summary`，不能把未返回的旧 REMOVED 解释为从未存在。
 
 ```json
 {
@@ -577,7 +590,7 @@ Remove 按**具体 Topic Epoch** 执行，不允许只按名称删除“当前�
 
 历史 `recording_state` 使用 `RECORDING / PAUSED / STOPPING / COMPLETE / INCOMPLETE / FAILED / UNKNOWN`。这是**历史任务持久化/读取视图**，与当前 `recorder.state` 不完全相同；例如某个历史任务为 INCOMPLETE，并不意味着新 Runtime 的 Recorder 现在为 Failed。已删除的 Rolling Segment 在详情中以状态 `REMOVED` 表示，不把它们从历史事实中悄悄抹去。
 
-`GET /api/v1/recordings/{recording_id}` 返回同一 HistoryEntry 加上有界 `segments` 列表，Segment 含 ID、状态（`WRITING / FINALIZING / COMPLETE / DELETING / REMOVED / INCOMPLETE`）、可读相对标识、开始/完成时间及可得消息数。缺少 Manifest、权限不足或数据损坏时应返回合法 UNKNOWN/诊断或错误；**不能从“文件目录还在”推断 COMPLETE**。
+`GET /api/v1/recordings/{recording_id}` 返回同一 HistoryEntry 加上分页 `segments` 列表。Segment 含 ID、状态（`WRITING / FINALIZING / COMPLETE / DELETING / REMOVED / INCOMPLETE`）、可读相对标识、开始/完成时间及可得消息数；另返回 `segment_page:{limit,offset,has_more}` 与 `segment_history_summary:{segments_created_total,segments_removed_total,removed_segments_compacted_total,compacted_through_segment_id}`，其中累计值使用十进制字符串，high-water mark 无压缩时为 null。已压缩的历史只允许来自 durable REMOVED 连续前缀；不能从 summary 反推出已删除文件仍存在。缺少 Manifest、权限不足或数据损坏时应返回合法 UNKNOWN/诊断或错误；**不能从“文件目录还在”推断 COMPLETE**。
 
 历史读取由 Recorder 域负责，V1.0 每次按查询范围读取 Manifest/Recovery，**默认不维护跨请求缓存**。Server 不重写解析、Recovery 或索引。对同一次历史查询，返回对象必须来自每项任务自洽的已读版本；多个任务间不保证全局同一时刻，动态分页可能重复或漏项。读取文件出错不得影响当前录制数据路径。
 
@@ -644,23 +657,59 @@ HTTP POST 到达
 | HTTP | 规范 Error Code | 请求结果 | 最低语义 |
 |---|---|---|---|
 | 400 | `MALFORMED_JSON / INVALID_ARGUMENT / UNSUPPORTED_API_VERSION` | FAILURE | JSON 解析、字段缺失、类型/枚举/请求 API 主版本无效；未调用 Recorder |
-| 401 | `UNAUTHENTICATED` | POST: FAILURE；GET: 无 outcome | 远程/受保护资源缺乏有效身份；未通过认证的请求不回显未验证 operation_id |
+| 401 | `UNAUTHENTICATED` | POST: FAILURE；GET: 无 outcome | 任意 Runtime HTTP/SSE 缺失、格式错误或无效 Bearer Token；未通过认证的请求不回显未验证 operation_id |
 | 403 | `PERMISSION_DENIED` | POST: FAILURE；GET: 无 outcome | 具备身份但无 read/control 所需权限；拒绝执行 |
-| 404 | `RESOURCE_NOT_FOUND` | FAILURE（若请求合法） | 未知路径/录制任务资源；证据 NOT_FOUND 不默认映射此码 |
+| 404 | `RESOURCE_NOT_FOUND / TOPIC_NOT_FOUND` | FAILURE（若请求合法） | 未知路径/录制任务/目标 Topic 资源；Evidence NOT_FOUND 不默认映射此码 |
 | 405 | `METHOD_NOT_ALLOWED` | FAILURE | 只读端点误用控制方法等 |
-| 409 | `INVALID_STATE / STALE_RUNTIME / STALE_RECORDING / STALE_TOPIC_EPOCH / TOPIC_TYPE_CONFLICT / RECORDING_EXISTS` | FAILURE | 领域状态、冲突或目标身份不匹配 |
+| 409 | `INVALID_STATE / ALREADY_PAUSED / ALREADY_FINISHED / STALE_RUNTIME / STALE_RECORDING / STALE_TOPIC_EPOCH / TOPIC_TYPE_CONFLICT / RECORDING_EXISTS` | FAILURE | 领域状态、重复控制、冲突或目标身份不匹配 |
 | 413 | `REQUEST_TOO_LARGE` | FAILURE | 超过有界请求体/字段大小 |
 | 415 | `UNSUPPORTED_MEDIA_TYPE` | FAILURE | POST 请求的 Content-Type 不支持（GET/SSE 的不可接受 Accept 应为 HTTP 406） |
 | 406 | `NOT_ACCEPTABLE` | FAILURE | 客户端声明的 Accept 不支持要求的响应媒体类型 |
-| 422 | `UNSUPPORTED_QOS / TYPE_SUPPORT_UNAVAILABLE / INVALID_CONFIG` | FAILURE | 已解析的语义不满足 Recorder 类型、QoS 或参数约束 |
-| 429 | `CONTROL_QUEUE_FULL / RATE_LIMITED` | FAILURE、effects:NONE | 受理前有界拒绝，无 Recorder 调用；可用 Retry-After |
-| 500 | `EVENT_COMMIT_FAILED / STORAGE_ERROR / INTERNAL_ERROR` | FAILURE | 领域执行中的已知失败，可能有持久化或订阅副作用 |
-| 503 | `RUNTIME_NOT_READY / DISK_UNSAFE / RECORDER_UNAVAILABLE / EVIDENCE_UNAVAILABLE / STATE_UNAVAILABLE / STATE_TOO_LARGE / QUEUE_TIMEOUT` | FAILURE | 环境安全、恢复/状态证据或服务不可用；`QUEUE_TIMEOUT` **仅表示控制请求已排队但在进入 Recorder 前原子移除成功**，`effects:NONE`，不得作为结果未知的回执 |
-| 504 | `OPERATION_RESULT_UNKNOWN` | UNKNOWN | 本次请求的结果无法确认，不表示 Recorder 一定失败 |
+| 422 | `UNSUPPORTED_QOS / TYPE_SUPPORT_UNAVAILABLE / SCHEMA_UNAVAILABLE / INVALID_CONFIG` | FAILURE | 已解析的语义不满足 Recorder 类型、Schema、QoS 或参数约束 |
+| 429 | `CONTROL_QUEUE_FULL / RATE_LIMITED` | FAILURE、effects:NONE | Server 受理前有界拒绝，无 Recorder 调用；可用 Retry-After |
+| 500 | `EVENT_COMMIT_FAILED / STORAGE_ERROR / DRAIN_TIMEOUT / INTERNAL_ERROR` | FAILURE | 已取得 Recorder 的确定领域失败；effects 必须按 Recorder 原样映射，不能用 504 代替 |
+| 503 | `RUNTIME_NOT_READY / DISK_UNSAFE / RECORDER_UNAVAILABLE / RECORDER_RESOURCE_EXHAUSTED / EVIDENCE_UNAVAILABLE / STATE_UNAVAILABLE / STATE_TOO_LARGE / QUEUE_TIMEOUT` | FAILURE | 环境安全、Recorder 资源/执行域、恢复/状态证据或服务不可用；`QUEUE_TIMEOUT` **仅表示控制请求已排队但在进入 Recorder 前原子移除成功**，`effects:NONE` |
+| 504 | `OPERATION_RESULT_UNKNOWN` | UNKNOWN | **Server 在 HTTP 回复预算内尚未取得 Recorder ControlHandle 的 DONE Result，或可信响应丢失**；不是 Recorder 的领域错误码 |
+
+### 4.2.1 Recorder Error → Protocol 的唯一映射
+
+一旦请求已经进入 Recorder，Server **不得自行重分类 RecorderError**。V1.0 使用下表作为规范映射；`effects` 逐字采用 Recorder Result，只有“确定未进入 Recorder”的 Server 受理错误才由 Server 产生 `effects:NONE`。
+
+| Recorder / Server 原因 | HTTP | Protocol ErrorCode | outcome / effects | retryable |
+|---|---:|---|---|---|
+| Recorder `INVALID_ARGUMENT` | 400 | `INVALID_ARGUMENT` | FAILURE / Recorder effects（通常 NONE） | false |
+| Recorder `TYPE_CONFLICT` | 409 | `TOPIC_TYPE_CONFLICT` | FAILURE / Recorder effects | false |
+| Recorder `TYPE_SUPPORT_UNAVAILABLE` | 422 | `TYPE_SUPPORT_UNAVAILABLE` | FAILURE / Recorder effects | false |
+| Recorder `SCHEMA_UNAVAILABLE` | 422 | `SCHEMA_UNAVAILABLE` | FAILURE / Recorder effects | false |
+| Recorder `UNSUPPORTED_QOS` | 422 | `UNSUPPORTED_QOS` | FAILURE / Recorder effects | false |
+| Recorder `INVALID_STATE` | 409 | `INVALID_STATE` | FAILURE / Recorder effects | false |
+| Recorder `ALREADY_PAUSED` | 409 | `ALREADY_PAUSED` | FAILURE / NONE | false |
+| Recorder `ALREADY_FINISHED` | 409 | `ALREADY_FINISHED` | FAILURE / NONE | false |
+| Recorder `RECORDING_EXISTS` | 409 | `RECORDING_EXISTS` | FAILURE / NONE | false |
+| Recorder `STALE_RECORDING` | 409 | `STALE_RECORDING` | FAILURE / NONE | false |
+| Recorder `STALE_TOPIC_EPOCH` | 409 | `STALE_TOPIC_EPOCH` | FAILURE / NONE | false |
+| Recorder `NOT_FOUND` / `TOPIC_NOT_FOUND` | 404 | `RESOURCE_NOT_FOUND` / `TOPIC_NOT_FOUND` | FAILURE / NONE | false |
+| Recorder `DISK_FULL` | 503 | `DISK_UNSAFE` + `details.protection_reason=DISK_CRITICAL` | FAILURE / Recorder effects | false |
+| Recorder `DISK_STATE_UNKNOWN` | 503 | `DISK_UNSAFE` + `details.protection_reason=DISK_UNKNOWN` | FAILURE / Recorder effects | false |
+| Recorder `RESOURCE_EXHAUSTED` | 503 | `RECORDER_RESOURCE_EXHAUSTED` | FAILURE / Recorder effects | false |
+| Recorder `EXECUTOR_UNAVAILABLE` | 503 | `RECORDER_UNAVAILABLE` | FAILURE / Recorder effects | false |
+| Recorder `WRITER_ERROR` / `STORAGE_UNAVAILABLE` | 500 | `STORAGE_ERROR` | FAILURE / Recorder effects | false |
+| Recorder `EVENT_COMMIT_FAILED` | 500 | `EVENT_COMMIT_FAILED` | FAILURE / Recorder effects | false |
+| Recorder `DRAIN_TIMEOUT` **作为最终 DONE Result** | 500 | `DRAIN_TIMEOUT` | FAILURE / Recorder effects（通常 POSSIBLE） | false |
+| Recorder `GENERATION_VIOLATION` / `POOL_FATAL` | 500 若仍能安全回应，否则连接可能终止 | `INTERNAL_ERROR` | fail-safe / 真实 effects | false |
+| Server admission 容量满，尚未调用 Recorder | 429 | `CONTROL_QUEUE_FULL` | FAILURE / NONE | false |
+| Server FIFO timeout 且原子证明未 STARTED | 503 | `QUEUE_TIMEOUT` | FAILURE / NONE | false |
+| HTTP reply deadline 到达、Handle 尚未 DONE | 504 | `OPERATION_RESULT_UNKNOWN` | UNKNOWN / POSSIBLE | false |
+
+**`DRAIN_TIMEOUT` 与 HTTP 504 严格分离。** 前者是 Recorder 已完成 ControlHandle 并明确给出的领域 FAILURE；后者表示 Server 尚未得到领域终态。Server 不得因为某个本地等待预算到期就制造 Recorder `DRAIN_TIMEOUT`，Recorder 也不得用网络 deadline 决定自身领域结果。**对所有控制 POST，§4.2.1 表中的 `retryable` 规范值统一为 `false`**：即使某个条件稍后可能恢复，也必须由 Application/用户在重新读取当前状态、重新验证 Target 后显式创建新的 OperationAttempt；Server/SDK 不允许依据 ErrorCode 自动重放。GET 查询的 429/503 可以独立返回可退避重试提示，但该语义不得传播到控制 POST。
+
+### 4.2.2 受理前拒绝允许省略 operation_id
+
+对于**确定发生在领域调用之前**的拒绝，Server 可以不回显尚未可信解析/授权的 `operation_id`，典型包括 400 malformed/closed-schema、401、403、405、406、413、415，以及 Server admission 前的 429。Client 将这类响应认定为可信 FAILURE 的条件不是“operation_id 必须匹配”，而是：响应属于当前 HTTP exchange；`api_version`、`request_id`、HTTP status、ErrorCode 组合合法；控制响应明确 `outcome:FAILURE`、`effects:NONE`；该 ErrorCode 在规范中保证未调用 Recorder。**一旦 Server 已成功解析并验证 operation_id 且请求进入 Control FIFO，所有后续控制响应（QUEUE_TIMEOUT、Recorder FAILURE/SUCCESS、504 UNKNOWN）都必须回显完全相同的 operation_id。** 缺失/不匹配时，若请求可能已发送，Client 保守保持 UNKNOWN。
 
 `QUEUE_TIMEOUT` 的规范性组合为 **HTTP 503 / FAILURE / effects:NONE / retryable:false**：它不是 `CONTROL_QUEUE_FULL` 的受理前 429，也不是已可能执行的 `OPERATION_RESULT_UNKNOWN` 504。Server 必须凭队列状态线性化证据证明原生调用未发生；控制 POST 即使获得 QUEUE_TIMEOUT 也不默认允许 Client 自动重试。此状态码与 Outcome 的组合属于当前 Protocol 规范，Server/Client 不可各自解释。
 
-表中 429/503 等应在 JSON 中提供稳定 ErrorCode；当 Recorder 在安全保护中返回明确错误时，HTTP 503 + FAILURE 并不代表“Recorder 线程已停止”或“任务已失败”。对于无法确定本次操作是否执行过的队列竞争，不能借 429/503 隐瞒 UNKNOWN。409 中的目标保护冲突表示**本次调用被 Server 在进入领域方法之前拒绝**；如果 Recorder 在调用中检测状态冲突，是否存在副作用则按 Recorder 返回信息如实表达。
+表中 429/503 等应在 JSON 中提供稳定 ErrorCode；当 Recorder 在安全保护中返回明确错误时，HTTP 503 + FAILURE 并不代表“Recorder 线程已停止”或“任务已失败”。**所有 RecorderErrorCode 必须落入 §4.2.1 的已定义映射；新增 Recorder ErrorCode 若没有同步更新 Protocol/Server/Client/测试，编译或契约测试必须失败，不能落入默认 500 后继续发布。** 对于无法确定本次操作是否执行过的队列竞争，不能借 429/503 隐瞒 UNKNOWN。409 中的目标保护冲突表示**本次调用被 Server 在进入领域方法之前拒绝**；如果 Recorder 在调用中检测状态冲突，是否存在副作用则按 Recorder 返回信息如实表达。
 
 `retryable` 属性仅帮助 Client 识别可尝试的**新请求前置状态**，不能自动为任何领域控制操作赋予幂等性。错误消息为安全的高层诊断，不包含 API Key、TLS 私钥、物理文件绝对路径、内部堆栈或 ROS CDR Payload。技术排障使用 request_id 关联受保护日志。
 
@@ -699,11 +748,11 @@ Client 应独立持有两类数据：
 | 明确 504 + UNKNOWN | 记录 UNKNOWN；刷新状态，不重试副作用 POST |
 | 已经开始发送请求，读超时/断线 | UNKNOWN；刷新状态或等待连接恢复后刷新 |
 | 确认在连接/写入前失败，绝未发送请求 | 记录 NOT_SUBMITTED（客户端本地结果，不是 Server operation outcome），可由用户决定是否首次发送 |
-| Topic Add/Remove UNKNOWN | 可只读查询相同 recording_id/operation_id 的 Topic Event 证据；CONFIRMED_SUCCESS/FAILURE 可提升**该 Topic 操作**结果，UNCERTAIN/NOT_FOUND 继续未知 |
+| Topic Add/Remove UNKNOWN | 可只读查询相同 recording_id/operation_id 的 Topic Event 证据；CONFIRMED_SUCCESS/FAILURE 只更新独立 `TopicEvidenceAssessment` 的领域事实判断，**原始 OperationResult 仍保持 UNKNOWN**；UNCERTAIN/NOT_FOUND 不增加确定性 |
 | 查询 API 失败 | 只标记状态不可用/过期，不修改已有操作结果 |
 | SSE 断开、发现版本缺口或 Server 重启 | 立即标记旧展示状态 STALE，并按 §5 建立新完整基线；不触发 Stop |
 
-对于 CLI，退出码如何表达 NOT_SUBMITTED/UNKNOWN 由 `cli.md` 定义；TUI/Web 的操作提示与“再次操作”确认由 Application 文档定义；Python Client 的异常类型与同步/异步 API 由 `client.md` 定义。不同应用不得对同一次操作得出相矛盾的成功结论。
+CLI 的退出码、TUI/Web 的操作提示与“再次操作”确认由 Application 设计定义；Python Client 的异常类型与同步/异步 API 由 `client.md` 定义。Application 设计可统一或拆分，但不同应用不得对同一次操作得出相矛盾的成功结论。
 
 **HTTPX 适配须保证控制 POST 不被自动重放。** HTTPX 的 `AsyncClient` 构造参数没有 `retries`；其内置连接重试选项属于 `AsyncHTTPTransport(retries=...)`，默认 Transport 不启用额外连接重试。`client.md` 不得使用无效的 `AsyncClient(retries=0)` 示例：需要显式控制时，可配置 `AsyncHTTPTransport(retries=0)`，并检查任何自定义 Transport、第三方 Retry 中间件或应用包装都不会自动重放控制 POST。**SSE 重连是 Client 主动建立新 GET 连接的独立策略，不等于对控制 POST 的重试**；`client.md` 应明确将控制 POST 与 SSE 消费隔离为不同的 HTTPX Client/Transport 实例及各自超时/重连配置，Application 包装器、中间件不得绕过这一边界对控制 POST 自动重放。Protocol 规定**重试行为隔离**而不要求某个具体类名或固定的连接池数量；若实现采用等价共享池方案，必须通过审查证明控制 POST 无自动重放。只有确定未发送并符合 §4.4 的情形，才可能执行**第一次实际发送**，而不是把结果不确定的请求偷偷重试。
 
@@ -760,8 +809,8 @@ SSE 帧使用标准 UTF-8、LF 行终止，字段采用 `event:`、`id:`、`data
   "api_version": "1.0",
   "state": {
     "runtime_instance_id": "9815222c-f39d-4d45-8d1a-bc7f68e75af6",
-    "state_revision": "84",
-    "observed_at": "2026-10-25T10:11:12.345Z",
+    "state_revision": "86",
+    "observed_at": "2026-10-25T10:11:16.345Z",
     "sample_validity": "CURRENT",
     "recorder": {
       "state": "RECORDING",
@@ -829,13 +878,13 @@ SSE 帧使用标准 UTF-8、LF 行终止，字段采用 `event:`、`id:`、`data
 ```text
 id: 93ac8a61-69f4-49c8-b3fa-400c4f396499/1
 event: state.snapshot
-data: {"api_version":"1.0","state":{"runtime_instance_id":"9815222c-f39d-4d45-8d1a-bc7f68e75af6","state_revision":"84","observed_at":"2026-10-25T10:11:12.345Z","sample_validity":"CURRENT","recorder":{"state":"RECORDING","recording_id":"run_001","recording_generation":"12","effective_config":{"mode":"ROLLING","duration_seconds":null,"segment_duration_seconds":60,"retention_duration_seconds":600,"compression":"LZ4","timestamp_policy":"RECEIVE"},"paused_reasons":[],"elapsed_wall_seconds":305.2,"elapsed_active_seconds":300.1,"paused_total_seconds":5.1,"last_error":null,"secondary_errors":[]},"topics":[],"topics_removed_recent":[],"topics_removed_total":"0","queue":{"used_messages":0,"max_messages":65536,"used_bytes":"0","max_bytes":"67108864"},"pool":{"fixed_capacity":81920,"in_use":0,"fallback_in_use":0,"allocation_failures":"0"},"cleanup":{"cleanup_queue_depth":0,"cleanup_pending_total":0,"cleanup_queue_full_count":"0","active_segment_id":null,"last_error":null},"disk":{"state":"NORMAL","sampled_at":"2026-10-25T10:11:12.345Z","valid":true,"available_bytes":"10485760000","used_percent":35.2,"failure_count":0},"process":{"sampled_at":"2026-10-25T10:11:12.345Z","valid":false,"cpu_percent_single_core":null,"rss_bytes":null,"thread_count":null,"fd_count":null}}}
+data: {"api_version":"1.0","state":{"runtime_instance_id":"9815222c-f39d-4d45-8d1a-bc7f68e75af6","state_revision":"87","observed_at":"2026-10-25T10:11:18.345Z","sample_validity":"CURRENT","recorder":{"state":"RECORDING","recording_id":"run_001","recording_generation":"12","effective_config":{"mode":"ROLLING","duration_seconds":null,"segment_duration_seconds":60,"retention_duration_seconds":600,"compression":"LZ4","timestamp_policy":"RECEIVE"},"paused_reasons":[],"elapsed_wall_seconds":305.2,"elapsed_active_seconds":300.1,"paused_total_seconds":5.1,"last_error":null,"secondary_errors":[]},"topics":[],"topics_removed_recent":[],"topics_removed_total":"0","queue":{"used_messages":0,"max_messages":65536,"used_bytes":"0","max_bytes":"67108864"},"pool":{"fixed_capacity":81920,"in_use":0,"fallback_in_use":0,"allocation_failures":"0"},"cleanup":{"cleanup_queue_depth":0,"cleanup_pending_total":0,"cleanup_queue_full_count":"0","active_segment_id":null,"last_error":null},"disk":{"state":"NORMAL","sampled_at":"2026-10-25T10:11:12.345Z","valid":true,"available_bytes":"10485760000","used_percent":35.2,"failure_count":0},"process":{"sampled_at":"2026-10-25T10:11:12.345Z","valid":false,"cpu_percent_single_core":null,"rss_bytes":null,"thread_count":null,"fd_count":null}}}
 
 : heartbeat
 
 id: 93ac8a61-69f4-49c8-b3fa-400c4f396499/2
 event: state.changed
-data: {"api_version":"1.0","state":{"runtime_instance_id":"9815222c-f39d-4d45-8d1a-bc7f68e75af6","state_revision":"85","observed_at":"2026-10-25T10:11:14.345Z","sample_validity":"CURRENT","recorder":{"state":"PAUSED","recording_id":"run_001","recording_generation":"12","effective_config":{"mode":"ROLLING","duration_seconds":null,"segment_duration_seconds":60,"retention_duration_seconds":600,"compression":"LZ4","timestamp_policy":"RECEIVE"},"paused_reasons":["USER"],"elapsed_wall_seconds":307.2,"elapsed_active_seconds":300.1,"paused_total_seconds":7.1,"last_error":null,"secondary_errors":[]},"topics":[],"topics_removed_recent":[],"topics_removed_total":"0","queue":{"used_messages":0,"max_messages":65536,"used_bytes":"0","max_bytes":"67108864"},"pool":{"fixed_capacity":81920,"in_use":0,"fallback_in_use":0,"allocation_failures":"0"},"cleanup":{"cleanup_queue_depth":0,"cleanup_pending_total":0,"cleanup_queue_full_count":"0","active_segment_id":null,"last_error":null},"disk":{"state":"NORMAL","sampled_at":"2026-10-25T10:11:14.345Z","valid":true,"available_bytes":"10485760000","used_percent":35.2,"failure_count":0},"process":{"sampled_at":"2026-10-25T10:11:14.345Z","valid":false,"cpu_percent_single_core":null,"rss_bytes":null,"thread_count":null,"fd_count":null}}}
+data: {"api_version":"1.0","state":{"runtime_instance_id":"9815222c-f39d-4d45-8d1a-bc7f68e75af6","state_revision":"88","observed_at":"2026-10-25T10:11:20.345Z","sample_validity":"CURRENT","recorder":{"state":"PAUSED","recording_id":"run_001","recording_generation":"12","effective_config":{"mode":"ROLLING","duration_seconds":null,"segment_duration_seconds":60,"retention_duration_seconds":600,"compression":"LZ4","timestamp_policy":"RECEIVE"},"paused_reasons":["USER"],"elapsed_wall_seconds":307.2,"elapsed_active_seconds":300.1,"paused_total_seconds":7.1,"last_error":null,"secondary_errors":[]},"topics":[],"topics_removed_recent":[],"topics_removed_total":"0","queue":{"used_messages":0,"max_messages":65536,"used_bytes":"0","max_bytes":"67108864"},"pool":{"fixed_capacity":81920,"in_use":0,"fallback_in_use":0,"allocation_failures":"0"},"cleanup":{"cleanup_queue_depth":0,"cleanup_pending_total":0,"cleanup_queue_full_count":"0","active_segment_id":null,"last_error":null},"disk":{"state":"NORMAL","sampled_at":"2026-10-25T10:11:14.345Z","valid":true,"available_bytes":"10485760000","used_percent":35.2,"failure_count":0},"process":{"sampled_at":"2026-10-25T10:11:14.345Z","valid":false,"cpu_percent_single_core":null,"rss_bytes":null,"thread_count":null,"fd_count":null}}}
 
 ```
 
@@ -910,11 +959,11 @@ data: {"api_version":"1.0","reason":"SUBSCRIBER_OVERFLOW","runtime_instance_id":
 | `read` | Runtime、Status、可用 Topic、历史列表/详情、Topic 证据查询、SSE | 只读并且有响应数据授权与脱敏边界 |
 | `control` | 所有 `/api/v1/control/*` POST | 可改变当前 Recorder 任务与 Topic，必须先通过明确认证授权 |
 
-Server 默认监听受限 loopback，本地部署策略可以通过文件权限/本机访问限制形成可信边界；**一旦可被非本机访问，必须有身份认证、控制授权和 TLS**。具体认证凭据方案、角色、证书和 TLS 终止方式属于 OPEN-04，在发布验收前由 `server.md` 与部署安全规范落地。协议不把“Authorization Header 存在”当成验证通过，也不要求某一种未经决策的 Token 算法。
+Server 默认监听受限 loopback；**所有 Runtime API、查询和 SSE 都必须携带并验证且仅接受一个 `Authorization: Bearer <opaque-token>`，不因 loopback 自动匿名放行。** Token 对应 `read` 或 `control` scope，`control` 隐含 `read`；缺失、重复、格式错误或无效 Token 返回 401，并可使用标准 `WWW-Authenticate: Bearer` 挑战；已认证但 scope 不足返回 403。Token 不得出现在 URL、Query、Cookie、JSON Body、SSE data 或普通日志。远程可达场景还必须使用 TLS；TLS 可由 Drogon 直接终止或由显式配置的受信反向代理终止，但 Runtime 仍自行验证 Bearer Token。协议不规定 Token 内部格式或签名算法，因为 Token 是高熵不透明预共享 Secret。
 
 安全状态必须默认拒绝：远程请求的权限/身份无法确认时不能放行控制；对代理提供的 `X-Forwarded-*` 等 Header，只有配置受信任的反向代理才能采用；不能依据客户端伪造的 IP/Host/Origin 头绕过限制。SSE 与普通 GET 同受 read 授权，不能以“只有状态通知”理由绕过敏感信息过滤。
 
-**Web 单独处理浏览器会话与 CSRF。** Drogon Recorder API 不自动继承 Web 的 Cookie Session；Web 后端应通过 Client SDK 使用受控凭证调用 Recorder，浏览器不能直接持有 Runtime 控制面密钥。CORS 默认不为任意 Origin 开放，尤其不得使用宽松跨域凭据策略代替鉴权。Web 对浏览器的 SSE 代理和会话存续由 `web.md` 定义，不改变本 API 的权限模型。
+**Web 单独处理浏览器会话与 CSRF。** Drogon Recorder API 不自动继承 Web 的 Cookie Session；Web 后端应通过 Client SDK 使用受控凭证调用 Recorder，浏览器不能直接持有 Runtime 控制面密钥。CORS 默认不为任意 Origin 开放，尤其不得使用宽松跨域凭据策略代替鉴权。Web 对浏览器的 SSE 代理、Session、CSRF 和会话存续必须在 Web Application 实现前形成明确设计，不改变本 API 的权限模型。
 
 **输入和输出约束：**
 - JSON 必须检查最大字节数、嵌套深度、字符串字节长度、数组元素数、枚举与整数范围；重复 JSON key 应拒绝或采用经过审查的单一确定策略，不能让授权字段被覆盖。
@@ -930,7 +979,7 @@ Server 默认监听受限 loopback，本地部署策略可以通过文件权限/
 
 当前 Protocol 的身份域、UNKNOWN/effects、Topic Evidence、Status、SSE 完整快照与安全默认拒绝都是可审查设计选择，**不是旧设计兼容包袱**；若发现更简洁且同样可验证的正确方案，应直接替换相应章节。任何改动不能在未经同步修订要求/验收的情况下暗中削弱数据完整性和安全性。
 
-`GET /runtime` 的 capability 必须描述**当前运行程序真实可用的能力**，而不是开发计划。若 Topic Evidence 尚未实现，`topic_events_lookup=false`；但正式发布若需求仍包含该能力，就必须实现并通过测试，不得把 false 当作跳过 MUST 的手段。
+`GET /runtime` 的 capability 必须描述**当前运行程序真实可用的能力**，而不是开发计划。任何构建若不能提供可信 Topic Evidence，则必须报告 `topic_events_lookup=false` 并使相应查询返回明确不可用；正式 V1.0 若需求仍包含该能力，就必须提供并通过测试，不得把 false 当作跳过 MUST 的手段。
 
 ## 6.3 协议级验收与故障注入矩阵
 
@@ -960,7 +1009,7 @@ Server 默认监听受限 loopback，本地部署策略可以通过文件权限/
 
 ## 6.4 Server / Client 设计交接与待量化事项
 
-Server/Client 不应再各自解释相同字段。以下事项属于**已定语义、待实现及验证的参数**，不得通过参数选择改变规范性结果：
+Server/Client 不应再各自解释相同字段。以下事项属于**已定语义、待量化或交付验证的参数**，不得通过参数选择改变规范性结果：
 
 | 事项 | 归属 | 交付时必须说明 |
 |---|---|---|
@@ -971,10 +1020,10 @@ Server/Client 不应再各自解释相同字段。以下事项属于**已定语�
 | SSE 实施预算 | `server.md` | 连接数/每连接字节与事件上限、慢发送检测、Streaming 隐性缓冲、清理 |
 | Client SDK | `client.md` | HTTPX 同步/异步调用、状态新鲜度、UNKNOWN、Evidence Lookup、异常与取消语义 |
 | SSE Parser | `client.md` | httpx-sse Issue #35、心跳/空 data、Last-Event-ID、重连与公共类型隔离 |
-| Web 会话 | `web.md` | Browser Session、CSRF、只经受权 Python Client 访问 Runtime |
+| Web 会话 | Web Application 设计 | Browser Session、CSRF、只经受权 Python Client 访问 Runtime；实现前必须闭合，可独立成文或并入统一 Application 设计 |
 | OPEN-01 | 性能验证规范 | 参考硬件、CPU 归一化边界、最终正式发布阈值 |
 | OPEN-02 | Server/Protocol 验证规范 | HTTP 延迟、SSE 状态可见延迟、容量、采样默认周期、过载测试 |
-| OPEN-04 | Server/Web 安全规范 | 认证方案、权限与 TLS 部署、远程访问发布准入 |
+| V1.0 Security | `server.md` + Web Application 设计 | Bearer Token Secret/Scope、TLS/受信代理、Web Session/CSRF、凭据泄漏与远程攻击用例按 AC-18 验证 |
 
 **不应推断为已经通过：** 使用 Drogon v1.9.14 和 httpx-sse 0.4.3 的技术选型，并不意味着其慢连接和 SSE 协议风险已经通过生产准入。Client Python 3.10/3.12 支持范围按技术选型执行；实际发布需记录 Python 的来源、系统安全更新和依赖兼容性，不以“CPython 上游生命周期”直接替代 Ubuntu LTS 安全支持判断。
 
@@ -989,8 +1038,8 @@ Server/Client 不应再各自解释相同字段。以下事项属于**已定语�
 3. SUCCESS/FAILURE/UNKNOWN、Event 证据查询与 HTTP 错误具有**可执行的组合映射**：§4.2 的 HTTP 状态码 / 机器可读 ErrorCode / `effects:NONE|POSSIBLE|CONFIRMED_PARTIAL`，加上 §2.5 的 `evidence_status: CONFIRMED_SUCCESS|CONFIRMED_FAILURE|UNCERTAIN|NOT_FOUND`，必须能区分受理拒绝、部分副作用、无法证实请求终态和只读证据缺失；任何超时/状态碰巧一致的场景不会伪造某次请求成功。
 4. Status 的写入、重放、Cleanup、Disk 与缺失值字段符合 Recorder；历史只读列表不伪造完成、不泄漏路径、不自行执行 Recovery。
 5. SSE 首次完整基线、发布顺序、慢客户端有界策略、断线/代际变化的 Client 重同步在实际协议帧层无矛盾。
-6. 未决 OPEN-01/02/04 的具体数值/实施方案已明确由后续文档承接，并且本协议未把尚未验证的性能或安全实现当作已通过。
+6. 未决 OPEN-01/02 的具体量化参数已明确由验证规范承接；OPEN-04 的 V1.0 安全设计已裁定为 Bearer Scope + 远程 TLS，但仍必须通过 AC-18 才能取得生产准入。本协议不把设计闭合当作验证通过。
 7. Client 能在不修改领域结果语义的前提下实现同步、异步、SSE 重连与 Application 显示，控制 POST 与 SSE 重连策略独立且不自动重放有副作用 POST；过期状态/心跳不能伪装 CURRENT，且不因部署配置变化改变 MUST 要求。
-8. Topic Evidence **已裁定路径 A**，Recorder 定义只读接口及 fsync 失败可信度边界；Server 不自行解释 Event 文件。**代码尚未实现，相关故障注入及 HTTP 查询验收为实施/发布阻断项。**
+8. Topic Evidence **已裁定路径 A**：Recorder 必须提供正式只读接口及 fsync 失败可信度边界，Server 不自行解释 Event 文件；该接口、故障注入及 HTTP 查询验收均属于正式 V1.0 的实施/发布阻断项。
 
 **开发阶段维护规则：** 端点、错误和 SSE 合同如需改变，直接修改本文并同步更新 Server/Client 和验证用例；本文件不是已发布协议兼容基线，也不代表 HTTP/SSE 已实现。

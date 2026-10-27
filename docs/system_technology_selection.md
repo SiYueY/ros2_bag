@@ -1,5 +1,3 @@
-> **CURRENT IMPLEMENTATION NOTE:** 本规范定义未来完整四层系统的技术选择；当前仓库处于 Recorder Only 阶段，尚未实现 Drogon Server、HTTPX Client、CLI/TUI/Web。该注释不改变原有技术选型。
-
 # ros2_bag 系统技术选型规范
 
 *System Technology Selection Specification*
@@ -7,7 +5,7 @@
 | 文档属性 | 内容 |
 |---|---|
 | 项目名称 | ros2_bag |
-| 文档版本 | v4.2.1 |
+| 文档版本 | v4.2.3 |
 | 文档类型 | 系统级技术选型规范 |
 | 文档状态 | DRAFT（开发中，技术选择可调整） |
 | 目标产品版本 | V1.0 |
@@ -416,7 +414,7 @@ Drogon、Trantor 及必要依赖可以通过受控构建方式静态集成。
 
 ### 版本与构建来源
 
-Drogon v1.9.14 作为当前技术选型的初始版本基线。
+Drogon v1.9.14 作为当前技术选型的初始版本基线。该 tag 在本次审查时解析为 Drogon commit `3aae769cc405cf5abb9d477675c6430924f02c7c`，其 `trantor` gitlink 为 `78e480f5e138acdc05f76c55a2716718cd846364`；发布时仍以项目 Dependency Lock 中记录的实际 SHA 为权威，不依赖浮动 branch。
 
 Drogon 及其 Trantor 依赖采用固定源码版本构建，不依赖 Ubuntu `apt` 软件仓库提供指定版本的 Drogon。
 
@@ -502,7 +500,7 @@ Issue 的后续状态应以锁定版本和专项验证结果为准。
 
 ### Drogon 官方 async_stream 示例
 
-https://github.com/drogonframework/drogon/tree/master/examples/async_stream
+https://github.com/drogonframework/drogon/tree/v1.9.14/examples/async_stream
 
 参考内容：
 
@@ -636,27 +634,7 @@ JSON 不承担 Recorder 高频 ROS 2 原始消息数据传输。
 
 ## 4.7 Drogon SSE 技术准入
 
-**Drogon 的 HTTP 框架选型已确定，但生产级 SSE 适用性必须通过专项验证。**
-
-准入条件：
-
-1. SSE 协议输出正确。
-2. 长时间异步连接稳定。
-3. 慢客户端条件下资源占用有界。
-4. 连接断开后相关资源能够及时释放。
-5. 多客户端之间不存在不可接受的阻塞影响。
-6. 网络异常不会影响 Recorder 高频数据处理。
-7. 关闭过程能够正确终止连接并释放资源。
-
-### 强制要求
-
-如果 Drogon 通用异步 Stream 无法在合理资源预算内满足长期 SSE 连接要求，并且无法通过局部、可维护的适配解决，则必须重新评估 Server 框架选型。
-
-这是影响技术选型成立的强制准入条件，不是可忽略的性能优化项。
-
-具体负载、内存增长斜率、连接回收时限和其他数值阈值，由专项性能与可靠性验证规范确定。
-
-本规范不预设缺乏实测依据的数值。
+Drogon Async Stream 已作为 V1.0 SSE Server 基础技术选定；**生产准入条件的唯一规范性定义见 §7.1**。本节只记录选型结论，不再重复维护协议正确性、慢客户端资源有界、连接回收、数据面隔离和关闭行为等准入条款。具体负载与数值阈值由 `verification.md` 量化；若 §7.1 的退出条件触发，则重新评估 Server 框架选型。
 
 ---
 
@@ -845,20 +823,7 @@ Client 对 Application 提供的接口应与具体 SSE Parser 解耦。
 
 ### 准入要求
 
-httpx-sse 0.4.3 必须满足：
-
-1. 与 HTTPX 0.28.1 兼容。
-2. 在 Python 3.10/3.12 上运行正确。
-3. 标准 SSE 协议解析正确。
-4. 正确处理 CR、LF、CRLF 及 Unicode 数据。
-5. 正确区分注释心跳与业务事件。
-6. 对 Issue #35 的影响具备明确、可验证的处理方案。
-7. 与 Drogon SSE 输出正常互操作。
-8. 异步取消、异常关闭和资源释放行为可控。
-9. 不产生不可接受的内存增长或额外依赖。
-10. 能在不改变 Application 公共接口的情况下替换。
-
-这些条件属于正式生产准入要求。
+httpx-sse 0.4.3 的**生产准入条件唯一由 §7.2 定义**。本节只保留选型理由、已知协议风险、技术使用边界与替换策略，避免两处清单长期漂移；Python 版本、标准 SSE 解析、Issue #35、Drogon 互操作、取消/关闭、资源上界和 Parser 可替换性均按 §7.2 与 `verification.md` 执行。
 
 ### 替换与回退策略
 
@@ -1517,11 +1482,11 @@ Python 依赖采用约 20 MiB 的压缩发布体积预算。
 
 ## 7.7 安全要求
 
-HTTP 控制服务默认采用受限本机访问方式。
+HTTP 控制服务默认采用受限本机监听，但 V1.0 Runtime API 不提供匿名模式：统一使用预共享高熵不透明 Bearer Token，并以 `read` / `control` scope 授权，`control` 包含 `read`。Token 仅从受限 Secret Provider/文件加载，不引入 OAuth/OIDC、用户数据库或 Token 签发服务。
 
-涉及远程访问时，必须采用可信的身份认证、授权及 TLS 保护机制。
+涉及远程访问时，在 Runtime Bearer 鉴权之外必须使用 TLS。TLS 可由 Drogon 直接终止，或由显式配置的受信反向代理终止；代理不得替代 Runtime Token 校验，也不得无条件信任转发 Header。
 
-Web Application 应具有适当的会话和 CSRF 防护。
+Web Application 应具有独立的 Session 和 CSRF 防护，浏览器不持 Runtime Bearer Token。
 
 Starlette 提供 Web 基础设施，但不会自动为所有修改状态的接口完成 CSRF 防护。
 
@@ -1757,9 +1722,9 @@ Python 依赖采用约 20 MiB 压缩发布体积预算，默认归档为 tar.xz�
 
 本规范确立技术选择及适用约束，不规定具体业务实现。
 
-**文档状态：REVIEW。**
+**文档状态：DRAFT。**
 
-完成正式技术评审后，可以冻结已确定的技术决策。
+项目仍处于开发阶段；技术选择可以在发现更优或更可验证方案时直接修订，不以历史评审结论形成冻结约束。
 
 Drogon SSE 和 httpx-sse 的生产准入仍须通过相应专项验证，不因技术选型冻结而自动获得批准。
 
@@ -1773,10 +1738,10 @@ Drogon SSE 和 httpx-sse 的生产准入仍须通过相应专项验证，不因�
    https://github.com/drogonframework/drogon
 
 2. Drogon HttpResponse API
-   https://github.com/drogonframework/drogon/blob/master/lib/inc/drogon/HttpResponse.h
+   https://github.com/drogonframework/drogon/blob/v1.9.14/lib/inc/drogon/HttpResponse.h
 
 3. Drogon async_stream 示例
-   https://github.com/drogonframework/drogon/tree/master/examples/async_stream
+   https://github.com/drogonframework/drogon/tree/v1.9.14/examples/async_stream
 
 4. Trantor
    https://github.com/an-tao/trantor
@@ -1839,10 +1804,10 @@ Drogon SSE 和 httpx-sse 的生产准入仍须通过相应专项验证，不因�
 ### 依赖与许可证
 
 22. Drogon LICENSE
-    https://github.com/drogonframework/drogon/blob/master/License
+    https://github.com/drogonframework/drogon/blob/v1.9.14/License
 
 23. Trantor LICENSE
-    https://github.com/an-tao/trantor/blob/master/License
+    https://github.com/an-tao/trantor/blob/78e480f5e138acdc05f76c55a2716718cd846364/License
 
 24. JsonCpp
     https://github.com/open-source-parsers/jsoncpp
@@ -1856,4 +1821,6 @@ Drogon SSE 和 httpx-sse 的生产准入仍须通过相应专项验证，不因�
 | v4.0 | 统一四层技术架构，明确 Drogon SSE 能力边界 |
 | v4.1 | 增加技术准入条件、Python 兼容版本、许可证审查和发布约束 |
 | v4.2 | 核实依赖及 Issue 状态，补充 HTTP/1.1、源码构建及语言绑定排除依据 |
-| **v4.2.1** | 正式确定 HTTPX 0.28.1 + httpx-sse 0.4.3；补充 Issue #35、维护风险、SSE Parser 的生产准入和替换策略，明确技术决策与生产验证独立管理 |
+| v4.2.1 | 正式确定 HTTPX 0.28.1 + httpx-sse 0.4.3；补充 Issue #35、维护风险、SSE Parser 的生产准入和替换策略，明确技术决策与生产验证独立管理 |
+| v4.2.2 | 去除实现进度注释；将 Drogon SSE 与 httpx-sse 的生产准入条件分别集中到 §7.1/§7.2；闭合 V1.0 Runtime 安全基线为预共享不透明 Bearer Token + read/control Scope + 远程 TLS，并保持 Web Session/CSRF 独立 |
+| **v4.2.3** | 文档状态统一为 DRAFT；明确当前技术选择可直接修订，生产准入继续由 Verification/Release 证据决定；Drogon/Trantor 的关键源码参考固定到 v1.9.14 及对应 gitlink SHA，避免 master 漂移 |

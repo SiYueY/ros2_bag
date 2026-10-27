@@ -2,7 +2,7 @@
 
 | 属性 | 内容 |
 |---|---|
-| 版本 | v0.1.0 |
+| 版本 | v0.1.2 |
 | 状态 | **DRAFT — 验证规格仍可调整，实际测试未执行** |
 | 依据 | requirements.md 的 AC-01～27，以及本文件 V-* 场景；recorder/protocol/server/client 当前开发稿 |
 | 适用 | Recorder、Runtime/Server、Protocol、Python Client、CLI/TUI/Web、MCAP 分析端 |
@@ -12,14 +12,13 @@
 
 ## 1.1 证据与判定分离
 
-每项测试具备五种独立属性：Test Status (PASS/FAIL/BLOCKED/NOT_RUN)、Decision (APPROVED/PENDING/REJECTED)、Admission (ALLOWED/BLOCKED)、代码源码 SHA、环境依赖闭包。**文档评审完成、G0 可继续开发、某项 Sanitizer 无告警，都不构成产品发布 PASS。** humble_tsan_risk.md 记录了一项仍需复测的 Fast DDS 风险；旧的本地测试证据不能替代当前代码和平台的新测试。
+**测试结果与 Gate 决策分层管理。** 单个测试记录 `Test Status = PASS / FAIL / BLOCKED / NOT_RUN`，并绑定源码 SHA、构建制品、配置和环境依赖闭包。Gate 层存在两类不同判定：开发/集成准入使用 `Admission = ALLOWED / ALLOWED_WITH_CONDITIONS / BLOCKED`，正式发布裁决使用 `Decision = APPROVED / PENDING / REJECTED`；**G0～G2 的规范性退出字段是 Admission，G3 的规范性退出字段是 Decision**，两组枚举不得互换或用同名字符串代替。**文档评审完成、G0 允许继续开发、某项 Sanitizer 无告警，都不构成产品发布 PASS。** Humble Fast DDS/TSan 风险直接记录在本文 §3.2；旧的本地测试证据不能替代当前代码和平台的新测试。
 
 统一用例记录（JSON/YAML 或 Markdown 同等字段）：
 
 ```yaml
-test_id: "V-REC-QUEUE-01"
-new_ac: ["AC-07"]
-legacy_ac: ["AC-12", "AC-79"]
+test_id: "EXAMPLE-TEST-ID"
+requirements: ["AC-07"]
 source_commit: "<git sha>"
 build_artifact_sha256: "<sha256>"
 platform: "ubuntu22-humble-amd64"
@@ -107,9 +106,12 @@ MCAP 的录制端与分析端两维 2×2（H→H、H→J、J→H、J→J）独�
 | V-REC-TOPIC-01 | Graph 未发现、可见零发布者、多类型、QoS Offered 不兼容/后加入 | 发现与可录性分离，QoS EXPLICIT 不被 AUTO 覆写 | AC-01/02/22 |
 | V-REC-TOPIC-02 | 已注册 Channel 但 subscription 失败，PREPARED 终态 fsync 故障 | 不开放 ingress、终态不可信时 UNCERTAIN，Event 身份可信 | AC-03/09/11 |
 | V-REC-TOPIC-03 | 3000 次 Add/Remove，同名再加与跨 Stop | Epoch 独立；按秒 RSS/FD/线程/Schema/Channel/TopicEvent 统计，无无界资源增长 | AC-03/16 |
+| V-REC-TOPIC-04 | Task 内先 Add `/x` 类型/Schema A→Remove→同名 Add 类型 B；另测同类型名但完整 Schema SHA-256 改变；对照同签名 A 的合法重加 | B/Schema 变化在 TOPIC_ADD_PREPARED、Writer register、Subscription create 前拒绝；同签名重加产生新 Epoch 且数据不串代 | AC-03/06 |
 | V-REC-MODE-01 | Normal、Timed 到期、Paused 仍计时、Stop 重入 | 不错误延长 Timed，Stop 完成包含 Writer/Manifest | AC-04 |
 | V-REC-MODE-02 | Rolling 空流、全部 Topic 删除、Pause 无消息、空段打开后 Stop | 不持续创建无界空段，首消息合法建段，Manifest 与真实文件匹配 | AC-04/05 |
 | V-REC-MODE-03 | Snapshot 达单 Topic/全局上限、Rolling 恰好边界、Writer Replay 失败 | 双预算/驱逐一致；Replay 计数独立，失败不伪报 Live 写入 | AC-05/07/10 |
+| V-REC-RETENTION-01 | COMPLETE Segment 后系统 UTC 前跳 24h/回跳 24h；进程重启分别发生在 COMPLETE 未授权与 durable DELETING 两种状态 | 墙钟变化不改变删除授权；同进程只按 steady age；重启后 COMPLETE 重新计满完整 retention，DELETING 直接幂等续删 | AC-05/09 |
+| V-REC-HISTORY-01 | Rolling 产生超过 `history.max_segment_records_per_task` 的 Segment，大量最老 Segment 已 REMOVED；另造无可压缩 REMOVED 前缀的满容量状态 | 仅 durable REMOVED 连续前缀被汇总；segment_limit/offset 分页有界且 summary 计数守恒；无法安全压缩时不创建下一 Segment并进入明确容量失败 | AC-05/23 |
 | V-REC-DISK-01 | 首次 statvfs 失败、连续失败、样本超过有效年龄、阻塞、CRITICAL、恢复、USER Pause | 起始 UNKNOWN 不允许 Start，系统恢复不解除 USER Pause；Recorder 热锁不等待 statvfs | AC-08 |
 | V-REC-CLEAN-01 | Cleanup 删除接口注入 35s、队列满、CleanupWorker 2s 退避唤醒与 DELETING 重启 | 不阻塞 Coordinator/ROS Executor、不新增线程/Timer；durable pending 不丢，Worker 退避后安全重新 claim，不重复删除，不误删 INCOMPLETE | AC-05/09/10 |
 | V-REC-RECOVERY-01 | ≥10 次约 30s 录制后 SIGKILL/重启/读回 | 保存发布/接收/录入序号、丢失窗口、Manifest/Event/Recovery，未知不宣称 COMPLETE | AC-09/16/17 |
@@ -121,7 +123,7 @@ MCAP 的录制端与分析端两维 2×2（H→H、H→J、J→H、J→J）独�
 | V-REC-EVENT-01 | 两个外部 Topic 操作误用相同 UUID；随后 Stop 自动移除多个 Topic | 外部复用产生 CONFLICT/UNCERTAIN；内部移除 origin=INTERNAL、operation_id=null，不污染 Topic Evidence | AC-03/11/14 |
 | V-REC-START-01 | 任务目录预先存在、两个 Start 同时请求、首个 statvfs 永久阻塞 | 目录不被复用/覆盖；最多一个 Start 取得启动权；Start 有界返回 DISK_STATE_UNKNOWN，Recorder Control/ROS Executor 不执行 statvfs | AC-04/08/17 |
 | V-REC-CONFIG-01 | Runtime 配置为 LZ4/rolling 默认 60/600；启动后篡改全局 YAML；依次 Start NORMAL/TIMED/ROLLING | 当前 Runtime 不受文件变化影响；StartCommand mode 正确覆盖任务模式，ROLLING 缺省取 60/600；Manifest/Status/StartResult effective_config 完全一致；重启后才加载新 RuntimeConfig | AC-04/05/25 |
-| V-REC-PAUSE-01 | DISK_CRITICAL 后用户 Pause，再 Resume；以及 USER 后 Disk UNKNOWN→NORMAL | PauseReasons 不互相覆盖；Resume 只清 USER；系统原因存在时仍 PAUSED；全部系统原因解除且无 USER 才 RECORDING | AC-04/08/13 |
+| V-REC-PAUSE-01 | `auto_resume=false`：DISK_CRITICAL 后用户 Pause，磁盘安全稳定；再直接 Resume。另测 `auto_resume=true` 的纯系统暂停 | 危险解除后 false 路径为 USER+DISK_RECOVERY_PENDING；一次 Resume 在新鲜安全复核后清 USER/PENDING 并恢复；true 路径仅在无 USER 时自动恢复 | AC-04/08/13 |
 | V-REC-CLEAN-02 | Task A 仍有持久 DELETING pending 时 Stop A/Start B；旧项失败+Worker 2s Retry+Shutdown/重启 | 旧任务目录不被新任务字段替换，Claim 按 Task/Segment/Manifest 身份去重，不跨根目录，Writer/SSE 不等待删除，Shutdown 不释放仍在用的 Lease | AC-05/09/17 |
 
 
@@ -166,10 +168,11 @@ sample_c/msg/Outer.msg
 | V-REC-GUARD-02 | 两个 Start 竞争，同时存在 Timed Stop | 至多一个 Start 获取领域启动权；非法/已存在 recording_id 无副作用拒绝；不能覆盖原 Task/目录 |
 | V-REC-GUARD-03 | Topic Remove 的旧 Epoch 与同名重新加入的新 Epoch 交错 | 旧 Remove 不可销毁新订阅 |
 | V-REC-TIME-01 | ROS use_sim_time 暂停/回跳，业务 Header.stamp 不等于接收时刻 | RECEIVE 仍取 Unix 系统时间；MCAP log_time=publish_time；Timed/Rolling 用 steady clock |
-| V-REC-TIME-02 | Timed deadline 到达时 Sequencer 人为阻塞 5 s，Producer 持续发布 | deadline 后新 Producer 无法越过 generation gate；deadline 前已准入消息可 Drain；最终 Stop 可以延迟但没有截止后新准入 |
-| V-REC-PAUSE-01 | USER Pause 与 DISK_CRITICAL 以两种顺序交错，再恢复磁盘、调用 Resume | 原因集合不互相覆盖；磁盘恢复不清 USER；Resume 只清 USER；所有原因为空才重开 ingress |
-| V-REC-PAUSE-02 | 仅 DISK_UNKNOWN 导致 PAUSED，用户直接 Resume；已有 USER 时重复 Pause | 前者 INVALID_STATE/effects:NONE 且系统保护不变；后者 ALREADY_PAUSED/effects:NONE |
+| V-REC-TIME-02 | Timed deadline 前人为阻塞/延迟 ROS Timer/Executor 5 s，Subscription Producer 仍持续执行；另让 Sequencer 忙于其他 Native 等待 | 每个 `try_enter(now)` 自己检查不可变 steady deadline；deadline 后新 Producer 均拒绝，不依赖 Timer callback 已运行；deadline 前已准入消息可 Drain，最终 Stop 可延迟 | AC-04/17 |
+| V-REC-PAUSE-02 | USER Pause 与 DISK_CRITICAL 以两种顺序交错；磁盘安全稳定后再 Resume | 原因集合不互相覆盖；USER 不被系统恢复清除；auto_resume=false 将解除的磁盘原因转成 DISK_RECOVERY_PENDING；一次 Resume 清 USER/PENDING 后才可重开 ingress | AC-04/08 |
+| V-REC-PAUSE-03 | 仅 DISK_UNKNOWN 导致 PAUSED：危险仍活动时直接 Resume；随后安全稳定进入 PENDING 再直接 Resume；已有 USER 时重复 Pause | 活动危险时 `DISK_UNSAFE/effects:NONE`；安全 pending 后一次 Resume SUCCESS 并恢复；重复 USER Pause 为 ALREADY_PAUSED/effects:NONE | AC-04/08 |
 | V-STATE-01 | 同 revision 的完整 SSE 状态先后具有较新/较旧 observed_at，或偷偷改变业务值 | 有效新采样刷新 observed_at，不回退时间；业务值变动必须增加 revision |
+| V-PROTO-EXAMPLE-01 | 解析 `protocol.md` 中全部完整 State 示例，按 `(runtime_instance_id,state_revision)` 聚合规范性业务字段 | 同一身份+revision 不得出现不同业务状态；示例中的 revision 演进合法，避免文档自身违反状态不变量 | AC-13 |
 
 这些测试使用确定性 Barrier/Clock 注入，不以随机延迟或仅 Server 层 DTO 校验充当领域原子性证据。
 
@@ -177,13 +180,17 @@ sample_c/msg/Outer.msg
 
 | 同步注入点 | 预期保守行为 | 留存证据 |
 |---|---|---|
+| Writer Close 返回后、MCAP 数据文件 fsync 失败 | Segment 不得 COMPLETE；Reader 暂时可读也不能替代持久化证明 | MCAP SHA、fsync fault log、Manifest/Recovery |
+| MCAP fsync 成功、metadata fsync 失败 | Segment 不得 COMPLETE；保留数据和失败诊断 | MCAP/metadata SHA、fault log |
+| 文件 fsync 均成功、segment directory fsync 失败 | 新文件名/metadata 目录项 durable 未证实；不得提交 COMPLETE | 目录快照、fault log |
+| 新 Segment/task 目录项创建后，task/output_root directory fsync 失败 | 不得把新目录的存在当作 durable；Start/Finalize 走失败/INCOMPLETE 路径 | parent-dir fault log、Recovery |
 | Manifest 临时文件写入后、fsync 前崩溃 | 旧 Manifest 仍可被 Recovery 安全识别；临时文件不是完成证据 | 文件系统目录、fsync fault log |
 | Manifest fsync 已成功、rename 前崩溃 | 同上；临时文件不可作为已提交状态 | 完整旧文件/Temp SHA |
 | rename 后、目录 fsync 前失败 | 新旧版本究竟 durable 未知；不能向调用者报 COMPLETE | old/new 版本校验和与诊断 |
 | Topic ADD PREPARED fsync 前失败 | 副作用必须在安全序列中禁止或保留不可信证据 | Event tail/operation_id |
 | Topic PREPARED 已 durable，Writer 注册后但 ADDED 未提交 | UNCERTAIN；Channel 可存在但 Client 不可误认请求成功 | Event+MCAP Channel+Reader |
 | TOPIC_ADDED 行可读但终态 fsync 失败 | 进程内已知失败时 Event Evidence 不可报告 CONFIRMED_SUCCESS | Event/Coordinator fsync injection result |
-| Writer Close 已返回、Manifest COMPLETE 提交失败 | 仍不能宣称 Recording Task COMPLETE；Reader 可读不替代任务终态 | Writer log/manifest/recovery |
+| Writer Close、MCAP/metadata/目录同步均成功，但 Manifest COMPLETE 提交失败 | 仍不能宣称 Recording Task COMPLETE；数据可 durable/readable 也不替代任务终态 | Writer log/data sync log/manifest/recovery |
 | Segment durable DELETING、删除前 SIGKILL | Recovery 保留删除意图，安全重试完整 Segment 删除 | Segment/Manifest SHA |
 | 删除系统调用已完成，REMOVED durable 前 SIGKILL | 再次恢复是幂等删除，不能把不存在目标误当损坏/删错文件 | 容器/目录差分 |
 | ERROR/Stop 时强制退出，重新启动 | 任何未完成段保持 INCOMPLETE 和诊断，不凭局部 MCAP Header 做完整性推断 | Recovery Report/Reader field test |
@@ -198,16 +205,29 @@ sample_c/msg/Outer.msg
 |---|---|---|---|
 | V-SRV-01 | 控制 32 排队满、Control Worker Native 阻塞 | 429 受理前拒绝；503 已排队但确定未开始；504 已可能进入且结果未知 | AC-11/12 |
 | V-SRV-02 | Stop HTTP 超时同时 Timed Stop→IDLE 或 Disk Pause→PAUSED | 两种终态均不归因为该请求，UNKNOWN 保留 | AC-11 |
+| V-SRV-HANDLE-01 | Recorder `stop()` 立即返回未 DONE ControlHandle；HTTP 30s deadline 先到，领域在 35s DONE；其间第二个外部 Resume/Start 已排队 | 30s 可发 504 UNKNOWN 并释放 ResponseSink，但唯一外部 mutation 槽继续被首 Handle 占用；第二请求不进入 Recorder；35s DONE 后才推进下一项，无 UAF/双完成 | AC-11/12/17 |
+| V-SRV-MAP-01 | 参数化遍历 RecorderErrorCode 与 Server admission/timeout 原因 | 每项恰好匹配 Protocol §4.2.1 的 HTTP/ErrorCode/outcome/effects；新增未映射枚举使契约测试失败；Recorder DRAIN_TIMEOUT=明确 FAILURE，只有 Handle 未 DONE 才 504 UNKNOWN | AC-11/12 |
 | V-SRV-03 | Topic PREPARED/ADDED fsync 故障、Topic Evidence 精确查询 | 只在 ID+Topic+可信持久证据一致时 CONFIRMED，UNCERTAIN/NOT_FOUND 不自动 POST | AC-11/14 |
 | V-SRV-EVIDENCE-RESTART | 终态已写但 fsync 返回失败；先在同进程 GET，然后控制进程退出/重启后按真实幸存文件分别测试完整终态、截断尾行和冲突终态 | 进程内已知失败返回 UNCERTAIN；重启后真实完整可信事件可确认**现存领域终态**但不伪造原同步 fsync 成功/HTTP SUCCESS；坏记录 UNCERTAIN | AC-09/11/14 |
 | V-SRV-04 | Status Revision 竞争、注册→采样→首帧、同 Revision 新 observed_at | GET/SSE 单源，完整基线先到、STALE/恢复的新 Revision 正确 | AC-13 |
 | V-SRV-05 | SSE 慢读 64 Clients、1MiB 最大帧、8MiB/s 候选、Socket backpressure | Application/Trantor/Socket 有界，动态 admission 或断开，不让数据面受网络阻塞 | AC-12/13/16 |
 | V-CLI-01 | HTTPX Connect/ReadTimeout、CancelledError、Redirect | 控制 1 次 POST，已经可能送出则 UNKNOWN、Attempt 保留 ID、无隐式 Stop | AC-11/14 |
+| V-CLI-RECEIPT-01 | 401/403/400 malformed 等 pre-domain 拒绝省略 operation_id；对照 QUEUE_TIMEOUT/Recorder FAILURE/504 省略或篡改 operation_id | 前者仅在 status+ErrorCode+FAILURE+effects:NONE+request_id/api_version 全部合法时接受明确 FAILURE；后者缺失/不匹配 ID 一律保守 UNKNOWN/ProtocolViolation | AC-11/14/18 |
+| V-CLI-EXAMPLE-01 | 对文档 sync/async 示例做静态/契约执行：Application 提供 CredentialProvider，Stop 使用 prepare+submit | 示例不绕过必填凭据、不调用不存在的裸 `stop(target)` 隐式 ID 路径；exactly one POST | AC-14/18 |
 | V-CLI-02 | httpx-sse Issue #35、注释心跳、合法空 data、CR/LF/CRLF、Unicode、半帧断线 | Parser 标准性和业务过滤分别验证，无虚假 StateUpdate | AC-13/14 |
 | V-CLI-03 | SSE Reader 静默阻塞、Watchdog 定时触发、Runtime ID 更新 | 主动 STALE/重新全量基线，不依赖下一帧到达才检查 | AC-13/14 |
 | V-APP-01 | CLI Ctrl+C/UNKNOWN、TUI/Web 重连、Web CSRF | CLI 退出码按规范；UI 不误报成功；浏览器无 Runtime control secret | AC-15/18 |
+| V-APP-TOPIC-01 | Graph 同名返回类型 A+B，分别省略 type、显式 type=A、显式 type=B 发起 Add | 三种均以 TYPE_CONFLICT 拒绝且无 Writer/Subscription 副作用；Client 不把显式 type 当选择器 | AC-02/03/22 |
 
-HTTPX/Drogon 均以项目锁定版本运行，Server 单次 FULL Frame/全局 Byte Budget/下游慢消费者的资源上限不能由客户端 MockParser PASS 代替。OPEN-02 必须明确参考网络延迟/带宽、最大快照、连接并发与新鲜度测量方法/合格阈值；OPEN-04 必须有远程身份/TLS/Web Session 实际攻击/权限用例。
+HTTPX/Drogon 均以项目锁定版本运行，Server 单次 FULL Frame/全局 Byte Budget/下游慢消费者的资源上限不能由客户端 MockParser PASS 代替。OPEN-02 必须明确参考网络延迟/带宽、最大快照、连接并发与新鲜度测量方法/合格阈值；V1.0 Security 必须按 AC-18 验证 Bearer Token、read/control Scope、TLS/受信代理、Secret 泄漏、Web Session/CSRF 与跨 Origin 攻击。
+
+## 3.2 Humble Fast DDS / TSan 开放风险
+
+**状态：OPEN。** 历史 Phase-0 Humble AMD64 Executor TSan 曾报告 Fast DDS 2.6 / spdlog mutex 相关诊断；相同诊断类别在**不使用 ros2_bag Pool、Queue、WriterAdapter 的最小 ROS 节点**中也曾复现。这只能说明旧证据没有把告警归因到 ros2_bag，**不能证明依赖栈告警无害，也不能证明当前项目没有被其掩盖的竞态**。
+
+历史本地证据曾包含 Humble Runtime、最小 ROS baseline、project-only core/payload 和 Jazzy Executor 结果，但这些文件不再作为仓库规范的一部分，也不能被新 Source SHA 继承为 PASS。G0/G3 必须重新产生当前证据：固定 Ubuntu/ROS/RMW/FastDDS/spdlog 版本与编译插桩，保留 full Humble run 的 unsuppressed TSan 输出；同时对 project-owned Queue/Pool/Control 域做聚焦 Sanitizer，以区分第三方诊断和项目自身 race。若尝试改变 Transport/RMW 规避告警，仍须重新验证 discovery、receipt、throughput、latency、CPU 与数据完整性。
+
+发布前必须给出以下之一并形成 G3 证据：依赖或项目问题已修复；在固定依赖上可重复证明风险被有效缓解；或由 Tech Lead/Project Owner 明确记录剩余风险接受。**确认的数据损坏、UAF 或项目自身 race 不允许通过风险签字豁免。** 本节是该风险的唯一现行规范记录，不依赖已删除的独立风险文档。
 
 # 4. G0–G3 审查门禁与可执行输出
 
@@ -215,29 +235,29 @@ HTTPX/Drogon 均以项目锁定版本运行，Server 单次 FULL Frame/全局 By
 
 | Gate | 进入条件 | 允许退出状态 | 强制产物 |
 |---|---|---|---|
-| G0 / 领域安全基线 | Recorder Pool/Queue/Writer 模型、Type/Schema 的可行性、当前源代码风险 | APPROVED/APPROVED_WITH_CONDITIONS/BLOCKED（有条件仅允许继续开发） | g0_admission_review.md、源码 SHA、Sanitizer/TSan 风险 |
+| G0 / 领域安全基线 | Recorder Pool/Queue/Writer 模型、Type/Schema 的可行性、当前源代码风险 | ALLOWED / ALLOWED_WITH_CONDITIONS / BLOCKED（有条件仅允许继续开发） | g0_admission_review.md、源码 SHA、Sanitizer/TSan 风险 |
 | G1 / 功能集成 | Core Topic/Writer/Recovery、HTTP/Protocol/Client 验收与标准负载初测 | ALLOWED/BLOCKED | g1_review.md、故障注入记录与环境清单 |
 | G2 / 跨平台 | 两 ROS Distro × 两 CPU Architecture、MCAP 2x2、自定义无包解析 | ALLOWED/BLOCKED | g2_review.md、原生日志/MCAP/CI SHA |
-| G3 / 发布 | AC-01～27 全量、当前 MUST/AC/V-* 全部闭合、OPEN-01/02/04、TSan 和包安装 | APPROVED/REJECTED；不允许 CONDITIONAL 当正式发布 | g3_release_review.md、Release Manifest/哈希/签审 |
+| G3 / 发布 | AC-01～27 全量、当前 MUST/AC/V-* 全部闭合、OPEN-01/02、AC-18 Security、TSan 和包安装 | APPROVED/REJECTED；不允许 CONDITIONAL 当正式发布 | g3_release_review.md、Release Manifest/哈希/签审 |
 
-历史 `docs/humble_tsan_risk.md` 的状态为 OPEN，不能直接划为无害。必须固定编译插桩的 Humble/RMW/FastDDS/spdlog 组合，对比最小 ROS 重现与本项目引用路径，另测 project-only Queue/Pool 的 Sanitizer，并保留 Unsuppressed 报告。G0 条件批准不得被 G3 当成“已解决”。出现确认的内存/数据完整性缺陷不能靠单人签字跳过；同一人可担任 Tech Lead/Owner 但必须如实标注。
+本文 §3.2 的 Humble Fast DDS/TSan 风险保持 OPEN，直到当前 Source/Dependency SHA 的复测和处置证据完成。G0 的 `ALLOWED_WITH_CONDITIONS` 不得被 G3 当成“已解决”。出现确认的内存/数据完整性缺陷不能靠单人签字跳过；同一人可担任 Tech Lead/Owner 但必须如实标注。
 
 ## 4.2 每次 Gate 检查的机器校验条件
 
-至少产出可机器处理的 `evidence-index.json`：包含本阶段须执行 Test IDs、运行平台、Source SHA、Config/Dependency SHA、原始 log/MCAP/golden 的 sha256、PASS/FAIL/BLOCKED/NOT_RUN、责任人与审查时间。Gate 校验脚本应拒绝：必需 ID 缺失、非 PASS 伪装为通过、结果文件不存在、哈希不符、环境平台不匹配、版本未锁定、OPEN 未关闭却 G3 APPROVED。
+至少产出可机器处理的 `evidence-index.json`：包含 `gate`、规范性的 `gate_result_kind`（G0～G2=`admission`，G3=`decision`）、对应 `gate_result`、本阶段须执行 Test IDs、运行平台、Source SHA、Config/Dependency SHA、原始 log/MCAP/golden 的 sha256、每项 `PASS/FAIL/BLOCKED/NOT_RUN`、责任人与审查时间。Gate 校验脚本应拒绝：**验证规格中存在重复 `test_id`**、Gate 类型与枚举不匹配、必需 ID 缺失、非 PASS 伪装为通过、结果文件不存在、哈希不符、环境平台不匹配、版本未锁定、OPEN 未关闭却 G3 APPROVED。
 
-验收汇总关联新 27 AC、所有 V-* 场景和新增 V-* 测试；允许一个 AC 被多个 V-* 覆盖，反之亦然。不引入已废弃的 UDS 等历史接口；每个当前 MUST/AC 都需要可执行证据。每次 Gate 不得仅填“详见总体报告”而没有原始证据 URI/相对路径。
+验收汇总关联当前 AC-01～27、所有 V-* 场景和新增 V-* 测试；允许一个 AC 被多个 V-* 覆盖，反之亦然。不引入已废弃的 UDS 等历史接口；每个当前 MUST/AC 都需要可执行证据。每次 Gate 不得仅填“详见总体报告”而没有原始证据 URI/相对路径。
 
-# 5. 待量化 Profile、当前缺口与实施边界
+# 5. 待量化 Profile 与发布前阻断条件
 
 | 问题 | 本规范状态 | 发布条件 |
 |---|---|---|
 | OPEN-01 CPU / 硬件 | PENDING；10 Topics ×1000Hz×1KiB×600s 的单 Topic <1% 丢失不可降低，CPU 的参考机/口径待决定 | 固定 CPU 核心归一口径、Recorder+Server 范围、采样/聚合与数值 |
 | OPEN-02 HTTP/SSE | PENDING；Server 2s/5s、64 Clients/8MiB/s 为可验证候选 | 定量 SLA、资源上界、反压时断连能力的真实证据 |
-| OPEN-04 TLS/Auth | PENDING；仅 Loopback 默认准入 | 正式远程方案、信任代理、CSRF、防盗密钥测试 |
-| Humble FastDDS TSan | OPEN（历史风险记录） | 分离第三方与自有 race、实际处置和 G3 决策 |
-| Topic Evidence | C++ 契约已设计，源码未完成 | Recorder Query 实现与 Event 可信故障注入 |
-| 频率/Gap | §5.2.1 修订候选，当前源码与独立周期不一致 | FakeClock 比较与 AC-88 精确验证 |
-| Cleanup durable pending | 当前源码对 queue full/失败丢意图 | 重试与持久删除授权修复、失败注入通过 |
+| V1.0 Security | DESIGN CLOSED；Bearer Token + read/control Scope + TLS direct/trusted-proxy | AC-18 全量攻击/权限/泄漏/证书/代理/Web Session/CSRF 证据通过后才获得远程生产准入 |
+| Humble FastDDS TSan | OPEN；现行风险记录见本文 §3.2 | 以当前 Source/Dependency SHA 分离第三方与自有 race、形成修复/缓解/明确风险处置并完成 G3 决策 |
+| Topic Evidence | REQUIRED | Recorder Query、Event 身份链、fsync/截断/冲突故障注入全部通过 AC-11 对应 V-* 测试 |
+| 频率/Gap | REQUIRED | 以 FakeClock 验证完整独立评价周期、边界误差和 Unknown 语义，并覆盖 AC-10/AC-22 |
+| Cleanup durable pending | REQUIRED | Queue full、删除失败、重启、跨任务 pending 的持久授权与重试故障注入通过 AC-05/AC-09/AC-10/AC-17 |
 
 本文件是**可执行验证计划/测试规格**，不是已运行测试报告；阈值注明候选时仍须按 OPEN 正式批准。后续 Code 实现/部署不得通过降低 Recorder 的数据安全、UNKNOWN 或 SSE 新鲜度来换取 PASS。

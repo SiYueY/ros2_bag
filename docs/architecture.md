@@ -2,7 +2,7 @@
 
 | 属性 | 内容 |
 |---|---|
-| 文档版本 | v0.3.2 |
+| 文档版本 | v0.3.4 |
 | 文档状态 | **DRAFT — V1.0 开发阶段，随时修订；规范尚未批准用于完整实施** |
 | 文档范围 | V1.0 系统架构、组件边界与跨层契约 |
 | 技术选型依据 | `docs/system_technology_selection.md` |
@@ -137,7 +137,7 @@ Recorder 内部管理 Topic 订阅、队列预算、消息池、Writer、快照�
 
 Runtime 必须遵守“**先取得输出目录所有权锁，再执行恢复**”的顺序。输出目录进程级互斥由 Runtime 负责，不得隐含为 Recorder Core 的自动行为；其他嵌入 Recorder Core 的宿主同样必须保证输出目录所有权。
 
-**Recorder 内部时间事件的执行域：** ROS Executor Timer 只发布有界触发事件，不在回调线程完成可能阻塞的 Timed Stop、Rolling Rotate、磁盘保护收尾。Recorder 自有的唯一内部控制顺序器负责调度这些事件，并以领域状态 Guard 与 Server 的独立外部 ControlWorker 竞争同一 Task 关闭权。二者仍有不同线程，但不得同时关闭同一个 Writer/Topic 实例；Writer 本身始终由独立 Writer Thread 独占。Stop/Shutdown 必须真实等待内部顺序器退出后再回收 Recorder 和 ROS Context。
+**Recorder 内部时间事件的执行域：** ROS Executor Timer 只发布有界触发事件，不在回调线程完成可能阻塞的 Timed Stop、Rolling Rotate、磁盘保护收尾。**RecorderControlSequencer 是所有 Task/Topic/Writer mutation 的唯一领域线性化执行域**：Server 的独立 ControlWorker 只负责网络 Admission、外部 FIFO 和等待 Recorder `ControlHandle`，它把请求提交给 Sequencer，不能与 Sequencer 形成第二个“关闭权”裁决点。唯一例外是不会推进领域状态机的**无阻塞安全 Gate**：Producer 准入可在自身线性化点因 Timed steady deadline 或磁盘危险原子拒绝新准入，并仅向 Sequencer 提交合并事件；Writer Close、Topic 状态、Manifest 终态仍只能由 Sequencer 协调。Writer 本身始终由独立 Writer Thread 独占。Stop/Shutdown 必须真实等待 Sequencer/Handle 所代表的领域工作结束后再回收 Recorder 和 ROS Context。
 
 ## 3.2 Server 与独立 Protocol
 
@@ -147,7 +147,7 @@ Server 至少遵守以下架构约束：
 
 - 把外部输入转换为受校验的 Recorder 参数；在网络边界处理认证、授权和请求大小限制。
 - 可能阻塞的 Recorder 调用不得直接长时间占用 Drogon 网络 I/O 事件循环；调度、并发限制和关闭同步必须受控，不预设独立大型任务框架。
-- **同一 Recorder 的外部状态变更调用必须串行化：** 同时最多一个由 Server 发起的变更操作进入 Recorder 原生调用；请求的受理、执行和结束顺序必须可判断。队列或执行单元必须有界，满载时显式拒绝；不得因 Recorder 各方法分别具备线程同步就默认允许任意组合并行调用。
+- **同一 Recorder 的外部状态变更调用必须串行化：** Server 同时最多持有一个“已提交给 Recorder 且领域尚未 DONE”的外部 mutation；请求的受理、提交和完成顺序必须可判断。Recorder 返回受管 `ControlHandle` 后，即使 HTTP ResponseSink 已超时/断开，Server 仍保持该外部执行槽，直到 Handle DONE；不得仅因网络等待结束就提交下一项冲突 mutation。队列和执行单元必须有界。
 - 只读状态查询可以在 Recorder 快照访问具备线程安全保证的前提下并发进行；内部定时器、磁盘保护和 Writer 故障仍可能并发改变领域状态，由 Recorder 的状态与同步约束裁决；Server 必须使用 Recorder 返回结果与后续权威快照识别冲突，不得推断自己的请求必然获胜。`server.md` 必须定义典型竞态下的结果解释与同步方式（例如外部 Stop 与磁盘保护 Pause 交错）。具体执行器与锁方案留给 `server.md`，不预先引入通用任务框架。
 - SSE 基于 Drogon 异步 Streaming 能力实现，订阅者与待发送数据必须有界；连接断开时释放相应资源，不允许慢客户端影响录制路径。
 - Server 重启与 Recorder 同属 Runtime 生命周期；不能把 HTTP 服务状态当成录制持久状态。
@@ -244,7 +244,7 @@ ROS 2 Executor / GenericSubscription
 - Server 不持有 Recorder 内部锁后再等待网络、用户界面或远程资源。
 - 停止、动态移除 Topic、Writer Drain、Rolling 轮转等顺序必须遵守 `recorder.md` 定义的领域契约。
 
-操作排队、超时和幂等由 Protocol/Server 规范分别定义。`protocol.md` 应定义 HTTP 结果未知时的操作查询或结果重新确认语义，`recorder.md` 应据此明确 Recorder 是否提供可关联具体操作的终态查询能力。如无此接口，Server 只能依据权威状态快照、状态变化及可关联的持久化证据判断操作效果；**达到预期状态不等于能够证明某次请求执行成功**。证据不足时必须保留 `UNKNOWN`，不得由 Client 缓存或 Server 猜测补出成功终态。不额外预设通用操作注册表或任务调度平台。
+操作排队、超时和幂等由 Protocol/Server 规范分别定义。**原始 HTTP `OperationResult`、当前 `CurrentStatus` 与可选的领域持久化证据是三个独立事实源。** `protocol.md` 只定义 V1.0 实际存在的结果确认能力：Topic Add/Remove 可按精确的请求/Topic 身份查询 durable Evidence；Start/Stop/Pause/Resume 不提供通用请求级终态查询。状态快照只能说明 Recorder 现在处于什么状态，不能把一个原始 UNKNOWN 请求补写为 SUCCESS/FAILURE；持久化 Evidence 只能确认对应领域终态/副作用，也不能倒填“当时 HTTP 已收到成功回执”。不额外预设通用 Operation Registry 或任务调度平台。
 
 ## 4.3 状态、事件与一致性
 
@@ -269,7 +269,7 @@ Server 的采样周期与开销约束、初始快照与订阅衔接策略、变�
 | 故障或异常 | 架构处理原则 |
 |---|---|
 | CLI/TUI/Web 退出，Client 或网络断开 | Recorder 继续运行；Client 恢复连接后重新同步状态 |
-| HTTP 请求超时或结果丢失 | 操作结果视为**未知**而非直接失败；通过状态或明确的操作查询协议处理 |
+| HTTP 请求超时或结果丢失 | 原始请求结果保持 **UNKNOWN**；CurrentStatus 只用于重新同步当前状态，有限 Topic Evidence 只确认精确关联的领域终态/副作用，二者均不得倒填原始 HTTP SUCCESS/FAILURE |
 | Server 请求过载 / SSE 慢客户端 | 有界排队、拒绝或断开；不得影响 ROS 数据面 |
 | ROS 2 数据突发 / Queue 达预算 | 按 Recorder 已定义的有界策略处理、记录统计，不让控制层创建无界缓存 |
 | 磁盘临界或状态不可知 | Recorder 的磁盘保护状态优先；Server 不得绕开暂停、恢复的安全判定 |
@@ -281,7 +281,7 @@ Server 的采样周期与开销约束、初始快照与订阅衔接策略、变�
 
 Recorder 恢复语义要求保留 `INCOMPLETE` 片段，对未能证明成功的 Topic 操作标记 `UNCERTAIN`；不得因网络客户端重连而修改已持久化的录制事实。恢复异常的“可继续启动”仅在不会覆盖、污染或错误回收录制数据时成立；恢复结果不等于录制成功，也不能被 Server 隐藏。
 
-**安全边界：** HTTP 控制服务默认只监听受限本机地址；远程访问须经过认证、授权与 TLS。`protocol.md` 定义身份与操作权限的协议语义，`server.md` 负责验证与执行；Web 另外负责浏览器会话和 CSRF 防护，两套安全边界不可混同。敏感配置及凭证不进入普通状态响应和日志。输出目录需要遵守最小权限和所有权要求，不能由 HTTP 参数绕过路径及恢复约束。具体认证模型、角色和远程部署方式由对应 Server/Web 文档明确并验证。
+**安全边界：** HTTP 控制服务默认只监听受限本机地址，但 Runtime API 本身仍使用预共享不透明 Bearer Token 鉴权；权限固定为 `read` / `control`，其中 `control` 包含 `read`。远程访问除 Token 外必须经过 TLS，可由 Drogon 直接终止或由显式受信反向代理终止；无论哪种部署，Runtime 都自行验证 Bearer Token，不能把代理 Header、浏览器 Cookie 或 Origin 当作身份。`protocol.md` 定义 Header/权限语义，`server.md` 负责 Secret Provider、授权、TLS/代理边界与拒绝策略；Web 另外负责浏览器 Session 和 CSRF，两套安全边界不可混同。敏感配置及凭证不进入普通状态响应和日志。输出目录遵守最小权限和所有权要求，不能由 HTTP 参数绕过路径及恢复约束。
 
 # 5. 工程约束与演进
 
@@ -330,7 +330,7 @@ C++ Runtime 为每目标平台提供原生 ELF，Recorder/Server 私有代码可
 | `protocol.md` | HTTP/JSON/SSE API、数据模型、错误、版本、操作完成与恢复语义 |
 | `server.md` | Drogon 接入、线程/控制调度、网络资源与状态/SSE 实现 |
 | `client.md` | HTTPX/httpx-sse 封装、同步/异步 API、重试重连与错误映射 |
-| `cli.md` / `tui.md` / `web.md`（计划） | 尚未编写；分别承载应用交互、状态展示、安全及部署契约，Application 实现前必须补齐 |
+| Application 设计（CLI/TUI/Web） | 在对应实现前补齐；可统一成一份文档或按应用拆分，承载交互、状态展示、退出码、浏览器安全及部署契约，不预设必须新增三个文件 |
 
 `system_technology_selection.md` 管理技术选择；Recorder 的恢复语义与取证统一由 `recorder.md` 定义，验收由 `verification.md` 承担。历史研究不作为当前设计约束，避免重复维护第二套含糊的规范。
 

@@ -105,9 +105,8 @@ All design documents are **DRAFT**: architecture and APIs may be changed as deve
 | [Server](docs/server.md) | Drogon, dispatch, status publication, SSE resource limits |
 | [Client](docs/client.md) | Python HTTPX sync/async SDK, UNKNOWN and SSE state tracking |
 | [Technology choices](docs/system_technology_selection.md) | Runtime libraries, versions, alternatives, deployment risks |
-| [Verification](docs/verification.md) | Reproducible functional, performance and failure-injection tests |
+| [Verification](docs/verification.md) | Reproducible functional, performance and failure-injection tests, including the active Humble Fast DDS/TSan risk register |
 | [Release](docs/release.md) | CI, toolchains, dependency locks, packaging, platform gates |
-| [Humble TSan risk](docs/humble_tsan_risk.md) | Unresolved ROS2/Fast DDS concurrency warning and evidence |
 
 Historical approvals cannot establish current implementation correctness. Source-level validation, four-platform execution, MCAP standalone decoding, security and performance gates must be measured on the actual implementation. The tests/performance/standard_profile.json is a proposed profile, not an automated benchmark or a PASS report.
 

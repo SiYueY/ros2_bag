@@ -2,7 +2,7 @@
 
 | 属性 | 内容 |
 |---|---|
-| 文档版本 | v0.1.1 |
+| 文档版本 | v0.1.3 |
 | 文档状态 | **DRAFT — V1.0 开发阶段，随时修订；规范尚未批准用于完整实施** |
 | 设计范围 | Python Client SDK：同步/异步 HTTP API、类型模型、控制结果、SSE 消费与重同步、异常/资源关闭、测试 |
 | 架构依据 | docs/architecture.md（开发稿，可直接联动修改） |
@@ -11,8 +11,7 @@
 | 协议依据 | docs/protocol.md（开发稿，可直接联动修改） |
 | Server 依据 | docs/server.md（开发稿，可直接联动修改） |
 | 选型依据 | `docs/system_technology_selection.md`；HTTPX 0.28.1 + httpx-sse 0.4.3，Python 3.10 / 3.12 |
-| 实现现状 | 当前仓库为 Recorder-only 基线，**尚无正式 Python Client SDK**；本文定义待实施目标 |
-| 下游 | CLI/TUI/Web 设计文件尚未编写；在对应 Application 实现前补齐。另有部署与专项验证 |
+| 下游 | CLI/TUI/Web 的 Application 契约在对应实现前补齐，可统一或按应用拆分；另有部署与专项验证 |
 
 # 1. 定位、边界与公共结构
 
@@ -80,7 +79,7 @@ HTTPX `Client` 与 `AsyncClient` 可以分别复用 Transport 逻辑但不能跨
 | Recorder 状态 | `get_status()` | `await get_status()` | CurrentStatus |
 | Topic Graph | `list_available_topics(query)` | 同名 await | AvailableTopicPage |
 | History 列表 | `list_recordings(query)` | 同名 await | RecordingPage |
-| History 详情 | `get_recording(recording_id)` | 同名 await | RecordingDetail |
+| History 详情 | `get_recording(recording_id, *, segment_limit=100, segment_offset=0)` | 同名 await | RecordingDetail（分页 Segment + compacted summary） |
 | Topic Event Evidence | `get_topic_operation(recording_id, operation_id)` | 同名 await | TopicOperationEvidence |
 | Start | `start(request_with_operation_id)` | 同名 await，要求预先持有 ID | OperationResult；推荐先 prepare 再 submit |
 | Stop/Pause/Resume | `stop/pause/resume(request_with_operation_id)` | 同名 await，要求预先持有 ID | OperationResult；不得只传裸 Target 后在 await 内生成隐藏 ID |
@@ -166,6 +165,7 @@ SDK 只使用 `httpx.Client` 和 `httpx.AsyncClient` 实现 HTTP；SSE 使用独
 |---|---|---|
 | `base_url` | `http://127.0.0.1:8765` | 固定 Origin 与 /api/v1 路径；禁止 API 参数注入主机/任意路径 |
 | `api_version` | `1.0` | 固定支持的协议主版本；连接时比对 Runtime 能力 |
+| `credential_provider` | 必填 | 为所有 Runtime GET/POST/SSE 提供 Bearer Secret；不得由 URL/userinfo/Query 注入 |
 | `connect_timeout_sec` | 3 s（候选） | 建立连接的预算；不能证明请求是否执行 |
 | `read_timeout_sec` | 40 s（候选） | 普通 HTTP 读预算须覆盖 Server 排队 5 s + Native Response 30 s + 网络/调度余量；超时仍为 UNKNOWN |
 | `write_timeout_sec` | 5 s（候选） | Body 发送上限；若任何字节可能发出则 UNKNOWN |
@@ -180,13 +180,13 @@ SDK 只使用 `httpx.Client` 和 `httpx.AsyncClient` 实现 HTTP；SSE 使用独
 | `max_sse_frame_bytes` | 1 MiB 完整帧（候选） | 不积累无界 SSE 输入；协议/Parser 前限制须实测 |
 | `max_history_items` | 每页 ≤200，累计显式分页 | 不在 SDK 内自动无限遍历任务列表 |
 
-数值都是**初始候选**，不是需求 OPEN-02 的已测 SLA。对 Control POST，Client 读取响应的预算必须结合 Server `max_queue_wait_ms`、`native_response_timeout_ms` 和网络/调度余量做联动校验；**不能只与单独的 Native Deadline 比较**。即使配置失配或网络超时，缺失可信响应的本次操作仍为 UNKNOWN，不能推断领域执行失败。
+数值都是**初始候选**，不是需求 OPEN-02 的已测 SLA。对 Control POST，Client 读取响应的预算必须结合 Server `max_queue_wait_ms`、`domain_response_timeout_ms` 和网络/调度余量做联动校验；**不能只与单独的领域响应 Deadline 比较**。即使配置失配或网络超时，缺失可信响应的本次操作仍为 UNKNOWN，不能推断领域执行失败。
 
 **隔离控制 POST 与 SSE GET 重连**：实现时控制 HTTP 与 SSE 使用不同的 HTTPX Client/Transport 实例，隔离超时、中间件/重试、连接池资源和长连接。同步与异步 Client 各自持有独立 Client 实例及生命周期；只读短 GET 可以与控制共用基础连接配置，但需确保 SSE 长连接不会饿死控制/查询流量。最小方案是“短 HTTP Client + SSE Client”，复杂部署可加独立只读池，不引入多套协议逻辑。
 
 HTTPX 0.28.1 的 `AsyncClient` **不存在 `retries` 构造参数**。若显式配置 Transport，使用 `httpx.AsyncHTTPTransport(retries=0)` / `httpx.HTTPTransport(retries=0)` 并审查自定义 Transport、Proxy、Middleware 均无 POST Replay；默认 HTTPX Client 也不应额外装自动重试插件。`follow_redirects=False` 需要通过 Redirect + Authorization 注入测试，不能“自动跟踪重定向找到 Runtime”。
 
-TLS/Auth 使用受控 `CredentialProvider` 或固定凭证引用，支持 read/control 权限差异，但不在协议层自行决定 Token 算法。默认日志、异常 repr 和 SDK DTO 不能包含 Authorization、私钥或完整敏感 Proxy URL；不因 `localhost` 默认认定浏览器来源可信。OPEN-04 的远程认证/TLS 方案待正式发布前验证。
+V1.0 Auth 使用受控 `CredentialProvider` 提供预共享不透明 Bearer Token；SDK 对所有 Runtime GET/POST/SSE 统一设置 `Authorization: Bearer ...`，不得把 Token 放入 URL、Query、Body 或可打印 DTO。Provider 可按应用身份选择 read 或 control 凭据，但 SDK 不解析 Token 内容，也不实现签发/刷新协议。远程 `base_url` 必须为 HTTPS；受信反向代理部署对 Client 仍表现为 HTTPS Origin。默认日志、异常 repr 和 SDK DTO 不能包含 Authorization、私钥或完整敏感 Proxy URL；不因 `localhost` 放宽 Token 或协议校验。
 
 ## 2.2 控制请求序列化、目标守卫与时序
 
@@ -196,7 +196,7 @@ TLS/Auth 使用受控 `CredentialProvider` 或固定凭证引用，支持 read/c
 |---|---|---|
 | Start | operation_id、expected_runtime_instance_id、recording_id、mode | NORMAL/TIMED/ROLLING；TIMED 正数 duration；ROLLING 的分段/保留需正数 |
 | Stop/Pause/Resume | operation_id、expected_runtime_instance_id、recording_id、recording_generation | 不能偷偷改用 Status 中更新后的另一个 Task |
-| Topic Add | Target + name、可选 type、qos、repeat_policy | Graph 多类型须显式 type；EXPLICIT QoS 必须完整 |
+| Topic Add | Target + name、可选 type、qos、repeat_policy | **Graph 同名多类型始终拒绝**；显式 type 只约束唯一可见类型，不能从多类型中选择；EXPLICIT QoS 必须完整 |
 | Topic Remove | Target + topic_id、topic_epoch | 只按 Epoch 删除，禁止 name-only |
 
 Start Request 只包含 recording_id、mode 及对应 duration/rolling 时长；V1.0 SDK **不暴露 compression、timestamp_policy、QoS 默认或 storage plugin 覆盖字段**。物理 output_root、MCAP 配置文件和插件路径同样不能从 Client 注入。实际 Compression/TimestampPolicy 只从 Start 成功响应的 `effective_config` 读取。operation_id 在尝试传输前确定并进入 Body；每个新的逻辑操作必须是新 UUID。SDK 不提供“用同一 ID 重传”作为正常 API；UNKNOWN 后显式重试创建新的 OperationAttempt，并保留旧 ID 只用于诊断/Topic Evidence。
@@ -217,7 +217,7 @@ PREPARE (validate model, acquire operation_id; no network effects)
 
 ### 2.2.1 OperationAttempt 单次提交的公共 API（明确选择）
 
-**在异步任务取消时，调用方必须能取得已提交请求的 operation_id**。所以 V1.0 的可取消控制 API 采用明确的两步形式，而非只在 `await client.stop(target)` 内生成一个调用方无法访问的 UUID：
+**在异步任务取消时，调用方必须能取得已提交请求的 operation_id**。所以 V1.0 的可取消控制 API 采用明确的两步形式，而非在单个 `await stop(...)` 协程内部生成一个调用方事先无法取得的 UUID：
 
 ```python
 attempt = client.prepare_stop(target)  # synchronous, no I/O, creates/validates operation_id
@@ -250,7 +250,7 @@ Sync/Async 便捷方法可以保留，但必须接收**调用方事先提供的 
 
 必须解析 Protocol §4.2 的 HTTP status + ErrorCode + Outcome + effects + retryable 组合。`503/QUEUE_TIMEOUT/FAILURE/effects:NONE/retryable:false` 是入队后确定未进入 Recorder；`429/CONTROL_QUEUE_FULL` 是 Admission 前拒绝；`504/OPERATION_RESULT_UNKNOWN` 是无法确认，不能互换。UNKNOWN 默认不得返回 effects:NONE 作为已证明未执行。
 
-可信响应要求 HTTP status 与 Outcome 组合有效、JSON 字段完整、api_version 受支持、operation_id 与请求一致、Server request_id 有效、已返回目标身份与请求守卫一致。任何不一致不允许宽容地当成功；POST 已可能发送时保持 UNKNOWN，而不能把普通 ValueError 包装成“可安全重试的失败”。
+可信响应要求 HTTP status 与 Outcome 组合有效、JSON 字段完整、api_version 受支持、Server request_id 有效，并满足 Protocol §4.2.2 的身份规则。**通常** control receipt 必须回显与 Attempt 完全相同的 operation_id 和目标身份；唯一例外是规范明确保证“尚未进入 Recorder”的 pre-domain rejection（例如 400 malformed/closed-schema、401、403、405、406、413、415、admission 前 429），这类响应可以省略尚未可信解析/授权的 operation_id。Client 只有在 HTTP status + ErrorCode 属于该白名单、`outcome=FAILURE`、`effects=NONE`、api_version/request_id 合法时才接受这个无 operation_id 的明确 FAILURE。QUEUE_TIMEOUT、Recorder Result、200 SUCCESS 和 504 UNKNOWN 都发生在 operation_id 已验证之后，**必须**回显同一 ID；其他缺失/不匹配在 POST 可能已发送时保持 UNKNOWN。任何不一致不允许宽容地当成功，也不能把普通 ValueError 包装成“可安全重试的失败”。
 
 异常族建议：`ClientError` 下区分 `LocalValidationError`、`ClientClosedError`、`AuthenticationError`、`QueryError`、`ProtocolViolation`、`ConnectionUnavailable`、`StreamError`、`ResourceLimitError`。**正常受信任 POST FAILURE 优先使用 OperationResult**，避免不同应用因异常处理分叉产生不同结论；GET 错误则抛明确的只读异常。默认字符串日志去掉第三方 HTTPX Error 中可能携带的 Secret；可以在安全诊断中保留精简 cause category。
 
@@ -299,15 +299,15 @@ HTTP Status 与 SSE 的完整 StateEnvelope 属于同一种 Protocol State，不
 
 每个 Topic 观察包括 name、types、publisher_count、observation（VISIBLE/VISIBLE_NO_PUBLISHER/NOT_FOUND/UNAVAILABLE）、recordability（CANDIDATE/TYPE_CONFLICT/TYPE_SUPPORT_UNAVAILABLE/QOS_INCOMPATIBLE）、actual_hz 与 frequency_validity。SDK 不基于 PublisherCount 或空 items 自行证明“永远不存在”或“必然可录”；Graph 在两次分页间可以变化，出现重复/漏项，应允许显式重新扫描。
 
-精确 name 查询中的 NOT_FOUND 是**本次观测**，不是永久不存在的事实。多类型需要由用户/Recorder 明确类型；QoS AUTO/EXPLICIT 的决策在 Recorder，Client 不调用 rclpy 获取另一套 Graph 信息。
+精确 name 查询中的 NOT_FOUND 是**本次观测**，不是永久不存在的事实。**同一 name 当前观察到多个类型时必须视为 TYPE_CONFLICT，即使用户已经传入 `type` 也不能选择其中一个继续 Add**；显式 type 只用于要求唯一可见类型与调用者预期一致。QoS AUTO/EXPLICIT 的决策在 Recorder，Client 不调用 rclpy 获取另一套 Graph 信息。
 
 ## 3.3 History 列表、详情与只读边界
 
-`list_recordings(query)` 允许 limit/offset/name_prefix/started_after/started_before，`get_recording(recording_id)` 返回含有界 Segment 的详细只读元信息。必须保持：
+`list_recordings(query)` 允许 limit/offset/name_prefix/started_after/started_before；`get_recording(recording_id, segment_limit, segment_offset)` 分页返回未压缩 Segment 明细，同时保留 `segment_page` 与 `segment_history_summary`。必须保持：
 
 - 历史 `RECORDING/PAUSED/STOPPING/COMPLETE/INCOMPLETE/FAILED/UNKNOWN` 与当前 Recorder.state **分开**，不可因为 Runtime READY 就将旧任务当 COMPLETE。
 - start_time/end_time、message_counts、segment_count、last_error 缺失时为 None/Unknown，绝不补造纪元时间或零。
-- Segment 状态 `WRITING/FINALIZING/COMPLETE/DELETING/REMOVED/INCOMPLETE`；删除掉的 Rolling Segment 仍可能有受控历史条目。
+- Segment 状态 `WRITING/FINALIZING/COMPLETE/DELETING/REMOVED/INCOMPLETE`；删除掉的 Rolling Segment 仍可能有受控历史条目。最老的 durable REMOVED 前缀若已由 Recorder 压缩，不会逐项返回，但 `segment_history_summary` 的累计计数与 `compacted_through_segment_id` 必须保留这一事实；Client 不补造虚构 Segment。
 - `path:null` 不允许 Client 在本地拼 output_root 或探测宿主机绝对目录；读取受 Server 权限控制。
 - `snapshot_consistency:BEST_EFFORT`，分页无跨请求全局 Snapshot 保证；跨页可以重复/漏项，需要一致列表时由 Application 从 offset=0 重新读取。指定时间过滤时 start_time 未知项被排除并由 diagnostics 计数；未指定时间过滤时未知时间项排在已知项之后。无限分页自动读取不属于 V1.0 默认行为。
 
@@ -379,7 +379,7 @@ Dedicated HTTPX SSE Client
 
 建立 SSE 连接前先检查 HTTP status，401/403/429/503 等属于握手前 JSON 错误，不能将错误 Body 当 SSE。HTTP 200 也必须核验 Content-Type 是 `text/event-stream`；握手失败映射成 SDK 受限 StreamError/AuthError。公共 API 不依赖 Parser 的 last-event-id 做服务器事件重放。
 
-**协议业务事件仅限** `state.snapshot`、`state.changed`、`stream.resync_required`；只有注释的心跳不是业务事件。SSE `id: stream_uuid/sequence` 作为不透明传输身份记录日志，不解析 sequence 数字推断 Recorder 或 Topic 的操作顺序。
+**协议业务事件仅限** `state.snapshot`、`state.changed`、`stream.resync_required`；只有注释的心跳不是业务事件。SSE `id: stream_id/stream_sequence` 作为不透明传输身份记录日志，不解析 sequence 数字推断 Recorder 或 Topic 的操作顺序。
 
 ## 4.2 全量 StateEnvelope 和版本比较
 
@@ -494,31 +494,39 @@ Async Client 与 Watcher 不应通过 `__del__`、weakref finalize、asyncio.run
 # Illustrative API contract; ros2_bag_client is not implemented yet.
 from ros2_bag_client import RecorderClient, ClientConfig, RecordingTarget
 
-with RecorderClient(ClientConfig(base_url="http://127.0.0.1:8765")) as client:
-    runtime = client.get_runtime()
-    status = client.get_status()
-    # A stopped/idle Recorder has no active target: do not infer one.
-    if status.recorder.recording_id is None:
-        raise RuntimeError("No active recording to stop")
-    target = RecordingTarget(
-        expected_runtime_instance_id=runtime.runtime_instance_id,
-        recording_id=status.recorder.recording_id,
-        recording_generation=status.recorder.recording_generation,
+def stop_active_recording(credential_provider) -> None:
+    # The Application supplies the provider; no URL/query secret is embedded here.
+    config = ClientConfig(
+        base_url="http://127.0.0.1:8765",
+        credential_provider=credential_provider,
     )
-    result = client.stop(target)  # Exactly one POST.
-    print(result.operation_id, result.outcome)
+    with RecorderClient(config) as client:
+        runtime = client.get_runtime()
+        status = client.get_status()
+        # A stopped/idle Recorder has no active target: do not infer one.
+        if status.recorder.recording_id is None:
+            raise RuntimeError("No active recording to stop")
+        target = RecordingTarget(
+            expected_runtime_instance_id=runtime.runtime_instance_id,
+            recording_id=status.recorder.recording_id,
+            recording_generation=status.recorder.recording_generation,
+        )
+        attempt = client.prepare_stop(target)  # Creates visible operation_id; no I/O.
+        result = client.submit(attempt)         # Exactly one POST.
+        print(attempt.operation_id, result.outcome)
 
-    if result.outcome == "UNKNOWN":
-        latest = client.get_status()   # Read-only. Does not resolve Stop.
-        print(latest.recorder.state)   # Even IDLE does NOT prove Stop SUCCESS.
+        if result.outcome == "UNKNOWN":
+            latest = client.get_status()   # Read-only. Does not resolve Stop.
+            print(latest.recorder.state)   # Even IDLE does NOT prove Stop SUCCESS.
 ```
 
 ```python
 # Illustrative async contract; does not imply an installed module.
 from ros2_bag_client import AsyncRecorderClient, ClientConfig
 
-async def watch_recorder() -> None:
-    async with AsyncRecorderClient(ClientConfig()) as client:
+async def watch_recorder(credential_provider) -> None:
+    config = ClientConfig(credential_provider=credential_provider)
+    async with AsyncRecorderClient(config) as client:
         async with client.watch_states() as updates:
             async for update in updates:
                 if update.kind == "STATE":
@@ -567,6 +575,7 @@ client:
     max_sse_frame_bytes: 1048576
     max_page_limit: 200
   security:
+    credential_provider: "<application-supplied>"
     follow_redirects: false
     trust_env: false
     verify_tls: true
@@ -583,7 +592,7 @@ client:
 - 所有 HTTP Response/Data/SSE/History 的字符串、嵌套、数组长度受有界校验；累计读取可按业务 API 显式分页，不许隐式无限增长。
 - 同步 Config 与异步 Config 的默认值必须一致；Python 构造与外部配置注入路径有同一规范性校验，不因不同初始化方式绕开安全默认。
 
-Client 不实现远程 Token 签发或 Web 浏览器 CSRF；OPEN-04 的具体认证/TLS 方案由 Server/Web/部署规范闭合。SDK 必须能安全传递凭证、不意外跨主机重定向、保留 read/control 权限失败诊断，但不能以本地回环为由跳过协议字段验证。
+Client 不实现 Token 签发、轮换服务或 Web 浏览器 CSRF；它只从受控 CredentialProvider 取得当前 Bearer Secret，并安全传递到固定 Origin。SDK 不意外跨主机重定向，保留 401/403 与 read/control 权限失败诊断，也不能以本地回环为由跳过鉴权或协议字段验证。
 
 ## 5.4 运维诊断、资源指标与日志字段
 
@@ -640,7 +649,7 @@ httpx-sse 0.4.3 是已选 Parser，但其生产准入保持 PENDING，特别是 
 | Redirect | 307/308、跨 Origin 与 Authorization | 控制不 Follow Redirect，不泄露认证凭据 | NFR-SEC-02、AC-18 |
 | 错误回执 | 不匹配 operation_id、缺 request_id、坏 JSON | 不接受伪 SUCCESS；可能送出时保留 UNKNOWN | FR-CTL-03、AC-11 |
 | Cancel/Close | Async POST 发送/读入途中取消 | 保留取消语义和 Attempt ID，不触发 Recorder Stop | FR-CTL-06/07、AC-14 |
-| Topic Add/Remove | Graph 多类型、QoS、repeat、Epoch | 不按 name 删除新 Epoch，不隐式选择冲突类型 | FR-CTL-01、AC-11/22 |
+| Topic Add/Remove | Graph 多类型、显式 type、QoS、repeat、Epoch、同名跨 Epoch Schema | 不按 name 删除新 Epoch；Graph 多类型即使显式 type 也拒绝；同任务同名 StorageSignature 变化拒绝 | FR-REC-04、FR-CTL-01、AC-03/11/22 |
 | Topic Evidence | 四种 evidence_status，终态与身份冲突 | 只有身份可信的 CONFIRMED 补充 Assessment，原 HTTP 结果不变 | FR-CTL-03/08、AC-11/14 |
 | Evidence 失败 | 503/EVIDENCE_UNAVAILABLE、404 Recording、能力 false | 不伪造 NOT_FOUND，不自动重试 Add/Remove | FR-CTL-03、AC-11 |
 | History | INCOMPLETE、FAILED、UNKNOWN、null 时间/计数、已删 Segment | 不伪造 COMPLETE，分页有界 | FR-DAT-09、AC-23 |
@@ -693,7 +702,7 @@ httpx-sse 0.4.3 是已选 Parser，但其生产准入保持 PENDING，特别是 
 | Drogon SSE 三层缓冲 | Server / OPEN-02 | 必须实测资源上界；Client 成功不代表 Server 准入通过 |
 | OPEN-01 | 性能规范 | SDK/应用 CPU 负载是否纳入同机测试按正式统计边界 |
 | OPEN-02 | Server/Client 验证 | 连接/时延/刷新/帧预算初始值有待量化 |
-| OPEN-04 | Server/Web/部署 | TLS/鉴权与代理方案正式确认前不能宣称远程安全准入 |
+| V1.0 Security | Server/Web/部署 | Bearer Scope、HTTPS/TLS、受信代理、Secret 脱敏与 Web Session/CSRF 必须通过 AC-18；SDK 不实现 Token 签发 |
 | Python 平台 | 技术选型/CI | 3.10/3.12、Ubuntu 22.04/24.04、AMD64/ARM64 需验证 |
 
 建议实施顺序：先 DTO/Codec/Runtime/GET，再六种控制 POST + UNKNOWN，随后 Topic Evidence，再实现 SSE Parser/StateTracker，最后 Watch/重连、应用接入与故障注入。不允许为赶工从 HTTPX Error 直接推断已执行/未执行或删除 SSE 完整快照验证。
@@ -710,7 +719,7 @@ Client 实现和集成之前必须确认：
 6. SSE 由 httpx-sse 完成标准帧解析，Issue #35 的空 Data/注释边界能验证；状态更新全量而不是 Patch。
 7. Runtime 重启、Gap、同 Revision 采样刷新、Server/Local STALE、GET 降级都复用一个 StateTracker。
 8. 连接、Watcher、Response、缓存、重连与 Application 消费队列都有容量/超时/关闭约束。
-9. 凭据、TLS、Redirect/代理、日志脱敏遵从 OPEN-04 安全边界；不能让 UI 会话变成 Runtime 控制密钥。
-10. OPEN-01/02/04、Drogon SSE 与 httpx-sse 的发布准入仍明确 PENDING，不以设计完成冒充功能已通过。
+9. 凭据、TLS、Redirect/代理、日志脱敏遵从 V1.0 Bearer + read/control Scope 安全边界；不能让 UI Session/Cookie 变成或泄漏 Runtime 控制密钥。
+10. OPEN-01/02、Drogon SSE、httpx-sse 与 AC-18 Security 的生产准入状态必须如实记录；OPEN-04 设计已闭合，但不得以设计完成冒充安全验证通过。
 
 本文件定义 Python Client 的开发目标，不表示代码或测试已经完成。若 HTTP/SSE/Recorder 接口不合理，可以直接同步修改设计，但必须保持 SDK 与 Protocol 的操作结果、身份、新鲜度和取消语义一致。
