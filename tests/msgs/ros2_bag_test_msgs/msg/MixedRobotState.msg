@@ -1,2 +1,0 @@
-ros2_bag_test_msgs/RobotState robot
-builtin_interfaces/Time stamp

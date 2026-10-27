@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
-"""Inspect actual MCAP summary Schema/Channel/Statistics records without ROS types.
-
-This does not replace PlotJuggler field parsing. Chunk payloads are not decoded.
-The independent summary scan intentionally requires the configured summary.
-"""
+"""Inspect MCAP summary Schema, Channel, and Statistics records without ROS types."""
 import argparse
 import hashlib
 import json
 from pathlib import Path
-import re
 import struct
 
 MAGIC = b"\x89MCAP0\r\n"
@@ -68,13 +63,6 @@ def inspect(path):
     for schema in schemas.values():
         if schema["encoding"] not in ("ros2msg", "ros2idl") or not schema["definition"]:
             raise ValueError("missing supported schema definition")
-        if schema["name"].endswith("/RobotState"):
-            for dependency in ("JointState", "MotorState", "TestTimestamp"):
-                if not re.search(r"ros2_bag_test_msgs/(?:msg/)?" + dependency, schema["definition"]):
-                    raise ValueError(f"missing dependency reference: {dependency}")
-                if schema["encoding"] == "ros2msg" and not re.search(
-                        r"MSG: ros2_bag_test_msgs/(?:msg/)?" + dependency, schema["definition"]):
-                    raise ValueError(f"missing dependency definition: {dependency}")
     if not schemas or not channels or count is None:
         raise ValueError("missing summary schema/channel/statistics")
     return {"file": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
@@ -84,13 +72,8 @@ def inspect(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("file", type=Path)
-    parser.add_argument("--expect-custom", action="store_true")
     args = parser.parse_args()
     result = inspect(args.file)
-    if args.expect_custom:
-        topics = {channel["topic"] for channel in result["channels"].values()}
-        if topics != {"/phase0/custom", "/phase0/mixed"} or result["message_count"] != 20:
-            raise ValueError("custom fixture topic/count mismatch")
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 

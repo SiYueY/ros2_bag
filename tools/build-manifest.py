@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Record the reproducible Recorder development build identity."""
+"""Record the reproducible development build identity for a supplied binary."""
 import argparse
 from datetime import datetime, timezone
 import hashlib
@@ -54,7 +54,7 @@ def main():
                 flags[name] = value
     working_tree_dirty = bool(output("git", "-C", str(root), "status", "--porcelain"))
     data = {
-        "schema_version": 2, "artifact_scope": "recorder_development",
+        "schema_version": 2, "artifact_scope": "development_binary",
         "source_commit": output("git", "-C", str(root), "rev-parse", "HEAD"),
         "working_tree_dirty": working_tree_dirty,
         "source_file_sha256": source_files,

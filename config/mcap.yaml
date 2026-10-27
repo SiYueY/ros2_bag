@@ -1,4 +1,4 @@
-# Recorder MCAP storage configuration.
+# MCAP storage configuration baseline for the next-generation implementation.
 compression: Lz4
 compressionLevel: Fastest
 chunkSize: 786432

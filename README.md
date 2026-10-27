@@ -1,130 +1,27 @@
 # ros2_bag
 
-ROS 2 C++17 Recorder core, currently in a **Recorder-only development state**.
-The project targets ROS 2 Humble/Jazzy on Ubuntu 22.04/24.04 (AMD64/ARM64),
-with MCAP storage through rosbag2_cpp.
+`next` is the initialization branch for the next-generation C++ implementation.
+It inherits the complete `develop` history, but intentionally contains no
+legacy Recorder runtime, library, API, lifecycle, or compatibility wrapper.
 
-This is **not** a V1.0 release and **not** the completed four-layer system.
+The design documents in [`docs/`](docs/) remain the baseline for the new work,
+including [`docs/result.md`](docs/result.md) and
+[`docs/cpp_coding_guidelines.md`](docs/cpp_coding_guidelines.md). The prior
+implementation remains available in `develop` only as reference material for
+validated ROS 2, rosbag2, MCAP, Humble, and Jazzy behavior.
 
-## Current scope
+## Baseline checks
 
-The repository currently develops and validates only the Recorder:
-
-- Dynamic ROS 2 GenericSubscription topic handling and QoS.
-- RecordingCoordinator lifecycle, normal/timed/rolling recording modes.
-- Bounded message queue, message pool, WriterAdapter and MCAP/LZ4 storage.
-- Snapshot recording buffer, manifest/event log, recovery and retention cleanup.
-- Process and disk resource sampling and Recorder-native status snapshots.
-
-The previous UDS/JSONL control server, Python IPC, CLI, and Python Web/SSE
-gateway were retired during Recorder-only closeout. No HTTP Server, Python Client,
-CLI, TUI or Web Application is currently provided. They are planned under the
-separately selected technology stack, but are **not implemented here**.
-
-## Build and test
-
-Initialize pinned submodules:
+Initialize pinned third-party dependencies before running tooling checks:
 
 ```bash
 git submodule update --init --recursive
 bash tools/verify-submodules.sh
-```
-
-A full Recorder/MCAP test environment requires the matching ROS 2
-rosbag2_cpp and rosbag2_storage_mcap packages. Before running recording
-tests on a host, verify the plugin:
-
-```bash
-source /opt/ros/humble/setup.bash
-ros2 pkg prefix rosbag2_storage_mcap
-```
-
-For Ubuntu 22.04 / Humble with tests enabled (the default):
-
-
-```bash
-source /opt/ros/humble/setup.bash
-cmake -S . -B build/humble -DCMAKE_BUILD_TYPE=Debug -DPython3_EXECUTABLE=/usr/bin/python3
-cmake --build build/humble --parallel 2
-ROS_DOMAIN_ID=218 ctest --test-dir build/humble --output-on-failure
-```
-
-To build and install **only** the Recorder development runtime, without
-test executables or test-only std_msgs dependencies:
-
-```bash
-source /opt/ros/humble/setup.bash
-cmake -S . -B build/humble-minimal -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
-cmake --build build/humble-minimal --parallel 2
-cmake --install build/humble-minimal --prefix build/humble-install
-```
-
-Only the Recorder executable and configuration are installed. The internal
-ros2_bag_core static library is **not yet an installed C++ SDK** and no public
-CMake Target/header export is promised for external consumers.
-
-For Jazzy, source the matching setup and use a separate build directory.
-Use a ROS_DOMAIN_ID isolated from other active ROS 2 systems.
-
-The minimal standalone executable can be started for initialization and
-shutdown verification:
-
-```bash
-source /opt/ros/humble/setup.bash
-build/humble/ros2_bag_recorder --config config/recorder.yaml
-```
-
-The standalone runtime holds a nonblocking advisory lock in its resolved
-output directory before recovery, preventing two cooperating Recorder
-processes from modifying the same recording root concurrently. The lock file
-persists after shutdown; only the OS lock is released.
-
-**Important:** The Recorder-only executable intentionally exposes **no external
-control interface**. It remains idle until terminated; it does **not** start a
-recording from the command line. C++ unit/integration tests call Recorder-native
-methods to exercise actual recording and MCAP readback. Do not rely on the old
-CLI/Web commands or assume this executable is a complete end-user recorder.
-
-For code-format and dependency checks:
-
-```bash
+cmake -S . -B build/next
+ctest --test-dir build/next --output-on-failure
 python3 tools/format-cpp.py --check
-python3 tests/unit/test_tooling.py
 ```
 
-## Current design documents (development stage)
-
-All design documents are **DRAFT**: architecture and APIs may be changed as development or review uncovers defects. There is no backward-compatibility obligation to unreleased UDS/Session/status.json designs. Superseded drafts and one-off reports have been removed from the working tree; Git history remains available. Current code still contains a Recorder-only prototype, not the planned Drogon Runtime or Python SDK.
-
-| Document | Responsibility |
-|---|---|
-| [Requirements](docs/requirements.md) | Current feature set, constraints, acceptance criteria |
-| [Architecture](docs/architecture.md) | Single-process layers, ownership, lifecycle, shutdown |
-| [Recorder](docs/recorder.md) | C++ domain APIs, data path, Queue/Pool, MCAP, recovery, disk safety |
-| [Protocol](docs/protocol.md) | HTTP/JSON/SSE routes, identities, outcomes and schemas |
-| [Server](docs/server.md) | Drogon, dispatch, status publication, SSE resource limits |
-| [Client](docs/client.md) | Python HTTPX sync/async SDK, UNKNOWN and SSE state tracking |
-| [Technology choices](docs/system_technology_selection.md) | Runtime libraries, versions, alternatives, deployment risks |
-| [Verification](docs/verification.md) | Reproducible functional, performance and failure-injection tests, including the active Humble Fast DDS/TSan risk register |
-| [Release](docs/release.md) | CI, toolchains, dependency locks, packaging, platform gates |
-
-Historical approvals cannot establish current implementation correctness. Source-level validation, four-platform execution, MCAP standalone decoding, security and performance gates must be measured on the actual implementation. The tests/performance/standard_profile.json is a proposed profile, not an automated benchmark or a PASS report.
-
-## Recorder-only closeout verification
-
-On 2026-10-25 the Recorder-only code passed **10/10 CTest tests** in each
-of the existing Humble AMD64 and Jazzy AMD64 test containers, including
-MCAP recording/readback and output-root process locking. The standalone Humble binary also passed a
-SIGINT shutdown smoke test.
-
-The host Ubuntu Humble environment lacks the rosbag2_storage_mcap
-plugin, so three host MCAP tests cannot run successfully there until
-that runtime dependency is installed. ARM64 was not reverified by this
-closeout, and these results are not V1.0 product acceptance.
-
-## Development boundary
-
-Recorder-domain APIs and tests are retained. Future communication and UI
-components must not be reintroduced until their respective designs are reviewed.
-The project does not provide backward compatibility for the retired UDS/CLI/Web
-implementations.
+There is deliberately no Recorder executable or C++ implementation target at
+this stage. `config/mcap.yaml`, dependency locking, formatting, and general
+tooling remain available for the forthcoming implementation.

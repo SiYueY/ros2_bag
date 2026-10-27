@@ -24,4 +24,4 @@ docker image inspect "ros2-bag:$task_distro-$task_arch" \
 docker run --rm "ros2-bag:$task_distro-$task_arch" \
     2>&1 | tee "$task_root/build/ci-evidence/$task_distro-$task_arch-tests.txt"
 
-echo "PASS Recorder-only native validation: $task_distro/$task_arch"
+echo "PASS next-generation baseline validation: $task_distro/$task_arch"
