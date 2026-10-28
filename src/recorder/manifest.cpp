@@ -67,22 +67,38 @@ std::optional<T> optional_from_json(const json& value, const char* name) {
 }
 
 json encode_error(const Error& error) {
-    return {{"code", static_cast<int>(error.code)}, {"effects", static_cast<int>(error.effects)},
-            {"message", manifest_message(error.message)}};
+    return {
+        {"code", static_cast<int>(error.code)},
+        {"effects", static_cast<int>(error.effects)},
+        {"message", manifest_message(error.message)}};
 }
 
 Error decode_error(const json& value) {
-    return {static_cast<ErrorCode>(value.at("code").get<int>()),
-            static_cast<Effects>(value.at("effects").get<int>()), value.at("message").get<std::string>()};
+    return {
+        static_cast<ErrorCode>(value.at("code").get<int>()),
+        static_cast<Effects>(value.at("effects").get<int>()),
+        value.at("message").get<std::string>()};
 }
 
 json encode_config(const TaskConfig& config) {
-    json value{{"mode", static_cast<int>(config.mode)},
-               {"compression", static_cast<int>(config.compression)},
-               {"timestamp_policy", static_cast<int>(config.timestamp_policy)}};
-    optional_to_json(value, "duration_ms", config.duration ? std::optional<std::int64_t>(config.duration->count()) : std::nullopt);
-    optional_to_json(value, "segment_duration_s", config.segment_duration ? std::optional<std::int64_t>(config.segment_duration->count()) : std::nullopt);
-    optional_to_json(value, "retention_duration_s", config.retention_duration ? std::optional<std::int64_t>(config.retention_duration->count()) : std::nullopt);
+    json value{
+        {"mode", static_cast<int>(config.mode)},
+        {"compression", static_cast<int>(config.compression)},
+        {"timestamp_policy", static_cast<int>(config.timestamp_policy)}};
+    optional_to_json(
+        value,
+        "duration_ms",
+        config.duration ? std::optional<std::int64_t>(config.duration->count()) : std::nullopt);
+    optional_to_json(
+        value,
+        "segment_duration_s",
+        config.segment_duration ? std::optional<std::int64_t>(config.segment_duration->count())
+                                : std::nullopt);
+    optional_to_json(
+        value,
+        "retention_duration_s",
+        config.retention_duration ? std::optional<std::int64_t>(config.retention_duration->count())
+                                  : std::nullopt);
     return value;
 }
 
@@ -104,7 +120,10 @@ TaskConfig decode_config(const json& value) {
 }
 
 json encode_segment(const SegmentInfo& segment) {
-    json value{{"segment_id", segment.segment_id}, {"state", static_cast<int>(segment.state)}, {"relative_path", segment.relative_path}};
+    json value{
+        {"segment_id", segment.segment_id},
+        {"state", static_cast<int>(segment.state)},
+        {"relative_path", segment.relative_path}};
     optional_to_json(value, "started_at_ns", segment.started_at_ns);
     optional_to_json(value, "completed_at_ns", segment.completed_at_ns);
     optional_to_json(value, "message_count", segment.message_count);
@@ -125,15 +144,17 @@ SegmentInfo decode_segment(const json& value) {
 }
 
 json encode(const ManifestData& data) {
-    json value{{"schema_version", data.schema_version},
-               {"manifest_revision", data.manifest_revision},
-               {"recording_id", data.task.recording_id},
-               {"generation", data.task.generation},
-               {"task_state", static_cast<int>(data.task.state)},
-               {"task_config", encode_config(data.task.config)},
-               {"topic_events_file", data.topic_events_file},
-               {"segment_history_summary", {{"compacted_removed_count", data.task.segment_history_summary.compacted_removed_count},
-                                            {"compacted_removed_bytes", data.task.segment_history_summary.compacted_removed_bytes}}}};
+    json value{
+        {"schema_version", data.schema_version},
+        {"manifest_revision", data.manifest_revision},
+        {"recording_id", data.task.recording_id},
+        {"generation", data.task.generation},
+        {"task_state", static_cast<int>(data.task.state)},
+        {"task_config", encode_config(data.task.config)},
+        {"topic_events_file", data.topic_events_file},
+        {"segment_history_summary",
+         {{"compacted_removed_count", data.task.segment_history_summary.compacted_removed_count},
+          {"compacted_removed_bytes", data.task.segment_history_summary.compacted_removed_bytes}}}};
     optional_to_json(value, "start_time_ns", data.task.start_time_ns);
     optional_to_json(value, "terminal_time_ns", data.task.terminal_time_ns);
     value["error"] = data.task.error ? encode_error(*data.task.error) : json(nullptr);
@@ -160,17 +181,22 @@ ManifestData decode(const json& value) {
     if (!value.at("error").is_null()) data.task.error = decode_error(value.at("error"));
     data.topic_events_file = value.at("topic_events_file").get<std::string>();
     const auto& summary = value.at("segment_history_summary");
-    data.task.segment_history_summary.compacted_removed_count = summary.at("compacted_removed_count").get<std::uint64_t>();
-    data.task.segment_history_summary.compacted_removed_bytes = summary.at("compacted_removed_bytes").get<std::uint64_t>();
-    for (const auto& error : value.at("secondary_errors")) data.secondary_errors.push_back(decode_error(error));
-    for (const auto& segment : value.at("segments")) data.segments.push_back(decode_segment(segment));
+    data.task.segment_history_summary.compacted_removed_count =
+        summary.at("compacted_removed_count").get<std::uint64_t>();
+    data.task.segment_history_summary.compacted_removed_bytes =
+        summary.at("compacted_removed_bytes").get<std::uint64_t>();
+    for (const auto& error : value.at("secondary_errors"))
+        data.secondary_errors.push_back(decode_error(error));
+    for (const auto& segment : value.at("segments"))
+        data.segments.push_back(decode_segment(segment));
     return data;
 }
 
 Result<void, Error> write_durable(const std::filesystem::path& path, const json& data) {
     const auto temporary = path.string() + ".tmp";
     const std::string serialized = data.dump(2) + "\n";
-    const int file = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    const int file =
+        ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
     if (file < 0) return Result<void, Error>(unexpect, storage_error(std::strerror(errno)));
     std::size_t offset = 0;
     while (offset < serialized.size()) {
@@ -202,7 +228,9 @@ Result<void, Error> write_durable(const std::filesystem::path& path, const json&
     const int directory = ::open(path.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (directory < 0 || ::fsync(directory) != 0) {
         if (directory >= 0) ::close(directory);
-        return Result<void, Error>(unexpect, storage_error("manifest rename durability is uncertain", Effects::Possible));
+        return Result<void, Error>(
+            unexpect,
+            storage_error("manifest rename durability is uncertain", Effects::Possible));
     }
     ::close(directory);
     return Result<void, Error>();
@@ -210,11 +238,16 @@ Result<void, Error> write_durable(const std::filesystem::path& path, const json&
 
 }  // namespace
 
-Result<Manifest, Error> Manifest::create(const std::filesystem::path& task_directory, ManifestData data) {
+Result<Manifest, Error> Manifest::create(
+    const std::filesystem::path& task_directory,
+    ManifestData data) {
     std::error_code error;
     std::filesystem::create_directories(task_directory, error);
     if (error) return Result<Manifest, Error>(unexpect, storage_error(error.message()));
-    if (data.manifest_revision != 1) return Result<Manifest, Error>(unexpect, storage_error("first manifest revision must be one"));
+    if (data.manifest_revision != 1)
+        return Result<Manifest, Error>(
+            unexpect,
+            storage_error("first manifest revision must be one"));
     const auto persisted = write_durable(task_directory / "manifest.json", encode(data));
     if (!persisted) {
         if (persisted.error().effects == Effects::None) {
@@ -227,12 +260,23 @@ Result<Manifest, Error> Manifest::create(const std::filesystem::path& task_direc
 
 Result<Manifest, Error> Manifest::load(const std::filesystem::path& task_directory) {
     try {
-        std::ifstream stream(task_directory / "manifest.json");
-        if (!stream) return Result<Manifest, Error>(unexpect, storage_error("cannot open manifest"));
+        const auto path = task_directory / "manifest.json";
+        std::error_code filesystem_error;
+        const auto status = std::filesystem::symlink_status(path, filesystem_error);
+        if (filesystem_error || !std::filesystem::is_regular_file(status) ||
+            std::filesystem::is_symlink(status)) {
+            return Result<Manifest, Error>(
+                unexpect,
+                storage_error("manifest is not a safe regular file"));
+        }
+        std::ifstream stream(path);
+        if (!stream)
+            return Result<Manifest, Error>(unexpect, storage_error("cannot open manifest"));
         json value;
         stream >> value;
         auto data = decode(value);
-        if (data.manifest_revision == 0) return Result<Manifest, Error>(unexpect, storage_error("invalid manifest revision"));
+        if (data.manifest_revision == 0)
+            return Result<Manifest, Error>(unexpect, storage_error("invalid manifest revision"));
         return Result<Manifest, Error>(Manifest(task_directory, std::move(data)));
     } catch (const std::exception& exception) {
         return Result<Manifest, Error>(unexpect, storage_error(exception.what()));
@@ -240,7 +284,8 @@ Result<Manifest, Error> Manifest::load(const std::filesystem::path& task_directo
 }
 
 Result<void, Error> Manifest::commit(ManifestData data) {
-    if (data.manifest_revision != data_.manifest_revision + 1 || data_.manifest_revision == std::numeric_limits<std::uint64_t>::max()) {
+    if (data.manifest_revision != data_.manifest_revision + 1 ||
+        data_.manifest_revision == std::numeric_limits<std::uint64_t>::max()) {
         return Result<void, Error>(unexpect, storage_error("invalid manifest revision transition"));
     }
     const auto persisted = write_durable(task_directory_ / "manifest.json", encode(data));

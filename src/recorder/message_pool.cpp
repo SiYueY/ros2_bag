@@ -40,7 +40,8 @@ std::shared_ptr<rclcpp::SerializedMessage> MessagePool::acquire() {
     ++in_use_;
     --active_operations_;
     return std::shared_ptr<rclcpp::SerializedMessage>(
-        std::addressof(node.message), [this, index](rclcpp::SerializedMessage*) { release(index); });
+        std::addressof(node.message),
+        [this, index](rclcpp::SerializedMessage*) { release(index); });
 }
 
 void MessagePool::begin_stop() {
@@ -53,7 +54,9 @@ void MessagePool::begin_stop() {
 
 bool MessagePool::wait_stopped_for(std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lock(mutex_);
-    return stopped_condition_.wait_for(lock, timeout, [this] { return lifecycle_ == Lifecycle::Stopped; });
+    return stopped_condition_.wait_for(lock, timeout, [this] {
+        return lifecycle_ == Lifecycle::Stopped;
+    });
 }
 
 PoolState MessagePool::state() const {

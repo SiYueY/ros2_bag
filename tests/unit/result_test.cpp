@@ -478,8 +478,10 @@ struct HasConstValueOr : std::false_type {};
 
 template <class R, class U>
 struct HasConstValueOr<
-    R, U, std::void_t<decltype(std::declval<const R&>().value_or(std::declval<U>()))>>
-: std::true_type {};
+    R,
+    U,
+    std::void_t<decltype(std::declval<const R&>().value_or(std::declval<U>()))>> : std::true_type {
+};
 
 template <class R, class U, class = void>
 struct HasEmplace : std::false_type {};
@@ -581,7 +583,9 @@ static_assert(std::is_move_assignable_v<MoveOnlyVoidResult>);
 static_assert(std::is_assignable_v<ThrowingMoveResult&, ThrowingMove>);
 
 static_assert(std::is_constructible_v<
-              ros2_bag::Result<FromUnexpect, ErrorCode>, std::in_place_t, ros2_bag::unexpect_t>);
+              ros2_bag::Result<FromUnexpect, ErrorCode>,
+              std::in_place_t,
+              ros2_bag::unexpect_t>);
 static_assert(
     !std::is_constructible_v<ros2_bag::Result<FromUnexpect, ErrorNoDefault>, ros2_bag::unexpect_t>);
 
@@ -645,7 +649,8 @@ void test_basic_construction_and_access() {
     CHECK(nested->value() == 11);
 
     ros2_bag::Result<int, ros2_bag::Result<void, ErrorCode>> result_as_error(
-        ros2_bag::unexpect, ros2_bag::Result<void, ErrorCode>{});
+        ros2_bag::unexpect,
+        ros2_bag::Result<void, ErrorCode>{});
     CHECK(!result_as_error);
     CHECK(result_as_error.error().has_value());
 }

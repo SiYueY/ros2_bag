@@ -10,7 +10,8 @@ std::int64_t steady_ns(std::chrono::steady_clock::time_point value) noexcept {
 }  // namespace
 
 void AdmissionGate::open(
-    std::uint64_t generation, std::uint64_t topic_epoch,
+    std::uint64_t generation,
+    std::uint64_t topic_epoch,
     std::optional<std::chrono::steady_clock::time_point> deadline) noexcept {
     generation_.store(generation, std::memory_order_release);
     topic_epoch_.store(topic_epoch, std::memory_order_release);
@@ -21,7 +22,9 @@ void AdmissionGate::open(
 void AdmissionGate::close() noexcept { accepting_.store(false, std::memory_order_release); }
 
 AdmissionResult AdmissionGate::admit(
-    std::uint64_t generation, std::uint64_t topic_epoch, const DiskAdmissionState& disk,
+    std::uint64_t generation,
+    std::uint64_t topic_epoch,
+    const DiskAdmissionState& disk,
     std::chrono::steady_clock::time_point now) noexcept {
     if (generation_.load(std::memory_order_acquire) != generation ||
         topic_epoch_.load(std::memory_order_acquire) != topic_epoch) {
@@ -44,8 +47,8 @@ AdmissionResult AdmissionGate::admit(
         disk_snapshot_busy_.fetch_add(1, std::memory_order_relaxed);
         return AdmissionResult::DiskSnapshotBusy;
     }
-    if (snapshot->state == DiskSafetyState::Critical || snapshot->state == DiskSafetyState::Unknown ||
-        now_ns > snapshot->valid_until_steady_ns) {
+    if (snapshot->state == DiskSafetyState::Critical ||
+        snapshot->state == DiskSafetyState::Unknown || now_ns > snapshot->valid_until_steady_ns) {
         accepting_.store(false, std::memory_order_release);
         disk_unsafe_.fetch_add(1, std::memory_order_relaxed);
         return AdmissionResult::DiskUnsafe;

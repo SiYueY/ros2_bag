@@ -5,8 +5,14 @@
 
 namespace ros2_bag::recorder {
 
-Cleanup::Cleanup(std::size_t queue_capacity, std::chrono::seconds warning_after, ResultCallback callback)
-: queue_capacity_(queue_capacity), warning_after_(warning_after), callback_(std::move(callback)), thread_([this] { run(); }) {}
+Cleanup::Cleanup(
+    std::size_t queue_capacity,
+    std::chrono::seconds warning_after,
+    ResultCallback callback)
+: queue_capacity_(queue_capacity),
+  warning_after_(warning_after),
+  callback_(std::move(callback)),
+  thread_([this] { run(); }) {}
 
 Cleanup::~Cleanup() {
     stop();
@@ -63,12 +69,17 @@ void Cleanup::run() {
         std::filesystem::remove_all(work.path, filesystem_error);
         DeleteResult result{work, std::nullopt};
         if (filesystem_error) {
-            result.error = Error{ErrorCode::StorageError, Effects::ConfirmedPartial, filesystem_error.message()};
+            result.error = Error{
+                ErrorCode::StorageError,
+                Effects::ConfirmedPartial,
+                filesystem_error.message()};
         }
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (result.error) last_error_ = result.error;
-            else ++total_removed_;
+            if (result.error)
+                last_error_ = result.error;
+            else
+                ++total_removed_;
             active_.reset();
             active_since_.reset();
         }
@@ -76,7 +87,10 @@ void Cleanup::run() {
             callback_(std::move(result));
         } catch (...) {
             std::lock_guard<std::mutex> lock(mutex_);
-            last_error_ = Error{ErrorCode::InternalError, Effects::ConfirmedPartial, "cleanup result callback threw"};
+            last_error_ = Error{
+                ErrorCode::InternalError,
+                Effects::ConfirmedPartial,
+                "cleanup result callback threw"};
         }
     }
 }

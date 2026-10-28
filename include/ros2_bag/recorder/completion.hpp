@@ -26,7 +26,9 @@ public:
             return false;
         }
         std::unique_lock<std::mutex> lock(state_->mutex);
-        return state_->condition.wait_for(lock, timeout, [this] { return state_->result.has_value(); });
+        return state_->condition.wait_for(lock, timeout, [this] {
+            return state_->result.has_value();
+        });
     }
 
     bool done() const noexcept {
@@ -85,7 +87,9 @@ public:
 
     Completion<T> completion() const { return completion_; }
 
-    void set_value(T value) const { producer_.complete(Result<T, Error>(std::in_place, std::move(value))); }
+    void set_value(T value) const {
+        producer_.complete(Result<T, Error>(std::in_place, std::move(value)));
+    }
 
     void set_error(Error error) const {
         producer_.complete(Result<T, Error>(unexpect, std::move(error)));

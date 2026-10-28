@@ -34,7 +34,10 @@ class Cleanup {
 public:
     using ResultCallback = std::function<void(DeleteResult)>;
 
-    Cleanup(std::size_t queue_capacity, std::chrono::seconds warning_after, ResultCallback callback);
+    Cleanup(
+        std::size_t queue_capacity,
+        std::chrono::seconds warning_after,
+        ResultCallback callback);
     ~Cleanup();
 
     Cleanup(const Cleanup&) = delete;

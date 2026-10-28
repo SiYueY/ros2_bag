@@ -36,7 +36,8 @@ struct Error {
 };
 
 inline bool operator==(const Error& left, const Error& right) {
-    return left.code == right.code && left.effects == right.effects && left.message == right.message;
+    return left.code == right.code && left.effects == right.effects &&
+           left.message == right.message;
 }
 
 inline bool operator!=(const Error& left, const Error& right) { return !(left == right); }

@@ -24,7 +24,9 @@ class Snapshot {
 public:
     explicit Snapshot(SnapshotConfig config);
 
-    void push_written_live(const RecordedMessage& message, std::chrono::steady_clock::time_point now);
+    void push_written_live(
+        const RecordedMessage& message,
+        std::chrono::steady_clock::time_point now);
     std::vector<RecordedMessage> replay_for(std::uint64_t generation) const;
     void erase_topic(TopicId topic_id, std::uint64_t topic_epoch);
     std::size_t total_bytes() const noexcept { return total_bytes_; }

@@ -27,6 +27,12 @@ struct QosOptions {
     std::optional<std::uint32_t> depth;
 };
 
+struct QosSelection {
+    QosOptions qos;
+    std::size_t compatible_publisher_count = 0;
+    bool all_publishers_compatible = true;
+};
+
 struct TopicOptions {
     std::string name;
     std::string type;
@@ -57,6 +63,12 @@ struct DiscoveredTopic {
 };
 
 Result<QosOptions, Error> normalize_qos(const std::optional<QosOptions>& options);
+bool qos_compatible(const QosOptions& publisher, const QosOptions& subscription) noexcept;
+Result<QosSelection, Error> select_qos(
+    const std::optional<QosOptions>& options,
+    const std::vector<QosOptions>& publisher_profiles,
+    std::size_t publisher_count,
+    bool publisher_profiles_truncated);
 Result<void, Error> validate_topic_options(const TopicOptions& options);
 
 }  // namespace ros2_bag::recorder

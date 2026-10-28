@@ -58,8 +58,9 @@ template <class T>
 inline constexpr bool kIsResult = IsResult<RemoveCvRefT<T>>::value;
 
 template <
-    class T, bool = kIsComplete<T>&& std::is_object_v<T> && !std::is_array_v<T> &&
-                    !std::is_const_v<T> && !std::is_volatile_v<T> && !kIsUnexpected<T>>
+    class T,
+    bool = kIsComplete<T>&& std::is_object_v<T> && !std::is_array_v<T> && !std::is_const_v<T> &&
+           !std::is_volatile_v<T> && !kIsUnexpected<T>>
 struct IsValidErrorType : std::false_type {};
 
 template <class T>
@@ -67,10 +68,10 @@ struct IsValidErrorType<T, true>
 : std::bool_constant<!std::is_abstract_v<T> && std::is_nothrow_destructible_v<T>> {};
 
 template <
-    class T, bool = kIsComplete<T>&& std::is_object_v<T> && !std::is_array_v<T> &&
-                    !std::is_const_v<T> && !std::is_volatile_v<T> &&
-                    !std::is_same_v<T, std::in_place_t> && !std::is_same_v<T, unexpect_t> &&
-                    !kIsUnexpected<T>>
+    class T,
+    bool = kIsComplete<T>&& std::is_object_v<T> && !std::is_array_v<T> && !std::is_const_v<T> &&
+           !std::is_volatile_v<T> && !std::is_same_v<T, std::in_place_t> &&
+           !std::is_same_v<T, unexpect_t> && !kIsUnexpected<T>>
 struct IsValidValueType : std::false_type {};
 
 template <class T>
@@ -806,7 +807,8 @@ using NonVoidWithDestructor = ConditionalDestructor<
 
 template <class T, class E>
 using NonVoidWithCopyConstructor = ConditionalCopyConstructor<
-    NonVoidWithDestructor<T, E>, std::is_copy_constructible_v<T> && std::is_copy_constructible_v<E>,
+    NonVoidWithDestructor<T, E>,
+    std::is_copy_constructible_v<T> && std::is_copy_constructible_v<E>,
     std::is_trivially_copy_constructible_v<T> && std::is_trivially_copy_constructible_v<E>,
     std::is_nothrow_copy_constructible_v<T> && std::is_nothrow_copy_constructible_v<E>>;
 
@@ -833,7 +835,8 @@ inline constexpr bool kNonVoidMoveAssignmentEnabled =
 
 template <class T, class E>
 using NonVoidWithCopyAssignment = ConditionalCopyAssignment<
-    NonVoidWithMoveConstructor<T, E>, kNonVoidCopyAssignmentEnabled<T, E>,
+    NonVoidWithMoveConstructor<T, E>,
+    kNonVoidCopyAssignmentEnabled<T, E>,
     kNonVoidCopyAssignmentEnabled<T, E> && std::is_trivially_copy_constructible_v<T> &&
         std::is_trivially_copy_assignable_v<T> && std::is_trivially_destructible_v<T> &&
         std::is_trivially_copy_constructible_v<E> && std::is_trivially_copy_assignable_v<E> &&
@@ -843,7 +846,8 @@ using NonVoidWithCopyAssignment = ConditionalCopyAssignment<
 
 template <class T, class E>
 using NonVoidSpecialMembers = ConditionalMoveAssignment<
-    NonVoidWithCopyAssignment<T, E>, kNonVoidMoveAssignmentEnabled<T, E>,
+    NonVoidWithCopyAssignment<T, E>,
+    kNonVoidMoveAssignmentEnabled<T, E>,
     kNonVoidMoveAssignmentEnabled<T, E> && std::is_trivially_move_constructible_v<T> &&
         std::is_trivially_move_assignable_v<T> && std::is_trivially_destructible_v<T> &&
         std::is_trivially_move_constructible_v<E> && std::is_trivially_move_assignable_v<E> &&
@@ -857,13 +861,17 @@ using VoidWithDestructor =
 
 template <class E>
 using VoidWithCopyConstructor = ConditionalCopyConstructor<
-    VoidWithDestructor<E>, std::is_copy_constructible_v<E>,
-    std::is_trivially_copy_constructible_v<E>, std::is_nothrow_copy_constructible_v<E>>;
+    VoidWithDestructor<E>,
+    std::is_copy_constructible_v<E>,
+    std::is_trivially_copy_constructible_v<E>,
+    std::is_nothrow_copy_constructible_v<E>>;
 
 template <class E>
 using VoidWithMoveConstructor = ConditionalMoveConstructor<
-    VoidWithCopyConstructor<E>, std::is_move_constructible_v<E>,
-    std::is_trivially_move_constructible_v<E>, std::is_nothrow_move_constructible_v<E>>;
+    VoidWithCopyConstructor<E>,
+    std::is_move_constructible_v<E>,
+    std::is_trivially_move_constructible_v<E>,
+    std::is_nothrow_move_constructible_v<E>>;
 
 template <class E>
 inline constexpr bool kVoidCopyAssignmentEnabled =
@@ -875,14 +883,16 @@ inline constexpr bool kVoidMoveAssignmentEnabled =
 
 template <class E>
 using VoidWithCopyAssignment = ConditionalCopyAssignment<
-    VoidWithMoveConstructor<E>, kVoidCopyAssignmentEnabled<E>,
+    VoidWithMoveConstructor<E>,
+    kVoidCopyAssignmentEnabled<E>,
     kVoidCopyAssignmentEnabled<E> && std::is_trivially_copy_constructible_v<E> &&
         std::is_trivially_copy_assignable_v<E> && std::is_trivially_destructible_v<E>,
     std::is_nothrow_copy_constructible_v<E> && std::is_nothrow_copy_assignable_v<E>>;
 
 template <class E>
 using VoidSpecialMembers = ConditionalMoveAssignment<
-    VoidWithCopyAssignment<E>, kVoidMoveAssignmentEnabled<E>,
+    VoidWithCopyAssignment<E>,
+    kVoidMoveAssignmentEnabled<E>,
     kVoidMoveAssignmentEnabled<E> && std::is_trivially_move_constructible_v<E> &&
         std::is_trivially_move_assignable_v<E> && std::is_trivially_destructible_v<E>,
     std::is_nothrow_move_constructible_v<E> && std::is_nothrow_move_assignable_v<E>>;
@@ -1017,7 +1027,8 @@ public:
     template <
         class G,
         std::enable_if_t<
-            std::is_constructible_v<E, const G&> && std::is_convertible_v<const G&, E>, int> = 0>
+            std::is_constructible_v<E, const G&> && std::is_convertible_v<const G&, E>,
+            int> = 0>
     constexpr Result(const Unexpected<G>& unexpected) noexcept(
         std::is_nothrow_constructible_v<E, const G&>)
     : SpecialMembers(unexpect, unexpected.error()) {}
@@ -1025,7 +1036,8 @@ public:
     template <
         class G,
         std::enable_if_t<
-            std::is_constructible_v<E, const G&> && !std::is_convertible_v<const G&, E>, int> = 0>
+            std::is_constructible_v<E, const G&> && !std::is_convertible_v<const G&, E>,
+            int> = 0>
     explicit constexpr Result(const Unexpected<G>& unexpected) noexcept(
         std::is_nothrow_constructible_v<E, const G&>)
     : SpecialMembers(unexpect, unexpected.error()) {}
@@ -1037,8 +1049,9 @@ public:
     : SpecialMembers(unexpect, std::move(unexpected).error()) {}
 
     template <
-        class G, std::enable_if_t<
-                     std::is_constructible_v<E, G&&> && !std::is_convertible_v<G&&, E>, int> = 0>
+        class G,
+        std::enable_if_t<std::is_constructible_v<E, G&&> && !std::is_convertible_v<G&&, E>, int> =
+            0>
     explicit constexpr Result(Unexpected<G>&& unexpected) noexcept(
         std::is_nothrow_constructible_v<E, G&&>)
     : SpecialMembers(unexpect, std::move(unexpected).error()) {}
@@ -1061,10 +1074,11 @@ public:
     }
 
     template <
-        class G, std::enable_if_t<
-                     std::is_constructible_v<E, const G&> && std::is_assignable_v<E&, const G&> &&
-                         result_traits::kCanReinitialize<E, T, const G&>,
-                     int> = 0>
+        class G,
+        std::enable_if_t<
+            std::is_constructible_v<E, const G&> && std::is_assignable_v<E&, const G&> &&
+                result_traits::kCanReinitialize<E, T, const G&>,
+            int> = 0>
     Result& operator=(const Unexpected<G>& unexpected) noexcept(
         std::is_nothrow_assignable_v<E&, const G&>&& std::is_nothrow_constructible_v<E, const G&>) {
         if (has_value()) {
@@ -1076,10 +1090,11 @@ public:
     }
 
     template <
-        class G, std::enable_if_t<
-                     std::is_constructible_v<E, G&&> && std::is_assignable_v<E&, G&&> &&
-                         result_traits::kCanReinitialize<E, T, G&&>,
-                     int> = 0>
+        class G,
+        std::enable_if_t<
+            std::is_constructible_v<E, G&&> && std::is_assignable_v<E&, G&&> &&
+                result_traits::kCanReinitialize<E, T, G&&>,
+            int> = 0>
     Result& operator=(Unexpected<G>&& unexpected) noexcept(
         std::is_nothrow_assignable_v<E&, G&&>&& std::is_nothrow_constructible_v<E, G&&>) {
         if (has_value()) {
@@ -1183,7 +1198,8 @@ public:
     }
 
     template <
-        class... Args, std::enable_if_t<std::is_nothrow_constructible_v<T, Args&&...>, int> = 0>
+        class... Args,
+        std::enable_if_t<std::is_nothrow_constructible_v<T, Args&&...>, int> = 0>
     T& emplace(Args&&... args) noexcept {
         return this->emplace_value(std::forward<Args>(args)...);
     }
@@ -1313,7 +1329,8 @@ private:
                     std::is_constructible_v<Return, Raw> && std::is_constructible_v<E, ErrorArg>) {
                     if (self.has_value()) {
                         return static_cast<Return>(std::invoke(
-                            std::forward<F>(function), std::forward<Self>(self).value()));
+                            std::forward<F>(function),
+                            std::forward<Self>(self).value()));
                     }
 
                     return Return(unexpect, std::forward<Self>(self).error());
@@ -1373,7 +1390,8 @@ private:
                         return Return(
                             std::in_place,
                             std::invoke(
-                                std::forward<F>(function), std::forward<Self>(self).value()));
+                                std::forward<F>(function),
+                                std::forward<Self>(self).value()));
                     }
                 }
 
@@ -1515,7 +1533,8 @@ public:
     template <
         class G,
         std::enable_if_t<
-            std::is_constructible_v<E, const G&> && std::is_convertible_v<const G&, E>, int> = 0>
+            std::is_constructible_v<E, const G&> && std::is_convertible_v<const G&, E>,
+            int> = 0>
     constexpr Result(const Unexpected<G>& unexpected) noexcept(
         std::is_nothrow_constructible_v<E, const G&>)
     : SpecialMembers(unexpect, unexpected.error()) {}
@@ -1523,7 +1542,8 @@ public:
     template <
         class G,
         std::enable_if_t<
-            std::is_constructible_v<E, const G&> && !std::is_convertible_v<const G&, E>, int> = 0>
+            std::is_constructible_v<E, const G&> && !std::is_convertible_v<const G&, E>,
+            int> = 0>
     explicit constexpr Result(const Unexpected<G>& unexpected) noexcept(
         std::is_nothrow_constructible_v<E, const G&>)
     : SpecialMembers(unexpect, unexpected.error()) {}
@@ -1535,8 +1555,9 @@ public:
     : SpecialMembers(unexpect, std::move(unexpected).error()) {}
 
     template <
-        class G, std::enable_if_t<
-                     std::is_constructible_v<E, G&&> && !std::is_convertible_v<G&&, E>, int> = 0>
+        class G,
+        std::enable_if_t<std::is_constructible_v<E, G&&> && !std::is_convertible_v<G&&, E>, int> =
+            0>
     explicit constexpr Result(Unexpected<G>&& unexpected) noexcept(
         std::is_nothrow_constructible_v<E, G&&>)
     : SpecialMembers(unexpect, std::move(unexpected).error()) {}
@@ -1550,7 +1571,8 @@ public:
     template <
         class G,
         std::enable_if_t<
-            std::is_constructible_v<E, const G&> && std::is_assignable_v<E&, const G&>, int> = 0>
+            std::is_constructible_v<E, const G&> && std::is_assignable_v<E&, const G&>,
+            int> = 0>
     Result& operator=(const Unexpected<G>& unexpected) noexcept(
         std::is_nothrow_constructible_v<E, const G&>&& std::is_nothrow_assignable_v<E&, const G&>) {
         if (has_value()) {

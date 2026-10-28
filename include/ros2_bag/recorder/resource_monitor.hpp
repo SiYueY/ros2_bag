@@ -45,7 +45,10 @@ class ResourceMonitor {
 public:
     using SampleCallback = std::function<void(DiskSample)>;
 
-    ResourceMonitor(DiskMonitorConfig config, DiskAdmissionState& admission, SampleCallback callback);
+    ResourceMonitor(
+        DiskMonitorConfig config,
+        DiskAdmissionState& admission,
+        SampleCallback callback);
     ~ResourceMonitor();
 
     ResourceMonitor(const ResourceMonitor&) = delete;

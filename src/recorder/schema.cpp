@@ -21,16 +21,31 @@ std::string trim(std::string value) {
         return std::isspace(character) != 0;
     });
     const auto last = std::find_if_not(value.rbegin(), value.rend(), [](unsigned char character) {
-        return std::isspace(character) != 0;
-    }).base();
+                          return std::isspace(character) != 0;
+                      }).base();
     if (first >= last) return {};
     return {first, last};
 }
 
 bool primitive(std::string_view type) {
     static const std::set<std::string> types{
-        "bool", "byte", "char", "float32", "float64", "int8", "uint8", "int16", "uint16", "int32", "uint32",
-        "int64", "uint64", "string", "wstring", "time", "duration"};
+        "bool",
+        "byte",
+        "char",
+        "float32",
+        "float64",
+        "int8",
+        "uint8",
+        "int16",
+        "uint16",
+        "int32",
+        "uint32",
+        "int64",
+        "uint64",
+        "string",
+        "wstring",
+        "time",
+        "duration"};
     return types.find(std::string(type)) != types.end();
 }
 
@@ -43,27 +58,43 @@ std::string element_type(std::string type) {
 }
 
 Result<void, Error> append_definition(
-    const std::string& type, std::unordered_set<std::string>& visiting, std::unordered_set<std::string>& visited,
+    const std::string& type,
+    std::unordered_set<std::string>& visiting,
+    std::unordered_set<std::string>& visited,
     std::vector<std::pair<std::string, std::string>>& definitions) {
     if (visited.find(type) != visited.end()) return Result<void, Error>();
     if (!visiting.insert(type).second) {
-        return Result<void, Error>(unexpect, Error{ErrorCode::SchemaUnavailable, Effects::None, "recursive schema dependency"});
+        return Result<void, Error>(
+            unexpect,
+            Error{ErrorCode::SchemaUnavailable, Effects::None, "recursive schema dependency"});
     }
     const auto first = type.find('/');
     const auto second = first == std::string::npos ? std::string::npos : type.find('/', first + 1);
-    if (first == std::string::npos || second == std::string::npos || type.substr(first + 1, second - first - 1) != "msg") {
-        return Result<void, Error>(unexpect, Error{ErrorCode::SchemaUnavailable, Effects::None, "unsupported ROS message type"});
+    if (first == std::string::npos || second == std::string::npos ||
+        type.substr(first + 1, second - first - 1) != "msg") {
+        return Result<void, Error>(
+            unexpect,
+            Error{ErrorCode::SchemaUnavailable, Effects::None, "unsupported ROS message type"});
     }
     const auto package = type.substr(0, first);
     const auto name = type.substr(second + 1);
     std::ifstream input;
     try {
-        input.open(std::filesystem::path(ament_index_cpp::get_package_share_directory(package)) / "msg" / (name + ".msg"));
+        input.open(
+            std::filesystem::path(ament_index_cpp::get_package_share_directory(package)) / "msg" /
+            (name + ".msg"));
     } catch (const std::exception& exception) {
-        return Result<void, Error>(unexpect, Error{ErrorCode::SchemaUnavailable, Effects::None, exception.what()});
+        return Result<void, Error>(
+            unexpect,
+            Error{ErrorCode::SchemaUnavailable, Effects::None, exception.what()});
     }
     if (!input) {
-        return Result<void, Error>(unexpect, Error{ErrorCode::SchemaUnavailable, Effects::None, "message definition is unavailable"});
+        return Result<void, Error>(
+            unexpect,
+            Error{
+                ErrorCode::SchemaUnavailable,
+                Effects::None,
+                "message definition is unavailable"});
     }
     std::ostringstream body;
     std::string line;
@@ -110,17 +141,24 @@ std::string schema_sha256(const std::string& definition) {
 Result<void, Error> validate_type_support(const std::string& type) {
     if (type.empty()) {
         return Result<void, Error>(
-            unexpect, Error{ErrorCode::TypeUnavailable, Effects::None, "empty ROS type"});
+            unexpect,
+            Error{ErrorCode::TypeUnavailable, Effects::None, "empty ROS type"});
     }
     try {
         const auto library = rosbag2_cpp::get_typesupport_library(type, "rosidl_typesupport_cpp");
         if (!library) {
             return Result<void, Error>(
-                unexpect, Error{ErrorCode::TypeUnavailable, Effects::None, "ROS type support library is unavailable"});
+                unexpect,
+                Error{
+                    ErrorCode::TypeUnavailable,
+                    Effects::None,
+                    "ROS type support library is unavailable"});
         }
         return Result<void, Error>();
     } catch (const std::exception& exception) {
-        return Result<void, Error>(unexpect, Error{ErrorCode::TypeUnavailable, Effects::None, exception.what()});
+        return Result<void, Error>(
+            unexpect,
+            Error{ErrorCode::TypeUnavailable, Effects::None, exception.what()});
     }
 }
 
@@ -133,9 +171,15 @@ Result<ResolvedSchema, Error> resolve_schema(const std::string& type) {
     const auto appended = append_definition(type, visiting, visited, definitions);
     if (!appended) return Result<ResolvedSchema, Error>(unexpect, appended.error());
     std::ostringstream encoded;
-    for (const auto& definition : definitions) {
-        encoded << "================================================================================\n";
-        encoded << "MSG: " << definition.first << "\n" << definition.second;
+    // The root definition is carried directly by the MCAP schema named with the
+    // root ROS type.  Only dependent definitions use the ros2msg separator.
+    // `append_definition()` post-orders its output, so the root is last.
+    encoded << definitions.back().second;
+    for (auto definition = definitions.rbegin() + 1; definition != definitions.rend();
+         ++definition) {
+        encoded
+            << "================================================================================\n";
+        encoded << "MSG: " << definition->first << "\n" << definition->second;
     }
     ResolvedSchema schema;
     schema.root_type = type;

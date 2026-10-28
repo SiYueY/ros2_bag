@@ -22,12 +22,17 @@ enum class AdmissionResult {
 
 class AdmissionGate {
 public:
-    void open(std::uint64_t generation, std::uint64_t topic_epoch,
-              std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt) noexcept;
+    void open(
+        std::uint64_t generation,
+        std::uint64_t topic_epoch,
+        std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt) noexcept;
     void close() noexcept;
 
-    AdmissionResult admit(std::uint64_t generation, std::uint64_t topic_epoch, const DiskAdmissionState& disk,
-                          std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) noexcept;
+    AdmissionResult admit(
+        std::uint64_t generation,
+        std::uint64_t topic_epoch,
+        const DiskAdmissionState& disk,
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) noexcept;
     DropCounters counters() const noexcept;
 
 private:

@@ -24,27 +24,37 @@ std::int64_t system_now_ns() {
 
 }  // namespace
 
-void DiskAdmissionState::publish(DiskSafetyState state, std::int64_t valid_until_steady_ns) noexcept {
+void DiskAdmissionState::publish(
+    DiskSafetyState state,
+    std::int64_t valid_until_steady_ns) noexcept {
     sequence_.fetch_add(1, std::memory_order_acq_rel);
     state_.store(state, std::memory_order_relaxed);
     valid_until_steady_ns_.store(valid_until_steady_ns, std::memory_order_relaxed);
     sequence_.fetch_add(1, std::memory_order_release);
 }
 
-std::optional<DiskAdmissionSnapshot> DiskAdmissionState::read(std::uint32_t maximum_retries) const noexcept {
+std::optional<DiskAdmissionSnapshot> DiskAdmissionState::read(
+    std::uint32_t maximum_retries) const noexcept {
     for (std::uint32_t attempt = 0; attempt < maximum_retries; ++attempt) {
         const auto first = sequence_.load(std::memory_order_acquire);
         if ((first & 1U) != 0U) continue;
         const DiskAdmissionSnapshot snapshot{
-            state_.load(std::memory_order_relaxed), valid_until_steady_ns_.load(std::memory_order_relaxed)};
+            state_.load(std::memory_order_relaxed),
+            valid_until_steady_ns_.load(std::memory_order_relaxed)};
         const auto second = sequence_.load(std::memory_order_acquire);
         if (first == second && (second & 1U) == 0U) return snapshot;
     }
     return std::nullopt;
 }
 
-ResourceMonitor::ResourceMonitor(DiskMonitorConfig config, DiskAdmissionState& admission, SampleCallback callback)
-: config_(std::move(config)), admission_(admission), callback_(std::move(callback)), thread_([this] { run(); }) {}
+ResourceMonitor::ResourceMonitor(
+    DiskMonitorConfig config,
+    DiskAdmissionState& admission,
+    SampleCallback callback)
+: config_(std::move(config)),
+  admission_(admission),
+  callback_(std::move(callback)),
+  thread_([this] { run(); }) {}
 
 ResourceMonitor::~ResourceMonitor() {
     stop();
@@ -60,9 +70,12 @@ void ResourceMonitor::run() {
     while (!stopping_.load()) {
         const auto value = sample();
         if (value.valid || value.consecutive_failures >= config_.failure_threshold) {
-            const auto valid_until = value.valid
-                                         ? steady_now_ns() + std::chrono::duration_cast<std::chrono::nanoseconds>(config_.max_age).count()
-                                         : steady_now_ns();
+            const auto valid_until =
+                value.valid
+                    ? steady_now_ns() +
+                          std::chrono::duration_cast<std::chrono::nanoseconds>(config_.max_age)
+                              .count()
+                    : steady_now_ns();
             admission_.publish(value.state, valid_until);
         }
         try {
@@ -89,8 +102,10 @@ DiskSample ResourceMonitor::sample() {
     result.valid = true;
     result.available_bytes = static_cast<std::uint64_t>(filesystem.f_bavail) * filesystem.f_frsize;
     const auto used_blocks = filesystem.f_blocks - filesystem.f_bavail;
-    result.used_percent = 100.0 * static_cast<double>(used_blocks) / static_cast<double>(filesystem.f_blocks);
-    if (result.available_bytes < config_.min_free_bytes || result.used_percent >= config_.pause_percent) {
+    result.used_percent =
+        100.0 * static_cast<double>(used_blocks) / static_cast<double>(filesystem.f_blocks);
+    if (result.available_bytes < config_.min_free_bytes ||
+        result.used_percent >= config_.pause_percent) {
         result.state = DiskSafetyState::Critical;
     } else if (result.used_percent >= config_.warning_percent) {
         result.state = DiskSafetyState::Warning;

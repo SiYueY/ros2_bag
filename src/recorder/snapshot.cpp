@@ -13,7 +13,8 @@ Snapshot::Snapshot(SnapshotConfig config) : config_(config) {
 }
 
 void Snapshot::push_written_live(
-    const RecordedMessage& message, std::chrono::steady_clock::time_point now) {
+    const RecordedMessage& message,
+    std::chrono::steady_clock::time_point now) {
     if (message.replayed) {
         return;
     }
@@ -71,7 +72,8 @@ void Snapshot::enforce_topic(TopicEntries& entries, std::chrono::steady_clock::t
         bytes += entry.message.payload_bytes;
     }
     while (!entries.empty() &&
-           (entries.size() > config_.max_messages_per_topic || bytes > config_.max_bytes_per_topic ||
+           (entries.size() > config_.max_messages_per_topic ||
+            bytes > config_.max_bytes_per_topic ||
             (config_.max_age && now - entries.front().inserted_at > *config_.max_age))) {
         bytes -= entries.front().message.payload_bytes;
         total_bytes_ -= entries.front().message.payload_bytes;

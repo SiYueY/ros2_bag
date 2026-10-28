@@ -44,11 +44,20 @@ public:
 
     Result<std::uint64_t, Error> append(TopicEvent event);
     Result<TopicOperationState, Error> operation_state(const OperationId& operation_id) const;
-    std::optional<std::uint64_t> uncertainty_watermark() const noexcept { return uncertainty_watermark_; }
+    std::optional<std::uint64_t> uncertainty_watermark() const noexcept {
+        return uncertainty_watermark_;
+    }
 
 private:
-    TopicEvents(std::filesystem::path path, std::string recording_id, std::uint64_t generation, std::uint64_t next_sequence)
-    : path_(std::move(path)), recording_id_(std::move(recording_id)), generation_(generation), next_sequence_(next_sequence) {}
+    TopicEvents(
+        std::filesystem::path path,
+        std::string recording_id,
+        std::uint64_t generation,
+        std::uint64_t next_sequence)
+    : path_(std::move(path)),
+      recording_id_(std::move(recording_id)),
+      generation_(generation),
+      next_sequence_(next_sequence) {}
 
     std::filesystem::path path_;
     std::string recording_id_;

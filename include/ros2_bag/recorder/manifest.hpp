@@ -22,7 +22,9 @@ struct ManifestData {
 
 class Manifest {
 public:
-    static Result<Manifest, Error> create(const std::filesystem::path& task_directory, ManifestData data);
+    static Result<Manifest, Error> create(
+        const std::filesystem::path& task_directory,
+        ManifestData data);
     static Result<Manifest, Error> load(const std::filesystem::path& task_directory);
 
     const ManifestData& data() const noexcept { return data_; }

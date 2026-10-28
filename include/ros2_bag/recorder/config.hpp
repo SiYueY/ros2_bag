@@ -37,6 +37,7 @@ struct RecorderConfig {
     std::size_t snapshot_max_total_bytes = 16U * 1024U * 1024U;
     std::size_t cleanup_queue_capacity = 16;
     std::chrono::seconds cleanup_warning{30};
+    std::chrono::seconds cleanup_retry_interval{2};
     std::chrono::milliseconds disk_max_age{10000};
     std::uint32_t disk_consecutive_failures = 3;
     double disk_warning_percent = 80.0;
@@ -53,7 +54,9 @@ struct RecorderConfig {
 
 Result<void, Error> validate_config(const RecorderConfig& config);
 Result<std::size_t, Error> message_pool_capacity(const RecorderConfig& config);
-Result<TaskConfig, Error> make_task_config(const RecorderConfig& config, const StartOptions& options);
+Result<TaskConfig, Error> make_task_config(
+    const RecorderConfig& config,
+    const StartOptions& options);
 
 }  // namespace ros2_bag::recorder
 
