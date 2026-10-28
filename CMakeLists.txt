@@ -10,6 +10,34 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include(CTest)
 
+find_package(rclcpp QUIET)
+find_package(rosbag2_cpp QUIET)
+find_package(OpenSSL REQUIRED)
+
+if(rclcpp_FOUND AND rosbag2_cpp_FOUND)
+  add_library(ros2_bag_recorder
+    src/recorder/config.cpp
+    src/recorder/message_pool.cpp
+    src/recorder/message_queue.cpp
+    src/recorder/resource_monitor.cpp
+    src/recorder/snapshot.cpp
+    src/recorder/manifest.cpp
+    src/recorder/topic_events.cpp
+    src/recorder/recorder.cpp
+    src/recorder/recovery.cpp
+    src/recorder/cleanup.cpp
+    src/recorder/writer.cpp
+    src/recorder/topic.cpp
+    src/recorder/admission.cpp
+    src/recorder/schema.cpp)
+  target_include_directories(ros2_bag_recorder PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_features(ros2_bag_recorder PUBLIC cxx_std_17)
+  target_link_libraries(ros2_bag_recorder PUBLIC rclcpp::rclcpp rosbag2_cpp::rosbag2_cpp OpenSSL::Crypto)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(ros2_bag_recorder PRIVATE -Wall -Wextra -Wpedantic -Werror)
+  endif()
+endif()
+
 if(BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
@@ -20,6 +48,15 @@ if(BUILD_TESTING)
   endif()
 
   add_test(NAME result_unit COMMAND result_test)
+
+  if(TARGET ros2_bag_recorder)
+    add_executable(recorder_foundation_test tests/unit/recorder/foundation_test.cpp)
+    target_link_libraries(recorder_foundation_test PRIVATE ros2_bag_recorder)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+      target_compile_options(recorder_foundation_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    endif()
+    add_test(NAME recorder_foundation_unit COMMAND recorder_foundation_test)
+  endif()
   add_test(
     NAME result_compile_fail
     COMMAND
