@@ -1,277 +1,433 @@
-# ros2_bag Recorder 详细设计
+# Recorder
 
 | 属性 | 内容 |
 |---|---|
-| 文档版本 | v0.2.10 |
-| 文档状态 | **DRAFT — V1.0 开发阶段，随时修订；规范尚未批准用于完整实施** |
-| 范围 | C++17 Recorder 领域接口、录制数据面、持久化与恢复 |
-| 上位规范 | `docs/architecture.md`、`docs/requirements.md`（开发稿，可直接联动修改） |
+| 文档版本 | v0.3.6 |
+| 文档状态 | **DRAFT — V1.0 冻结候选；完成 v0.3.5 全文审查、错误码机器映射与跨文档一致性修订，待最终评审确认** |
+| 范围 | C++17 Recorder 模块、ROS 2 Topic 录制、消息数据路径、MCAP、持久化、恢复、资源保护、状态观测与关闭 |
+| 上位规范 | `docs/architecture.md`、`docs/requirements.md` |
 | 技术选型 | `docs/system_technology_selection.md` |
+| C++ 规范 | `docs/cpp_coding_guidelines.md` |
+| Result 契约 | `docs/result.md` |
 
-# 1. 定位、职责与接口
+---
 
-## 1.1 文档边界和设计原则
+# 1. 概述与代码组织
 
-Recorder 是录制领域的单一事实来源，负责 ROS 2 Topic 发现与订阅、录制任务、消息准入、Writer/MCAP、Rolling、Snapshot、持久化记录、磁盘安全、恢复证据与录制诊断。
+## 1.1 模块定位
 
-V1.0 **一个 Recorder Runtime 管理一个 Recorder 实例，同一时刻最多一个活动录制任务**。Rolling 的多个 Segment 属于同一个任务。
+Recorder 是 `ros2_bag` 主程序中的内部 C++ 模块，是录制领域的唯一事实来源。
 
-本文定义应当实现的 Recorder V1.0 契约，**不记录开发进度、测试通过率或交付状态**，也不规定 Drogon 路由、HTTP JSON Schema、SSE、Client 和 UI。
+Recorder 负责：
 
-跨层所有权与关闭顺序以 `architecture.md` 为准；产品功能与验收门槛以 `requirements.md` 为准；版本、第三方依赖和并发队列等技术选择以 `system_technology_selection.md` 为准。
+- ROS 2 Topic 发现；
+- Topic 订阅的创建、销毁与生命周期；
+- Normal / Timed / Rolling 三种录制模式；
+- 消息准入、内存预算、消息池与队列；
+- 单 Writer Thread；
+- MCAP Segment 创建、写入、轮转和关闭；
+- Schema 解析与自包含定义；
+- Snapshot 与 Rolling Segment 重放；
+- Manifest 与 Topic Event 持久化；
+- Retention 与 Segment 删除；
+- 提供 Recorder 领域的 Recovery 能力；其启动执行由 Runtime 在开放正常 Recorder mutation admission 前编排；
+- 磁盘保护与资源采样；
+- 当前运行状态快照；
+- 已完成 Task 查询；
+- Topic Add/Remove durable 结果查询；
+- Recorder Shutdown。
 
-**恢复状态、目录锁、只读取证与可删除条件全部由本文直接规定；测试与报告格式由 `verification.md` 承接。**
+Recorder 不负责：
 
-本设计限定 Recorder 的高频路径、Pool/Queue/Writer 所有权、Topic 事件、保守恢复与资源边界；**不定义** UDS/JSONL 网络控制协议、`operation_status` 服务、`status.json` 状态发布器、CLI/Web 或实施计划。
+- HTTP / SSE；
+- Drogon；
+- Protocol JSON 编解码；
+- Client / CLI / TUI / Web；
+- Runtime 的 output_root 进程锁；
+- Runtime 的 ROS Context / Executor 最终生命周期；
+- 跨进程 IPC；
+- 用户数据库与认证。
 
-Recorder Core 不依赖 HTTP、Python、UI 或独立 IPC。
+V1.0：
 
-核心约束：
+```text
+one Recorder Runtime
+→ one Recorder
+→ at most one active Task
+```
 
-1. 高频 ROS 回调路径必须有界，不做文件写入、网络 I/O、复杂 JSON 或无界阻塞。
-2. `rosbag2_cpp::Writer` 的所有操作只能经由**单 Writer Thread** 执行。
-3. `recording_generation + topic_id + topic_epoch` 隔离跨任务及动态 Topic 生命周期。
-4. 成功的领域操作必须满足相应持久化/完成边界；证据不足绝不伪造成功。
-5. Pool、Queue、Snapshot、Writer 控制与 Cleanup 的资源均有上限。
-6. 恢复保守、可重复，未知结果保留原始数据与诊断。
-7. Runtime 当前状态、历史持久化事实和单次控制请求结果属于三个不同维度，不能互相反推。
-8. 为实现有界资源而采用的保守降级必须明确可观察，不能静默把“不知道”表达成“成功”。
-9. V1.0 优先采用简单、确定、可验证的单进程机制，不为了预防尚未观察到的性能问题引入数据库、额外调度线程或复杂持久化索引。
+Rolling 中多个 Segment 仍属于同一个 Task。
 
-## 1.2 组件分工和线程边界
+## 1.2 核心设计原则
+
+1. **模块接口直接。** Recorder 是进程内 C++ 模块，不采用 RPC 风格 Request/Response API。
+2. **抽象来自真实职责。** 不为结构对称预建 Coordinator、Manager、Adapter、Store、Registry、Context。
+3. **运行态与持久态分离。** 当前 Recorder 状态与 Manifest 中 Task 生命周期不是同一状态机。
+4. **多原因暂停可表达。** 用户暂停与一个**生效中的**磁盘保护原因可以同时存在；该原因来自 `DiskPauseReason`，不等同于最新 `DiskSafetyState`。
+5. **Error 必须机器可映射。** Server 不解析 `Error.message` 推导 Protocol ErrorCode。
+6. **Effects 与 UNKNOWN 分离。** Effects 描述已经取得 Recorder 最终 Failure 时可证明的副作用范围；UNKNOWN 是 Server/Client 等观察者无法确认领域终态的观察结果，不是 Recorder 自身状态。
+7. **唯一串行 mutation 域。** Task、Topic、Writer、Manifest 的状态变化只有一个权威线性化顺序。
+8. **高频数据路径有界。** ROS callback 不做文件 I/O、网络 I/O、复杂 JSON 或无界等待。
+9. **Writer 单线程独占。** 所有 `rosbag2_cpp::Writer` API 只由 Writer Thread 调用。
+10. **持久化成功必须可证明，不确定时保守降级。** durable 证据不足不能伪造成功；一旦关键 durable outcome 无法确认，必须停止依赖该事实继续推进会扩大不确定性的 mutation。
+11. **Recovery 保守。** 不续录旧 Task、不恢复旧 Topic ACTIVE、不自动删除 INCOMPLETE。
+12. **V1.0 一次实现完整 Recorder。** Topic、Writer、Snapshot、Recovery、Cleanup、Resource Monitor 全部属于第一版。
+
+## 1.3 整个 C++ 工程目录结构
+
+Recorder 的物理目录不能脱离 Server 与主程序 Runtime 单独设计。`ros2_bag` 是一个统一的 C++/ROS 2 工程，而不是由 Recorder、Server 等多个可独立发布的小型子工程拼接而成。
+
+V1.0 采用**项目级头文件/源文件分离 + 模块目录镜像**：整个工程只有一套顶层 `include/` 与 `src/`；Recorder、Server 通过对应子目录表达功能边界，不在各自目录下再次建立 `include/src`。
+
+推荐整体布局：
+
+```text
+ros2_bag/
+├── CMakeLists.txt
+├── package.xml
+│
+├── include/
+│   └── ros2_bag/
+│       ├── result.hpp
+│       │
+│       ├── recorder_runtime.hpp
+│       ├── runtime_config.hpp
+│       ├── output_root_lock.hpp
+│       │
+│       ├── recorder/
+│       │   ├── recorder.hpp
+│       │   ├── completion.hpp
+│       │   ├── error.hpp
+│       │   ├── config.hpp
+│       │   ├── task.hpp
+│       │   ├── topic.hpp
+│       │   ├── state.hpp
+│       │   ├── message.hpp
+│       │   ├── message_pool.hpp
+│       │   ├── message_queue.hpp
+│       │   ├── snapshot.hpp
+│       │   ├── writer.hpp
+│       │   ├── schema.hpp
+│       │   ├── manifest.hpp
+│       │   ├── topic_events.hpp
+│       │   ├── recovery.hpp
+│       │   ├── cleanup.hpp
+│       │   └── resource_monitor.hpp
+│       │
+│       └── server/
+│           └── ...                 # Server 头文件，具体职责由 server.md 冻结
+│
+├── src/
+│   ├── main.cpp
+│   ├── recorder_runtime.cpp
+│   ├── runtime_config.cpp
+│   ├── output_root_lock.cpp
+│   │
+│   ├── recorder/
+│   │   ├── recorder.cpp
+│   │   ├── task.cpp
+│   │   ├── topic.cpp
+│   │   ├── message_pool.cpp
+│   │   ├── message_queue.cpp
+│   │   ├── snapshot.cpp
+│   │   ├── writer.cpp
+│   │   ├── schema.cpp
+│   │   ├── manifest.cpp
+│   │   ├── topic_events.cpp
+│   │   ├── recovery.cpp
+│   │   ├── cleanup.cpp
+│   │   └── resource_monitor.cpp
+│   │
+│   └── server/
+│       └── ...                     # Server 源文件，具体职责由 server.md 冻结
+│
+├── tests/
+│   ├── unit/
+│   │   ├── recorder/
+│   │   ├── server/
+│   │   └── runtime/
+│   └── integration/
+│
+├── config/
+└── docs/
+```
+
+### 目录设计原则
+
+该布局表达的是一个统一程序中的三个层次：
+
+```text
+main.cpp
+   ↓
+RecorderRuntime                # composition root
+   ├── recorder/               # 录制领域模块
+   └── server/                 # HTTP/SSE 适配模块
+```
+
+依赖方向固定为：
+
+```text
+Runtime
+  ├──> Recorder
+  └──> Server
+          └──> Recorder
+
+Recorder -X-> Server
+Recorder -X-> Drogon
+Server   -X-> Recorder persistence implementation
+Server   -X-> Writer / Queue / Pool / Cleanup internals
+```
+
+其中 `-X->` 表示禁止依赖。
+
+### 为什么不是每个模块各自 `include/src`
+
+V1.0 **不采用**：
+
+```text
+src/recorder/include/...
+src/recorder/src/...
+src/server/include/...
+src/server/src/...
+```
+
+原因：
+
+- Recorder、Server 不是可独立发布的软件包；
+- 不需要为每个内部模块制造一套小型 library project 外观；
+- 项目级 `include/` / `src/` 已足够清晰表达 header/source 分离；
+- `include/ros2_bag/recorder/` 与 `src/recorder/` 路径镜像，代码浏览和依赖分析更直接；
+- Server 同样遵守同一布局，不形成第二套目录哲学；
+- Runtime 是 composition root，不人为建立 `runtime/include/runtime/src`。
+
+### `include/` 不等于独立公共 SDK
+
+顶层 `include/ros2_bag/` 表示项目统一 C++ header 根目录，不自动意味着：
+
+```text
+稳定第三方 SDK
+独立 ABI 兼容承诺
+必须安装全部 header
+Recorder/Server 可独立发布
+```
+
+是否安装、哪些 header 属于最终用户 API，由顶层 CMake `install(...)` 与发布策略单独决定。当前开发阶段允许所有设计直接演进，不为未发布接口承担兼容包袱。
+
+### 不建立额外内部目录层
+
+Recorder V1.0 不再增加：
+
+```text
+include/ros2_bag/recorder/internal/
+include/ros2_bag/recorder/detail/
+include/ros2_bag/recorder/common/
+src/recorder/internal/
+src/recorder/common/
+src/recorder/utils/
+src/recorder/core/
+```
+
+当前模块规模尚不需要物理 `internal/detail` 层。跨模块依赖通过 CMake target、include 规则和 Code Review 约束；如果未来误用确实成为维护问题，再基于实际依赖图调整，而不是提前建立层级。
+
+### 构建组织
+
+V1.0 顶层只需要一个项目级 `CMakeLists.txt` 作为构建权威。Recorder/Server 可以被组织成内部 target，以便表达依赖和测试边界，但**不因此成为独立子工程**：
+
+```text
+ros2_bag_recorder   # internal target
+ros2_bag_server     # internal target
+ros2_bag            # final executable
+```
+
+默认不要求：
+
+```text
+src/recorder/CMakeLists.txt
+src/server/CMakeLists.txt
+add_subdirectory() 形成独立项目层次
+```
+
+如果未来需要拆分为多个 CMake 文件以提升可维护性，仍保持**单一顶层工程和统一 `include/src` 布局**；拆分仅是构建文件组织优化，不改变“一个统一 C++ 工程”的架构事实，也不意味着 Recorder/Server 变成独立发布子工程。
+
+### 跨文档约束
+
+该整体 C++ 布局不应只存在于 Recorder 文档。冻结前必须同步：
+
+- `docs/architecture.md`：作为整个 C++ 程序目录与依赖方向的权威；
+- `docs/cpp_coding_guidelines.md`：统一 header/source 路径、include 写法和模块依赖规则；
+- `docs/server.md`：Server 目录必须使用相同的顶层 `include/src` 镜像结构；
+- 本文只继续冻结 Recorder 目录中的文件职责，不为 Server 重复定义内部文件设计。
+
+## 1.4 文件职责
+
+本节中的 `*.hpp` 均位于 `include/ros2_bag/recorder/`，对应 `*.cpp` 均位于 `src/recorder/`。表中仍使用简短文件名表示同一职责对，避免每行重复完整路径。纯 header 类型没有对应 `.cpp` 时不为了目录对称制造空实现文件。
+
+| 文件 | 主要职责 |
+|---|---|
+| `recorder.*` | 模块入口、对象组合、mutation 提交、状态与查询、Shutdown；实现唯一串行 mutation 域 |
+| `completion.hpp` | 异步领域操作完成观察；纯类型/模板定义 |
+| `error.hpp` | `ErrorCode`、`Effects`、`Error` |
+| `config.hpp` | Recorder 静态配置及校验 |
+| `task.*` | `TaskMode`、durable `TaskState`、`TaskConfig`、`TaskInfo`、`TaskDetail`、`TaskList` 与活动 Task 生命周期 |
+| `topic.*` | `TopicOptions`、`TopicInfo`、`DiscoveredTopic`、发现、QoS、ID/Epoch、Subscription、Add/Remove |
+| `state.hpp` | `RecorderState`、`PauseState`、`DropCounters`、`DiskSample`、`ProcessSample`、`TopicState`、`SegmentState`、当前 `State`；**只定义按值数据类型，不实现状态采集逻辑** |
+| `message.hpp` | `RecordedMessage` |
+| `message_pool.*` | 固定有界消息节点池 |
+| `message_queue.*` | queue、消息/字节预算、ProducerToken、admission |
+| `snapshot.*` | Rolling Snapshot 缓存与 replay |
+| `writer.*` | 单 Writer Thread、Segment、Writer 内部控制与结果回报 |
+| `schema.*` | ROS type → 完整 MCAP Schema |
+| `manifest.*` | `manifest.json` 数据、revision、durable commit |
+| `topic_events.*` | `topic_events.jsonl` Event 持久化，以及 `TopicOperationState` 查询解释 |
+| `recovery.*` | 启动恢复、Recovery finding 与受控 `recovery.json` 诊断 |
+| `cleanup.*` | 独立单线程 Cleanup worker、retention、DELETING、文件删除和结果回报 |
+| `resource_monitor.*` | 磁盘/CPU/RSS/FD/thread 采样与 DiskAdmission 发布 |
+
+`state.hpp` 没有对应 `state.cpp` 是刻意设计：它只保存纯数据结构。`State Recorder::state() const` 的采集、一致性检查和聚合逻辑放在 `recorder.cpp` 以及各组件自己的快照接口中。
+
+`TaskInfo`、`TaskDetail`、`TaskList` 都属于 Task 领域，因此放在 `task.hpp`，不额外创建 `history.hpp`。
+
+`TopicOperationState` 直接解释 `topic_events.jsonl` 的 durable 证据，因此定义在 `topic_events.hpp`，不放入通用 `state.hpp`。
+
+### 明确删除的旧抽象
+
+V1.0 不建立：
+
+```text
+RecordingCoordinator
+RecorderFacade
+RecorderService
+RecorderControlSequencer
+TopicManager
+WriterAdapter
+CleanupWorker（作为公开/文件名抽象）
+RecordingTargetGuard
+TopicTargetGuard
+HistoryQuery
+HistoryPage
+TopicOperationEvidence
+```
+
+`cleanup.*` 内部确实拥有一个 Recorder-owned 单线程 worker，但不因为线程存在就把文件/领域对象命名为 `CleanupWorker`。
+
+本文冻结行为契约，不冻结上述旧类名，也不要求一个 class 对应一个文件。
+
+## 1.5 组件、启动阶段与线程模型
+
+Recovery 与运行期 Worker 必须分开理解。
+
+### 启动阶段
+
+`recovery.*` 属于 Recorder **领域模块**，因为只有 Recorder 能解释 Manifest、Topic Events、Segment 和 Schema 等持久化事实；但 Recovery 的**执行时机由 Runtime 编排**。
 
 ```mermaid
 flowchart LR
-    Pub["ROS 2 Topic"] --> Sub["TopicManager / GenericSubscription"]
-    Sub --> Pool["RecordedMessage + PoolState"]
-    Pool --> Queue["QueueBudget + MessageQueue"]
-    Queue --> Writer["Writer Thread / WriterAdapter"]
-    Writer --> MCAP["MCAP Segment"]
-    Writer --> Snapshot["SnapshotBuffer"]
-    Coordinator["RecordingCoordinator"] -->|"控制 / 状态"| Sub
-    Coordinator -->|"有界 Writer 请求"| Writer
-    Coordinator --> Manifest["Manifest / Topic Events"]
-    Coordinator --> Cleanup["CleanupWorker"]
-    Monitor["ResourceMonitor"] -->|"Disk / Process Snapshot"| Coordinator
-    Recovery["Recovery / History"] --> Manifest
+    RUNTIME["Runtime"] --> LOCK["Acquire output_root lock"]
+    LOCK --> RECOV["recorder::Recovery\nstartup-only"]
+    RECOV --> BUILD["Construct/Open Recorder\nruntime execution domains"]
+    BUILD --> SERVER["Open Server admission"]
 ```
 
-| 组件或执行域 | 主要职责 | 禁止行为 |
-|---|---|---|
-| RecordingCoordinator | Task 状态、事务边界、组件生命周期与领域错误 | 持有状态锁等待 Writer/Executor/网络 |
-| RecorderControlSequencer（内部执行域） | 唯一 Task/Topic/Writer/Manifest mutation 线性化域；执行外部控制及 Timed Stop、Rolling Rotate、Disk Safety、Writer Failure、Shutdown 收尾 | 在 ROS Executor Timer 中同步等待 Writer/Executor；让 Cleanup/Writer/Server 成为第二个状态或 Manifest 裁决点 |
-| TopicManager / ROS Executor | 发现、QoS、订阅实例、Topic 事件、接收并入队 | ROS 回调直接调用 Writer 或删除文件 |
-| PoolState / QueueBudget | 消息句柄唯一所有权及双配额 RAII | 容量耗尽时无界分配 |
-| Writer Thread / WriterAdapter | Writer 独占、Topic 注册、写入、轮转、Finalize | 从其他线程并发访问 rosbag2 Writer |
-| SnapshotBuffer | 持有有限的已写入消息用于 Segment 边界重放 | 无界缓存或跨 Epoch 重放 |
-| ResourceMonitor | 磁盘安全、CPU/RSS/FD/线程遥测；提供 stop-request 与 finished Completion | 持有 Coordinator 锁执行 `statvfs`；未确认 Worker 退出就进入析构/join |
-| CleanupWorker | 根据 Manifest 中 durable `DELETING` 授权串行执行文件系统删除；向 Sequencer 回报结果；提供 stop-request 与 finished Completion | 直接提交 Manifest 终态、持锁删除、自动删除 INCOMPLETE；未确认 Worker 退出就进入析构/join |
-| Runtime | 输出根目录独占锁、Node/Executor/ROS Context、启动恢复与最终关闭 | 将进程锁当成 Recorder Core 内部自动行为 |
+Recovery 不是长期并行 Worker，不与 Writer/Cleanup/Resource Monitor 同时承担运行期职责。Recovery 完成前普通 Recorder mutation admission 必须关闭。
 
-跨线程共享的非原子数据需 mutex 或可证明的 happens-before；短临界区不得包围 Writer I/O、Executor 等待或文件删除。
+### 运行期组件
 
-Recorder Shutdown 依赖的 ROS Executor 与 Context 必须在收尾完成前保持可运行，不能在 Executor 自身回调中等待必须由该执行域推进的任务。
+```mermaid
+flowchart LR
+    ROS["ROS 2 Topic"] --> TOPIC["Topic / Subscription"]
+    TOPIC --> POOL["Message Pool"]
+    POOL --> QUEUE["Message Queue"]
+    QUEUE --> WRITER["Writer Thread"]
+    WRITER --> MCAP["MCAP Segment"]
+    WRITER --> SNAP["Snapshot"]
 
-**Worker Shutdown 采用 request/finish 两阶段。**
+    REC["Recorder\nserial mutation domain"] --> TOPIC
+    REC --> WRITER
+    REC --> PERSIST["Manifest / Topic Events"]
+    REC --> CLEAN["Cleanup Thread"]
 
-Writer、CleanupWorker、ResourceMonitor 的停止入口先设置 stopping gate/notify 并立即返回；线程函数退出时设置 finished 状态并通知 Completion。
+    MON["Resource Monitor"] --> REC
 
-Recorder Sequencer 可以等待 finished，但 Runtime 的 shutdown deadline 必须在独立执行域继续运行。
+    WRITER -. "WriterResult" .-> REC
+    CLEAN -. "CleanupResult" .-> REC
+    TOPIC -. "ExecutorResult" .-> REC
+```
 
-只有已经观察到 finished 的线程才执行 `join()`，使 join 成为线程资源回收而不是不可控的等待机制。
+执行域：
 
-析构函数只允许在所有受管 Worker 已 finished 的正常路径使用；不可恢复阻塞路径由 Runtime 保持对象存活并进入 `UNSAFE_TO_DESTROY`。
+| 执行域 | 主要职责 | 结果如何回到 Recorder | 禁止行为 |
+|---|---|---|---|
+| Recorder 串行 mutation 域 | Task/Topic/Writer/Manifest 状态裁决 | 本域自身 | 持热路径锁等待慢 I/O |
+| ROS Executor | discovery、Subscription create/remove、callback | 产生内部 ExecutorResult/事件，由 Recorder 串行域领取 | 直接 Stop/Rotate/Manifest commit |
+| Writer Thread | 独占 rosbag2 Writer | 产生 WriterResult，由 Recorder 串行域推进后续状态 | 其他线程并发访问 Writer；自行改 Task/Manifest 终态 |
+| Cleanup Thread | 按 durable DELETING 删除文件 | 产生 CleanupResult，由 Recorder 串行域重新验证 Manifest | 自行提交 REMOVED；阻塞 Recorder mutation 域 |
+| Resource Monitor | statvfs / CPU / RSS / FD / thread | 发布 bounded resource/disk snapshot 和安全事件 | 在 Recorder 热路径锁内采样 |
+| Runtime | output_root 锁、Recovery 调度、ROS Context/Executor 生命周期、最终 Shutdown | 调用 Recorder API / 观察 Completion | Recorder 未完成时提前销毁依赖 |
 
-### 1.2.1 RecorderControlSequencer：唯一状态变更执行域
+Cleanup 是 Recorder-owned 单线程 worker。`remove_all()` 等文件系统调用阻塞时，只阻塞 Cleanup Thread；Recorder 串行域仍可以处理不依赖该删除完成的状态变化和只读查询。Cleanup active operation 会记录 `active_since` 供 warning/Shutdown 诊断，但 V1 不增加 heartbeat/watchdog 线程。
 
-V1.0 不允许“每个调用线程拿 Coordinator mutex 后各自推进状态机”。
+### 内部结果回流原则
 
-Recorder 自己拥有一个**单线程、独立于 ROS Executor、Writer Thread、CleanupWorker 和 Server ControlWorker 的领域控制执行域** `RecorderControlSequencer`。
+Writer、ROS Executor、Cleanup 都可以异步执行慢操作，但**最终领域状态只能由 Recorder 串行 mutation 域修改**。
 
-所有会修改 Task/Topic/Writer/Manifest 生命周期的动作最终都由该执行域决定线性化顺序；其他线程只能读取 immutable/原子快照、执行已授权的原生工作，或提交拥有自身生命周期的数据/Completion。
-
-- 外部 `Start/Stop/Pause/Resume/Add/Remove`：公共领域 API 构造拥有自身数据的 `ControlRequest`、尝试提交到有界外部队列并立即返回共享 `ControlHandle<Result>`。调用方可以等待 Handle，但**等待超时只结束调用方等待，不结束领域操作**。只有 `cancel_if_not_started()` 在线性化地完成 `PENDING -> CANCELLED_NOT_STARTED` 时，才能证明该请求没有进入 Recorder 副作用。
-- `cancel_if_not_started()` 供直接 C++/库调用方在尚未交付语义的场景以及确定性测试使用；它是线程安全的 CAS 操作，同一 Handle 多个并发调用者至多一个返回 true。**Server 一旦成功把请求提交给 Recorder，就不得因为 HTTP ResponseSink 超时、客户端断连或网络取消再调用该接口**；Server 必须继续持有外部 mutation 槽直到 Handle 进入终态。
-- 内部 `TimedStop/DiskSafety/RollingRotate/WriterFailure/Shutdown`：ROS Timer、ResourceMonitor、Producer hard gate、Writer Thread 和 Runtime 只提交**绑定 recording_generation 的内部事件**并立即返回，不在原执行域里等待 Sequencer。相同代际的 `TimedStop`、`DiskSafety`、`RollingRotate` 可以按事件种类合并；`WriterFailure/Shutdown` 不得因普通队列容量而丢弃。
-- Sequencer 是唯一可以把 Recorder State/Task Persistent State 从一个稳定或内部阶段推进到下一阶段、取得 Task Lease、决定 ingress 是否允许重新开放、发起 Writer/Executor 原生事务以及提交运行期 Manifest mutation 的执行域。
-- Producer 的 Timed/Disk hard gate 只允许执行受本文明确允许的无阻塞准入判断和 gate 关闭，不允许直接执行 Writer Close、Topic 状态提交或 Manifest 终态。
-- Writer I/O、ROS Executor 上的 Subscription create/remove、文件同步、Cleanup `remove_all()` 等可以在专有执行域进行；Sequencer 发起后不得持 Coordinator/TopicMap 锁等待。Completion 必须绑定到原 `ControlRequest`、Task/Topic Lease 和 Generation，不能使用调用线程栈地址。
-- `status()/discover/history/evidence` 是只读调用，不进入 mutation 队列，但必须取得独立值对象/Lease；History/Evidence 的磁盘读取不得持有 Sequencer/Writer/Topic 热路径锁，也不得变更 Manifest/Cleanup 授权。
-
-**有界与优先级。**
-
-外部控制队列容量是配置项，满时在进入领域执行前返回：
+统一模式：
 
 ```text
-RESOURCE_EXHAUSTED
-effects:NONE
+Recorder starts/requests native work
+→ worker/native domain executes
+→ produces bounded result object
+→ result enters Recorder internal event path
+→ serial mutation domain revalidates generation/object identity/current state
+→ commits next domain transition
 ```
 
-内部安全事件不与外部请求争抢这部分容量：实现使用固定的内部事件槽/位图或独立小型有界系统队列，其中：
+V1 不建立公共 `WriterResult/CleanupResult/ExecutorResult` API，但实现至少要携带以下核心字段：
 
 ```text
-WriterFailure
-Shutdown
+WriterResult:
+  generation
+  segment_id when applicable
+  command/result kind
+  Result<... , Error>
+  first_live_written + first_live_steady_time when applicable
+
+CleanupResult:
+  recording_id
+  segment_id
+  relative path identity
+  delete result
+  authorized_manifest_revision (diagnostic only)
+
+ExecutorResult:
+  generation
+  topic_id / topic_epoch when applicable
+  operation kind (create/remove)
+  native completion result
 ```
 
-有保留位置。
+这些对象是内部私有值对象，不形成通用 Request/Response、Operation Registry 或独立公共文件层次。
 
-同一 Generation 的同类可合并事件只保留一次 pending 标记。
+# 2. 领域模型与模块接口
 
-Shutdown 关闭外部 admission 后，Sequencer 仍处理已经 STARTED 的请求和必须完成的系统收尾，直到安全关闭或 Runtime 明确进入 `UNSAFE_TO_DESTROY`。
+## 2.1 RecorderState 与 TaskState
 
-这层序列化**不能被 Server ControlWorker 替代**。
-
-Recorder 在没有 Server 的库调用/测试环境中仍必须正确处理 Timer、Disk、Writer 和 Cleanup completion。
-
-Server 的单 Worker 只负责：
-
-```text
-网络 Admission
-外部 FIFO
-Response 生命周期
-Recorder Handle 持续观察
-```
-
-相反，Recorder Sequencer 也不承担：
-
-```text
-HTTP Deadline
-认证
-SSE
-```
-
-推荐 ControlHandle 状态：
-
-```text
-PENDING --Sequencer claim--> STARTED --> WAITING_NATIVE --> DONE
-   │
-   └--cancel_if_not_started() CAS succeeds--> CANCELLED_NOT_STARTED
-```
-
-`DONE` 与 `CANCELLED_NOT_STARTED` 都是**Handle 终态**，但只有 `DONE` 携带领域 `Result`。
-
-`CANCELLED_NOT_STARTED` 表示请求在进入 Recorder 副作用之前被确定取消，不能伪造一个 Recorder 失败 Result。
-
-`done()` 的 V1.0 语义是：
-
-> Handle 已进入任一终态。
-
-调用方需要区分成功完成与未开始取消时必须读取 `state()`。
-
-`result()` 仅在：
-
-```text
-state() == DONE
-```
-
-时有值，其余状态返回 `nullopt`。
-
-**WAITING_NATIVE 与等待预算。**
-
-`WAITING_NATIVE` 不是让 Sequencer 线程在一个不可取消的 `future.get()` 上永久睡眠。
-
-实现必须使 Sequencer 在不持领域锁的情况下观察 Completion，并让 Runtime 的 shutdown deadline/诊断执行域独立继续推进。
-
-`control.native_wait_warning_ms` 只定义**诊断/监管预算**：
-
-超过该预算应：
-
-```text
-记录当前 phase/native operation
-通知 Runtime/Status
-必要时关闭新的危险 mutation admission
-```
-
-但如果 Writer/Executor/Cleanup 原生操作已经 STARTED 且仍可能访问 Recorder 对象，**等待预算耗尽不等于领域操作 DONE**。
-
-ControlHandle 仍保持：
-
-```text
-STARTED
-或
-WAITING_NATIVE
-```
-
-相关 Lease 和对象图必须继续存活。
-
-`DRAIN_TIMEOUT` 只有在 Recorder 已经取得**真实可终结证据**时才能作为最终 `Result` 返回，例如：
-
-- 原生调用已经返回；
-- 或被证明未开始且成功取消；
-- 但 Drain 的领域完成条件在规定的受控边界内失败。
-
-若同步 Writer I/O、STARTED ExecutorCall、`remove_all()` 或 `statvfs()` 永久阻塞且无法证明其已经退出，则只能记录 timeout/watchdog 诊断并让 Shutdown Handle 保持未完成。
-
-Runtime 依据 `architecture.md` 的独立 deadline 进入：
-
-```text
-UNSAFE_TO_DESTROY
-```
-
-不得用一个伪造的：
-
-```text
-DRAIN_TIMEOUT
-DONE
-```
-
-释放对象。
-
-只有：
-
-```text
-PENDING -> CANCELLED_NOT_STARTED
-```
-
-成功才能确定本次没有进入 Recorder 副作用。
-
-`STARTED/WAITING_NATIVE` 后任意 waiter 停止等待，Sequencer 和相关 Task/Topic/Writer/Executor/Cleanup Lease 仍必须继续存活到真实终点。
-
-不得把栈上的：
-
-```text
-std::string* error
-Promise
-裸对象指针
-```
-
-交给迟到回调。
-
-也不得把“某个 waiter/HTTP/Runtime observer 超时”编码成已经完成的领域结果。
-
-## 1.3 领域 API 与所有权
-
-Recorder 的公共领域接口在 V1.0 采用以下**目标模型**。
-
-实现可调整文件拆分，但不得改变这里的字段语义、所有权和完成边界；Server 只依赖这些领域值对象，不依赖 Writer/TopicManager 内部类型。
+Recorder 当前运行态：
 
 ```cpp
-enum class RecordingMode {
-    Normal,
-    Timed,
-    Rolling
+enum class RecorderState {
+    Idle,
+    Initializing,
+    Recording,
+    Paused,
+    Stopping,
+    Failed
 };
+```
 
-// V1.0 只支持 Recorder receive time；
-// 保留枚举用于未来受评审的扩展。
-enum class TimestampPolicy {
-    Receive
-};
+Manifest 持久 Task 生命周期：
 
-enum class CompressionMode {
-    None,
-    Lz4
-};
-
-enum class DiskSafetyState {
-    Normal,
-    Warning,
-    Critical,
-    Unknown
-};
-
-enum class PersistentTaskState {
+```cpp
+enum class TaskState {
     Initializing,
     Recording,
     Finalizing,
@@ -279,2190 +435,1927 @@ enum class PersistentTaskState {
     Failed,
     Incomplete
 };
+```
 
-enum class PauseReason : std::uint8_t {
-    User = 1,
-    DiskCritical = 2,
-    DiskUnknown = 4,
-    DiskRecoveryPending = 8,
+二者严格分离，但在 Start/Stop 边界存在明确映射。
+
+### 状态关系图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Initializing: durable INITIALIZING established
+    Initializing --> Recording: Start completion boundary proven
+    Initializing --> Stopping: Shutdown claims initialization finalization
+    Initializing --> Failed: initialization after durable task creation fails
+    Initializing --> Failed: shutdown finalization fails
+
+    Recording --> Paused: PauseState non-empty
+    Paused --> Recording: Resume/maybe_open_ingress succeeds
+
+    Recording --> Stopping: Stop / Timed Stop / Shutdown
+    Paused --> Stopping: Stop / Shutdown
+
+    Recording --> Failed: runtime terminal failure
+    Paused --> Failed: runtime terminal failure
+    Stopping --> Failed: finalization fails
+    Stopping --> Idle: Task Completed + runtime resources released
+    Failed --> Idle: safe failure terminalization completed and runtime not poisoned
+```
+
+### 运行态与持久态映射
+
+| RecorderState | 当前 Task 是否存在 | 常见 durable TaskState | ingress |
+|---|---:|---|---|
+| Idle | 否 | 无 current Task | CLOSED |
+| Initializing | 是 | Initializing | CLOSED |
+| Recording | 是 | Recording | 按 Topic gate OPEN/CLOSED |
+| Paused | 是 | Recording | CLOSED |
+| Stopping | 是 | Finalizing，或 finalization durable transition 尚未完成时仍为 Recording | CLOSED |
+| Failed | 通常仍有失败 Task/收尾 ownership | Failed，或持久化失败时仍可能是 Initializing/Recording/Finalizing | CLOSED |
+
+关键规则：
+
+```text
+RecorderState::Paused != TaskState::Paused
+```
+
+因为 TaskState 根本没有 Paused。运行时 Paused 时，Manifest 中 Task 仍处于同一 durable Recording 生命周期。
+
+### Initializing 的精确定义
+
+在任何 Task directory/Manifest 副作用之前：
+
+```text
+RecorderState = Idle
+```
+
+第一份 `TaskState::Initializing` Manifest durable 成功后，这个 Task 才被定义为真实存在，同时运行态进入：
+
+```text
+RecorderState::Initializing
+```
+
+Initializing 期间：
+
+- Task ingress CLOSED；
+- Topic Live gate CLOSED；
+- Pause / Resume / Add / Remove 对外均返回 `InvalidState / Effects::None`；
+- 用户不能在 Initializing 阶段预置 Pause 意图；若业务要求“Start 后立即 Pause”，必须先等待 Start Completion Done(Success)，再提交 Pause；
+- Stop 不是普通用户控制路径；若初始化失败或 Runtime Shutdown 到来，由 Recorder 自己走失败/关闭收尾；
+- Runtime Shutdown 在 durable INITIALIZING 之后取得关闭权时，Recorder 可以 `Initializing -> Stopping`，取消尚未开始的初始化工作、等待已经 STARTED 的 native work，再尝试形成安全的失败终态；若该收尾本身失败则进入 `Failed`；
+- `state()` 可以观察到 current recording_id/generation 与 `RecorderState::Initializing`。
+
+### `TaskState::Initializing -> Recording` 与 Start Success
+
+Start 完成边界固定为：
+
+```text
+durable INITIALIZING Manifest
+→ Writer execution domain ready
+→ Start-time type/Schema preflight completed
+→ configured initial Topic prerequisites completed（若 Runtime 配置要求初始 Topic）
+→ Task runtime resources ready
+→ durable TaskState::Recording Manifest
+→ RecorderState::Recording
+→ maybe_open_ingress()
+→ Start Completion Success
+```
+
+说明：
+
+- “Writer ready”表示 Writer Thread/控制通道已经可正确接受后续工作，**不要求为了 Start 成功强制创建一个空物理 Segment**；
+- 如果没有预配置初始 Topic，则 Start 不需要为了等待未来动态 Topic 而停留在 Initializing；
+- Start Completion 绝不能早于 durable `TaskState::Recording`；
+- durable `TaskState::Recording` 成功但 `maybe_open_ingress()` 因 Disk/Timed 等安全条件不允许开放时，Start 不能伪造 Recording ingress；正常 Start 前置已要求 Disk fresh/safe，因此这种情况通常只来自并发安全事件，Recorder 应立即按最新安全事实转入 Paused/Stopping/Failed，而不是回滚 durable Recording。
+
+### INITIALIZING durable 前后失败
+
+若创建 Task directory/写第一份 Manifest 之前就失败：
+
+```text
+RecorderState remains Idle
+no durable Task exists
+→ Error / Effects::None
+```
+
+若第一份 INITIALIZING Manifest 的 durable outcome 本身无法确认：
+
+```text
+RecorderState = Failed
+manifest durability uncertain
+no further Manifest mutation in this Runtime
+→ Error / Effects::Possible
+→ requires Runtime restart + Recovery before any new Start
+```
+
+若 INITIALIZING 已 durable，之后 Writer ready/Schema preflight/其他初始化步骤失败：
+
+```text
+RecorderState::Initializing -> RecorderState::Failed
+```
+
+Recorder 尝试安全 terminalization；能 durable 提交 Failed 才写 `TaskState::Failed`，否则下次 Recovery 按现存介质事实形成 Incomplete/诊断。
+
+### Stopping → Failed
+
+Stop / Timed Stop / Shutdown 收尾已经进入：
+
+```text
+RecorderState::Stopping
+TaskState::Finalizing（如果该 transition 已 durable）
+```
+
+之后任一关键 finalization 步骤失败，例如：
+
+```text
+Writer Drain/Close
+required file fsync
+directory fsync
+Manifest terminal commit
+```
+
+Recorder 运行态进入：
+
+```text
+RecorderState::Failed
+```
+
+持久 TaskState 取决于还能证明什么：
+
+- 若 Recorder 仍能成功提交 durable `TaskState::Failed` → Manifest 记录 Failed；
+- 若 Manifest 本身已经 durability uncertain / 不可继续 mutation → **不得伪造 durable Failed**；磁盘上可能仍是 `Recording` 或 `Finalizing`，下次 Recovery 按介质事实保守形成 `Incomplete`。
+
+状态图里的 `Stopping -> Failed` 只描述运行态，不能被理解为“Manifest 一定已经 durable Failed”。
+
+### Completed durable 后资源释放失败
+
+如果 durable `TaskState::Completed` 已成功，但随后 Recorder-owned runtime resource 在释放/停止时发现不可安全完成：
+
+```text
+historical Task remains Completed
+RecorderState = Failed
+```
+
+不能把一个已经 durable Completed 的 Task 改写为 Failed 仅仅为了描述 Runtime teardown 问题。Recorder 在资源真正可安全释放前不回 Idle。
+
+如果释放失败不是永久阻塞，而是已有受管工作仍可能在后续返回真实完成结果，Recorder 保持 `Failed` 并等待该结果；一旦所有 ownership 能够安全释放、persistence authority 仍可信且没有 shutdown/persistence poison，仍可按 Failed → Idle 条件恢复。V1 不提供“用户点击重试 teardown”之类额外恢复 API，也不允许用新的 Start 绕过尚未释放的旧资源。
+
+如果资源永久阻塞或无法再次证明安全释放，Recorder 保持 fail-safe `Failed`；用户可请求 Runtime Shutdown，最终超过关闭 grace 时进入 `UNSAFE_TO_DESTROY`，由进程级重启 + Recovery 恢复。这是有意的 fail-safe 行为。
+
+### Failed → Idle
+
+普通、可安全收尾且持久化事实仍可信的失败，在满足：
+
+```text
+failed Task 的可安全 terminalization 已完成
++
+Task-owned Writer/Subscription/Pool/Queue 不再被运行期工作引用
++
+没有已 STARTED native work 仍引用该 Task
++
+Recorder persistence authority 未进入 poison/uncertain 状态
++
+shutdown_requested == false
+```
+
+后，由 Recorder 串行 mutation 域自动：
+
+```text
+Failed -> Idle
+```
+
+不要求全局 Cleanup queue 清空；旧 Task durable `DELETING` Segment 可以继续由 Cleanup 后台处理。
+
+但以下情况**不得** Failed → Idle 后继续新 Start：
+
+```text
+Manifest durable outcome uncertain
+manifest_revision == UINT64_MAX
+其他使本 Runtime 无法继续证明持久化 revision chain 的 poison condition
+```
+
+这些情况保持 Failed/关闭新 Start，要求 Runtime restart + Recovery 重新建立介质事实。
+
+### Resume 与状态转换
+
+Resume 对 PauseState 的修改见 §2.3。
+
+Resume 的 PauseState 修改与 RecorderState/gate 转换必须由**同一次串行 mutation**提交，不能向 `state()` 暴露：
+
+```text
+PauseState empty
++
+RecorderState::Paused
+```
+
+这种中间状态。
+
+串行域先计算候选的新 PauseState，再执行：
+
+```text
+maybe_open_ingress(candidate_pause_state)
+```
+
+只有它在同一线性化操作中再次确认：
+
+```text
+candidate PauseState empty
+TaskState == Recording
+RecorderState == Paused
+Timed deadline not reached
+DiskAdmission fresh/safe
+shutdown_requested == false
+```
+
+才一次性提交：
+
+```text
+PauseState = empty
+RecorderState::Paused -> RecorderState::Recording
+Task gate OPEN
+→ Resume Completion Success
+```
+
+如果 Timed Stop/Disk/Shutdown 等条件在 Resume 的线性化点已经成立，Resume 必须按下表返回，不能先修改 PauseState 再“补救”：
+
+| 线性化点事实 | Resume 结果 | PauseState / RecorderState |
+|---|---|---|
+| `shutdown_requested == true`，或 Recorder 已进入 Stopping/Failed | `InvalidState / Effects::None` | 不修改 PauseState；保持真实状态 |
+| Timed hard deadline 已到，Timed Stop 已取得关闭权 | `InvalidState / Effects::None` | 不修改 PauseState；由 Stop 路径进入/保持 Stopping |
+| Disk 在本次 Resume 复核中成为 Critical，且没有 USER 变化已经提交 | `DiskCritical / Effects::None` | 保持 Paused |
+| Disk 在本次 Resume 复核中成为 Unknown，且没有 USER 变化已经提交 | `DiskUnknown / Effects::None` | 保持 Paused |
+| USER 已经在同一次 Resume 中被确认清除，但 DiskCritical/DiskUnknown 仍阻止 reopen | 对应 Disk Error / `Effects::ConfirmedPartial` | `user_paused=false`，系统原因保留，RecorderState 必须仍为 Paused |
+| 所有 pause reason 可清除，且 Timed/Disk/Shutdown 条件都允许 reopen | Success | 原子提交 PauseState empty + RecorderState Recording + Task gate OPEN |
+
+这里的“先赢得线性化顺序”不是 wall-clock 先后猜测，而是 Recorder 唯一串行 mutation 域已经提交的领域顺序。若 Resume 已经成功线性化并返回 Success，随后发生的 Timed Stop/Disk/Shutdown 是**新的后续状态变化**，不能反向改写已完成的 Resume 结果。
+
+因此：
+
+> Resume 返回 Success 时，外部可观察快照中 PauseState 一定为空，并且 RecorderState 已经是 Recording；二者是同一领域提交，不存在可观察的中间窗口。
+
+> Resume 返回 `ConfirmedPartial` 时，RecorderState 必须仍为 Paused。若 Stopping/Failed/Shutdown 已经在 Resume 之前取得线性化权，则 Resume 必须返回 `InvalidState / None`，不能一边修改 PauseState 一边再宣称被更高优先级流程覆盖。
+
+## 2.2 TaskMode 与 TaskConfig
+
+```cpp
+enum class TaskMode {
+    Normal,
+    Timed,
+    Rolling
+};
+```
+
+使用 `TaskMode` 而不是过泛的 `Mode`。
+
+V1.0 相关枚举固定为：
+
+```cpp
+enum class CompressionMode {
+    None,
+    Lz4
 };
 
-enum class RecorderPhase {
-    Validation, TaskCreate, SchemaPreflight, WriterOpen, TopicRegister,
-    SubscriptionCreate, Ingress, ProducerDrain, ExecutorDetach, WriterDrain,
-    WriterClose, DataSync, ManifestCommit, TopicEventCommit, Cleanup, Recovery, Shutdown,
+enum class TimestampPolicy {
+    Receive
 };
+```
 
-enum class ControlHandleState {
-    Pending, Started, WaitingNative, Done, CancelledNotStarted,
-};
+`TimestampPolicy::Receive` 是 V1.0 唯一时间策略。未来增加 source/header timestamp 时再扩展，不预留未实现枚举。
 
-struct StartCommand {
+Start 输入：
+
+```cpp
+struct StartOptions {
     std::string recording_id;
-    RecordingMode mode = RecordingMode::Normal;
+    TaskMode mode = TaskMode::Normal;
     std::optional<std::chrono::milliseconds> duration;
     std::optional<std::chrono::seconds> segment_duration;
     std::optional<std::chrono::seconds> retention_duration;
 };
+```
 
-struct EffectiveTaskConfig {
-    RecordingMode mode;
+冻结后的 Task 配置：
+
+```cpp
+struct TaskConfig {
+    TaskMode mode;
     std::optional<std::chrono::milliseconds> duration;
     std::optional<std::chrono::seconds> segment_duration;
     std::optional<std::chrono::seconds> retention_duration;
     CompressionMode compression;
     TimestampPolicy timestamp_policy = TimestampPolicy::Receive;
 };
+```
 
-struct RecordingTargetGuard {
-    std::string recording_id;
-    std::uint64_t recording_generation;
+合法组合：
+
+| TaskMode | duration | segment_duration | retention_duration |
+|---|---|---|---|
+| Normal | `nullopt` | `nullopt` | `nullopt` |
+| Timed | **必须 > 0** | `nullopt` | `nullopt` |
+| Rolling | `nullopt` | 正值或缺省 | 正值或缺省 |
+
+Rolling 中两个字段独立取默认值：
+
+```text
+segment_duration missing   -> runtime default segment_duration
+retention_duration missing -> runtime default retention_duration
+```
+
+允许只显式覆盖其中一个。
+
+以下均为：
+
+```text
+InvalidArgument / Effects::None
+```
+
+- Timed `duration <= 0`；
+- Timed 中 `segment_duration` 或 `retention_duration` 不是 `nullopt`；
+- Normal 中任一 duration 字段存在；
+- Rolling 中 `duration` 存在；
+- Rolling 显式 segment/retention 为 0 或负值；
+- chrono 转换/相加会溢出实现支持范围。
+
+Timed 的具体可表示性检查固定为：
+
+```text
+duration.count() > 0
+AND
+duration 能无溢出转换为 steady_clock::duration
+AND
+steady_clock::now() + converted_duration <= steady_clock::time_point::max()
+```
+
+`StartOptions::duration` 本身已经以 `milliseconds` 表示，因此不存在“传入 1ns 再截断为 0ms”的隐式接受路径；Protocol/Server 在构造 StartOptions 时也必须拒绝会丢失为 0ms 的无效值。
+
+非法组合不得创建 Task directory，也不得写第一份 Manifest。
+
+Compression / TimestampPolicy 不由单次 Start 任意覆盖。
+
+QoS 不属于 TaskConfig。
+
+Runtime 启动时已经验证且冻结 Storage Profile。Start 只使用该已验证结果，不重复解析/重新验证磁盘 YAML。
+
+## 2.3 PauseState
+
+用户暂停和系统磁盘保护必须同时可表达，但系统磁盘原因本身只能有一个。
+
+```cpp
+enum class DiskPauseReason {
+    None,
+    Critical,
+    Unknown,
+    RecoveryPending
 };
 
-struct TopicTargetGuard {
-    RecordingTargetGuard recording;
-    TopicId topic_id;
-    std::uint64_t topic_epoch;
+struct PauseState {
+    bool user_paused = false;
+    DiskPauseReason disk = DiskPauseReason::None;
 };
+```
 
-enum class DomainEffects {
+Paused 条件：
+
+```text
+user_paused
+OR
+disk != None
+```
+
+合法组合：
+
+| user_paused | disk | Protocol paused_reasons |
+|---:|---|---|
+| false | None | `[]` |
+| true | None | `[USER]` |
+| false | Critical | `[DISK_CRITICAL]` |
+| false | Unknown | `[DISK_UNKNOWN]` |
+| false | RecoveryPending | `[DISK_RECOVERY_PENDING]` |
+| true | Critical | `[USER, DISK_CRITICAL]` |
+| true | Unknown | `[USER, DISK_UNKNOWN]` |
+| true | RecoveryPending | `[USER, DISK_RECOVERY_PENDING]` |
+
+类型上不允许：
+
+```text
+Critical + Unknown
+Critical + RecoveryPending
+Unknown + RecoveryPending
+```
+
+### Pause
+
+Pause 只修改 `user_paused`。
+
+```text
+Recording / Paused
++
+user_paused=false
+→ set true
+→ Success
+```
+
+已经：
+
+```text
+user_paused=true
+```
+
+则：
+
+```text
+AlreadyPaused / Effects::None
+```
+
+处于：
+
+```text
+Idle
+Stopping
+Failed
+```
+
+时 Pause：
+
+```text
+InvalidState / Effects::None
+```
+
+Pause 永远不清除 DiskPauseReason。
+
+### Disk pause
+
+```text
+fresh sample proves critical
+→ disk = Critical
+
+sample stale / repeated sampling failure
+→ disk = Unknown
+```
+
+恢复并满足稳定期：
+
+```text
+auto_resume=true
+→ disk = None
+
+auto_resume=false
+→ disk = RecoveryPending
+```
+
+### Resume
+
+Resume 可以清除：
+
+```text
+user_paused
+disk == RecoveryPending
+```
+
+但 RecoveryPending 只能在 Resume 时再次确认：
+
+```text
+fresh
+safe
+stable
+```
+
+后才允许清除。
+
+Resume 永远不能主动清除：
+
+```text
+Critical
+Unknown
+```
+
+结果：
+
+| 条件 | Result |
+|---|---|
+| USER/PENDING 成功清除，最终 PauseState 为空 | Success |
+| USER 被清除，但 Critical/Unknown/未重新确认成功的 RecoveryPending 仍在 | 对应 Disk Error / `ConfirmedPartial` |
+| 没有 USER/PENDING，仅 Critical/Unknown | 对应 Disk Error / `None` |
+| PauseState 已空 | `InvalidState / None` |
+| RecorderState 为 Idle/Stopping/Failed | `InvalidState / None` |
+
+RecoveryPending 的再次确认如果失败：
+
+- 新鲜度不足 → `DiskUnknown`；
+- 新样本重新证明危险 → `DiskCritical`；
+- 若同一次 Resume 已经成功清除了 USER，则返回对应 Disk Error / `ConfirmedPartial`；
+- 若没有任何 USER 变化且 RecoveryPending 也未能清除，则返回对应 Disk Error / `None`。
+
+只有：
+
+```text
+PauseState empty
+AND Task not Stopping/Failed
+AND Timed deadline not reached
+AND Disk fresh/safe
+AND Topic gate allows
+```
+
+才允许 reopen ingress。
+
+## 2.4 ErrorCode、Effects 与 UNKNOWN
+
+### ErrorCode
+
+```cpp
+enum class ErrorCode {
+    InvalidArgument,
+    InvalidState,
+    AlreadyPaused,
+    NotFound,
+    RecordingExists,
+    StaleRecording,
+    StaleTopicEpoch,
+    TopicTypeConflict,
+    UnsupportedQos,
+    TypeUnavailable,
+    SchemaUnavailable,
+    ResourceExhausted,
+    DiskCritical,
+    DiskUnknown,
+    StorageError,
+    EventCommitFailed,
+    DrainTimeout,
+    Unavailable,
+    InternalError
+};
+```
+
+语义：
+
+| ErrorCode | 含义 |
+|---|---|
+| InvalidArgument | 参数格式、非法组合、非法值 |
+| InvalidState | 当前 Recorder/Task 状态不允许，且没有更精确的稳定机器错误码 |
+| AlreadyPaused | Pause 请求发现 USER pause 已经存在 |
+| NotFound | Task / Topic 明确不存在 |
+| RecordingExists | Start 的 `recording_id` 已经存在，禁止覆盖历史目录 |
+| StaleRecording | `recording_id/generation` 不再指向当前活动 Task |
+| StaleTopicEpoch | recording identity 正确，但 `topic_id/topic_epoch` 已过期 |
+| TopicTypeConflict | 同名 Topic 的类型/冻结 storage signature 与当前 Task 已有身份冲突 |
+| UnsupportedQos | QoS 不在 V1 安全白名单或字段组合非法 |
+| TypeUnavailable | ROS type support 不可用 |
+| SchemaUnavailable | 无法生成完整 MCAP Schema |
+| ResourceExhausted | bounded queue/pool/metadata 容量耗尽 |
+| DiskCritical | 本次操作被明确磁盘危险阻止 |
+| DiskUnknown | 本次操作缺少可信新鲜磁盘安全证据 |
+| StorageError | Writer/MCAP/fsync/Manifest 等普通持久化失败 |
+| EventCommitFailed | Topic Event durable commit 失败/不确定 |
+| DrainTimeout | Recorder 已取得可终结证据，但 Stop/Drain 的领域完成条件在自身 deadline 内未满足 |
+| Unavailable | Executor 等必需运行依赖当前不可用 |
+| InternalError | 其他可恢复内部失败 |
+
+`ErrorCode::DiskCritical / DiskUnknown` 表示：
+
+> 本次操作为什么失败。
+
+`DiskSafetyState::Critical / Unknown` 表示：
+
+> 最新磁盘安全状态是什么。
+
+二者时间点和用途不同，不可互换。
+
+### Effects
+
+```cpp
+enum class Effects {
     None,
     Possible,
     ConfirmedPartial
 };
 
-enum class RecorderErrorCode {
-    InvalidArgument, NotFound, TopicNotFound, TypeConflict, TypeSupportUnavailable,
-    SchemaUnavailable, UnsupportedQos, InvalidState, AlreadyPaused, AlreadyFinished,
-    RecordingExists, StaleRecording, StaleTopicEpoch, ResourceExhausted, DiskFull,
-    DiskStateUnknown, WriterError, StorageUnavailable, EventCommitFailed, DrainTimeout,
-    ExecutorUnavailable, GenerationViolation,
-};
-
-struct RecorderError {
-    RecorderErrorCode code;
-    RecorderPhase phase;
-    DomainEffects effects;
+struct Error {
+    ErrorCode code;
+    Effects effects = Effects::None;
     std::string message;
-};
-
-template <class T>
-class RecorderControlHandle {
-public:
-    bool wait_for(std::chrono::milliseconds timeout) const;
-
-    ControlHandleState state() const noexcept;
-
-    bool done() const noexcept;
-
-    std::optional<ros2_bag::Result<T, RecorderError>> result() const;
-
-    bool cancel_if_not_started();
-};
-
-struct ShutdownCompletion;
-
-class RecorderShutdownHandle {
-public:
-    bool wait_for(
-        std::chrono::milliseconds timeout) const;
-
-    bool done() const noexcept;
-
-    std::optional<ros2_bag::Result<void, RecorderError>> result() const;
-
-private:
-    std::shared_ptr<ShutdownCompletion>
-        completion_;
-};
-
-struct StartInfo {
-    std::string recording_id;
-    std::uint64_t recording_generation = 0;
-    EffectiveTaskConfig effective_config;
-};
-
-struct TopicOperationInfo {
-    TopicId topic_id = kInvalidTopicId;
-    std::uint64_t topic_epoch = 0;
-};
-
-class Recorder {
-public:
-    RecorderControlHandle<StartInfo>
-    start(const StartCommand&);
-
-    RecorderControlHandle<void>
-    stop(const RecordingTargetGuard&);
-
-    RecorderControlHandle<void>
-    pause(const RecordingTargetGuard&);
-
-    RecorderControlHandle<void>
-    resume(const RecordingTargetGuard&);
-
-    RecorderControlHandle<TopicOperationInfo>
-    add_topic(
-        const RecordingTargetGuard&,
-        TopicInfo,
-        const OperationId&);
-
-    RecorderControlHandle<TopicOperationInfo>
-    remove_topic(
-        const TopicTargetGuard&,
-        const OperationId&);
-
-    RecorderStatus status() const;
-
-    TopicDiscoveryResult discover_topics(
-        const TopicDiscoveryQuery&) const;
-
-    HistoryPage query_history(
-        const HistoryQuery&) const;
-
-    TopicOperationEvidence
-    lookup_topic_operation(
-        const std::string& recording_id,
-        const OperationId&) const;
-
-    RecorderShutdownHandle request_shutdown();
 };
 ```
 
-### Recording ID 规范
+含义：
 
-`recording_id` 同时是协议身份与任务目录单一组件。
+| Effects | 含义 |
+|---|---|
+| None | 可证明本次操作没有产生领域副作用 |
+| Possible | 已进入可能有副作用阶段，但无法证明最终边界 |
+| ConfirmedPartial | 可证明部分预期变化已经发生，但整体目标未达成 |
 
-V1.0 统一采用：
+典型矩阵：
+
+| 操作/阶段 | 失败 | Effects |
+|---|---|---|
+| Start 参数校验 | InvalidArgument | None |
+| Start recording_id 已存在 | RecordingExists | None |
+| Start durable INITIALIZING 后 Writer Open 失败 | StorageError | ConfirmedPartial |
+| Pause 已 USER paused | AlreadyPaused | None |
+| Resume 清除 USER，但 DiskCritical 仍在 | DiskCritical | ConfirmedPartial |
+| Add 在尝试 PREPARED 之前失败 | 对应 Error | None |
+| ADD_PREPARED append/fsync 结果无法确认 | EventCommitFailed | Possible |
+| Add 已 durable PREPARED，后续明确失败且 ADD_FAILED durable | 对应 Error | ConfirmedPartial |
+| Add terminal Event fsync 不确定 | EventCommitFailed | Possible |
+| Remove 在尝试 PREPARED 之前 recording stale / topic epoch stale | StaleRecording / StaleTopicEpoch | None |
+| REMOVE_PREPARED append/fsync 结果无法确认 | EventCommitFailed | Possible |
+| Remove 已关闭 Topic gate，但 terminal Event 不确定 | EventCommitFailed | Possible |
+| Stop 在开始前被状态守卫拒绝 | InvalidState | None |
+| Stop 已进入收尾，后续 Writer/Storage 失败 | StorageError / DrainTimeout | Possible 或 ConfirmedPartial，按 Recorder 可证明边界决定 |
+
+Server 不允许自行“猜 Effects”。
+
+
+Stop/Finalize 的 `Possible` 与 `ConfirmedPartial` 按可证明边界区分：
+
+```text
+已经确认某些领域变化完成并且该变化不会在当前失败处理中被撤销，
+但整体 Stop/Finalize 目标未达成
+→ ConfirmedPartial
+
+已经进入可能产生副作用的 native/durable 阶段，
+但无法可靠判断具体哪些目标变化已经成立
+→ Possible
+```
+
+典型 Stop 失败判定：
+
+| 场景 | Effects | 理由 |
+|---|---|---|
+| 尚未取得 Stop 关闭权即被状态守卫拒绝 | `None` | 没有进入领域副作用 |
+| 已关闭 ingress，Writer Drain/Close 明确失败且最终 Writer/Segment 状态无法证明 | `Possible` | 已进入终止流程，但存储/Writer 最终边界不确定，V1 保守分类 |
+| Writer Close 已明确成功，随后 required file fsync 失败 | `ConfirmedPartial` | Writer 已完成不可逆关闭，但 durable 完成条件未满足 |
+| terminal Manifest rename/directory fsync outcome 不可确认 | `Possible` | 无法证明最终 durable TaskState 到底是旧版还是新版 |
+| 某个旧 Segment 已 durable COMPLETE，但后续 Task terminalization 失败 | `ConfirmedPartial` | 至少该 Segment 的 durable 完成事实已经确定 |
+
+上述表是 V1 的规范分类，不允许 Server 根据当前 State 自行重新分类。
+
+`DrainTimeout` 只用于 Recorder 已经获得**可终结**的 Stop/Drain 领域证据，并能安全返回一个最终 Failure 的情况。对永久阻塞、仍引用 Recorder-owned 对象的 started native work：
+
+```text
+Completion remains unfinished
+→ Runtime grace expires
+→ UNSAFE_TO_DESTROY
+```
+
+不能为了让 Shutdown/Stop 返回而制造 `DrainTimeout` Error。
+
+### Protocol UNKNOWN
+
+UNKNOWN 不是 Recorder Error。
+
+当：
+
+```text
+Recorder Completion 尚未完成
++
+HTTP reply deadline 到达
+```
+
+Server 可以保守返回：
+
+```text
+outcome = UNKNOWN
+effects = POSSIBLE
+```
+
+这里的 `POSSIBLE` 是 Protocol 对“可能已进入领域”的保守表达，不是从 Recorder Error.effects 读取的。
+
+虽然 Protocol 也使用字符串 `POSSIBLE`，它与 C++ `recorder::Effects::Possible` 属于不同层：前者是 Protocol response 字段的值，后者是 Recorder 最终 Error 的领域属性。二者可以映射为同名文本，但实现中不得把“HTTP UNKNOWN 自动等价于 Recorder Error.effects == Possible”。
+
+## 2.5 Completion
+
+Recorder 顶层 API 不公开 Pending/Running/Cancelled 状态机，也不提供领域取消。
+
+```cpp
+template <class T>
+class Completion {
+public:
+    bool wait_for(std::chrono::milliseconds timeout) const;
+    bool done() const noexcept;
+    std::optional<Result<T, Error>> result() const;
+};
+```
+
+### `wait_for()`
+
+返回值严格表示：
+
+```text
+true  = 在给定 timeout 内 Completion 已完成
+false = timeout 到期时 Completion 仍未完成
+```
+
+它**不表示领域操作成功或失败**。
+
+因此：
+
+```cpp
+if (completion.wait_for(timeout)) {
+    // 只能说明可以读取 result()；
+    // Result 仍可能是 Error。
+}
+```
+
+`wait_for()` 可以多次调用。一次 timeout：
+
+- 不修改 Completion；
+- 不取消 Recorder mutation；
+- 不影响后续再次 wait；
+- 不阻止最终 `result()` 产生。
+
+### 生命周期规则
+
+1. Recorder 方法成功返回 Completion 后，该 mutation 已由 Recorder 接管；
+2. HTTP timeout / disconnect 不取消 Recorder mutation；
+3. `result()` 仅在 `done()==true` 时有值；
+4. Completion 不持久化；
+5. 不提供通用 Operation Registry；
+6. Server 不得假设“尚未拿到 Result”等于“领域操作未开始”；
+7. Server 的排队取消、queue timeout 和 overload admission 全部发生在调用 Recorder 之前；
+8. Recorder 不提供 `is_accepting()` 让 Server 先查再调用，因为该查询会形成 TOCTOU；Recorder 自己仍在领域线性化点做最终 admission。
+
+Server 自己的 FIFO 满/queue timeout 属于 Server admission 责任，不属于 Recorder Completion 语义。
+
+内部实现可以拥有：
+
+```text
+Queued
+Claimed
+WaitingWriter
+WaitingExecutor
+WaitingCleanup
+...
+```
+
+但这些状态不进入 Recorder 模块 API。
+
+Server 自身 admission 只依据 Server-owned FIFO/timeout/backlog；不得基于 Recorder `state()` 做权威准入。Recorder 最终准入仍在线性化点决定。
+
+`Completion<void>::result()` 为 `std::optional<Result<void, Error>>`，`Result<void, Error>` 语义完全遵循 `docs/result.md`。
+
+## 2.6 TopicOptions、TopicInfo 与 DiscoveredTopic
+
+Add Topic 输入、已 Add Topic 冻结事实、ROS Graph discovery 结果是三个不同语义，禁止复用同一类型。
+
+### QosOptions
+
+```cpp
+enum class QosMode {
+    Auto,
+    Explicit
+};
+
+enum class Reliability {
+    Reliable,
+    BestEffort
+};
+
+enum class Durability {
+    Volatile,
+    TransientLocal
+};
+
+enum class History {
+    KeepLast,
+    KeepAll
+};
+
+struct QosOptions {
+    QosMode mode = QosMode::Auto;
+
+    std::optional<Reliability> reliability;
+    std::optional<Durability> durability;
+    std::optional<History> history;
+    std::optional<std::uint32_t> depth;
+};
+```
+
+规则：
+
+```text
+Auto
+→ reliability/durability/history/depth 全部必须 nullopt
+
+Explicit
+→ reliability/durability/history 必填
+
+Explicit + KeepLast
+→ depth 必填，1..10000
+
+Explicit + KeepAll
+→ depth 必须 nullopt
+```
+
+### TopicOptions
+
+V1.0 完整字段固定为：
+
+```cpp
+struct TopicOptions {
+    std::string name;
+    std::string type;
+    std::optional<QosOptions> qos;
+    std::optional<double> expected_hz;
+};
+```
+
+- `name`：绝对 ROS Topic 名；
+- `type`：ROS 类型字符串；若 Protocol 允许省略，则 Server/Recorder discovery 层必须先解析成唯一确定类型后再构造 TopicOptions；
+- `qos`：缺省等价 Auto；
+- `expected_hz`：可选诊断期望频率，必须为有限正数。
+
+V1 `TopicOptions` 没有其他隐藏字段，不支持 per-topic RepeatPolicy / Snapshot enable 开关。
+
+### TopicInfo
+
+`TopicInfo` 只描述**已经属于当前 Task 某个 Topic Epoch 的冻结事实**：
+
+```cpp
+struct TopicInfo {
+    TopicId topic_id;
+    std::uint64_t topic_epoch;
+
+    std::string name;
+    std::string type;
+
+    QosOptions qos;  // 实际冻结后的 Explicit 形式
+
+    std::optional<std::string> type_hash;
+    std::string schema_sha256;
+
+    std::optional<double> expected_hz;
+};
+```
+
+其中：
+
+- `type_hash`：ROS 2 能提供时使用 ROS 标准字符串化格式 `RIHS{version}_{value}`（当前常见 RIHS01 形如 `RIHS01_<lowercase_hex>`）；优先使用 ROS 提供的 stringify/parse 能力，不自行发明另一种编码。Humble 环境无法获得标准 type hash 时保持 `nullopt`，不得以 `schema_sha256` 冒充 ROS type hash；
+- `schema_sha256`：对冻结后的完整 encoded Schema bytes 计算 SHA-256，格式固定为 64 字符 lowercase hex；
+- `qos`：永远是 Recorder 实际采用并冻结的 Explicit 结果，不再是 Auto。
+
+Publisher count、当前 QoS compatibility、visibility、actual_hz、gap 等属于**动态运行时观测**，放在 `TopicState`，不写入 TopicInfo。
+
+同名 Topic Remove 后重新 Add 必须获得新 `topic_epoch`；旧 Epoch 永不复用。
+
+### DiscoveredTopic
+
+Graph discovery 结果没有 topic_id/topic_epoch，不得返回 TopicInfo：
+
+```cpp
+enum class TopicRecordability {
+    Recordable,
+    TypeConflict,
+    TypeUnavailable,
+    QosIncompatible
+};
+
+struct DiscoveredTopic {
+    std::string name;
+    std::vector<std::string> types;
+
+    std::size_t publisher_count = 0;
+    TopicRecordability recordability = TopicRecordability::Recordable;
+
+    std::vector<QosOptions> publisher_qos_profiles;
+    bool publisher_qos_profiles_truncated = false;
+};
+```
+
+要求：
+
+- `publisher_count` 表示本次 Graph observation 看到的真实 Publisher 数量；它可以大于 `publisher_qos_profiles.size()`；
+- `publisher_qos_profiles` 每个 `DiscoveredTopic` 最多保留 `topics.discovery_max_endpoint_profiles` 个，默认 64；达到上限时仍返回 Topic，并设置 `publisher_qos_profiles_truncated=true`；未截断时该字段为 false；
+- `TopicRecordability` 是 discovery 的**最严重问题汇总**，不是把类型层和 QoS 层误认为同一个机制。优先级固定为 `TypeConflict > TypeUnavailable > QosIncompatible > Recordable`；需要更细诊断时使用其他字段/Protocol details，不再为 V1 拆第二组状态枚举；
+- `types` 是本次 Graph observation 对该 Topic name 观察到的去重、稳定排序类型集合，并受 discovery 返回预算约束；唯一类型时 `types.size()==1`，同名多类型时保留实际观察集合并令 `recordability=TypeConflict`，不能挑一个类型伪装唯一；
+- discovery 只表达当前 Graph observation，不代表 Topic 已 Add，也不创建 Topic ID/Epoch；
+- `QosIncompatible` 表示：基于当前已观察 Publisher endpoint profiles，在 V1 支持的 QoS 候选集合内不存在一个 candidate 能与**全部**已观察 Publisher 同时兼容；它是 Graph 诊断，不等价于 Add 必然失败；
+- Auto Add 仍会按 §4.1 的确定性策略选择最合适的支持 QoS，并在 `TopicState` 暴露实际兼容性；
+- Schema/type support 的进一步 preflight 失败可体现在 `recordability` 或 Add 时返回结构化 Error，具体 Protocol 展示由 `protocol.md` 对齐。
+
+## 2.7 TaskInfo、SegmentInfo、TaskDetail 与 TaskList
+
+这些类型定义在 `task.hpp`，属于历史 Task 只读领域值对象。
+
+### SegmentInfo
+
+```cpp
+enum class SegmentLifecycleState {
+    Writing,
+    Finalizing,
+    Complete,
+    Deleting,
+    Removed,
+    Incomplete
+};
+
+struct SegmentInfo {
+    std::uint64_t segment_id;
+    SegmentLifecycleState state;
+
+    std::string relative_path;
+
+    std::optional<std::int64_t> started_at_ns;
+    std::optional<std::int64_t> completed_at_ns;
+
+    std::optional<std::uint64_t> message_count;
+    std::optional<std::uint64_t> size_bytes;
+};
+```
+
+`relative_path` 是相对 Task directory 的受控标识，不向 Recorder API 暴露宿主机绝对路径。
+
+`message_count/size_bytes` 的保证：
+
+- `Complete`：如果正常 Close/readback 成功，必须有值；
+- `Deleting/Removed`：只要对应明细记录仍保留，就保留已经确认的计数；
+- `Writing/Finalizing/Incomplete`：不能证明最终计数时为 `nullopt`，不得用当前临时计数伪装成最终事实。
+
+### TaskInfo
+
+`TaskInfo` 是有限摘要，用于 Start 成功结果和历史 Task 列表：
+
+```cpp
+struct TaskInfo {
+    std::string recording_id;
+    std::uint64_t generation;
+
+    TaskState state;
+    TaskConfig config;
+
+    std::optional<std::int64_t> start_time_ns;
+    std::optional<std::int64_t> terminal_time_ns;
+
+    SegmentHistorySummary segment_history_summary;
+
+    std::optional<Error> error;
+};
+```
+
+时间字段：
+
+- `start_time_ns`：正常 Task 在第一份 durable INITIALIZING Manifest 后即应已知；仅损坏/不完整旧介质事实无法安全恢复时允许 `nullopt`；
+- `terminal_time_ns`：Completed / Failed / Incomplete 有可信终态时间时填写；未知必须 `nullopt`，不能伪造 0。
+
+### TaskDetail
+
+```cpp
+struct TaskDetail {
+    TaskInfo task;
+
+    std::vector<SegmentInfo> segments;
+    std::size_t segment_offset = 0;
+    std::size_t detail_segment_count = 0;
+    bool segment_has_more = false;
+
+    std::uint64_t total_segment_count = 0;
+
+    bool recovered = false;
+    bool recovery_findings_available = false;
+    std::uint32_t incomplete_segment_count = 0;
+    std::uint32_t uncertain_topic_operation_count = 0;
+};
+```
+
+不建立独立 `RecoverySummary` 公共类型。
+
+字段语义：
+
+- `recovered=true`：该 Task 的当前历史视图至少经过一次 startup Recovery 处理/重新分类；
+- `recovery_findings_available=true`：存在非空、可供诊断的 Recovery finding；它不等价于“磁盘上恰好存在 recovery.json 文件”；
+- `task.segment_history_summary`：已安全压缩的 durable REMOVED 前缀累计信息；
+- `segments`：本次分页仍保留详情的 Segment；
+- `detail_segment_count`：当前 Manifest 中仍保留独立明细、可参与 `segment_offset/segment_limit` 分页的 Segment 记录数；
+- `total_segment_count`：逻辑历史 Segment 总数，包括已压缩 REMOVED；
+- `segment_has_more` 只针对**仍保留明细的 Segment 记录集合**，规范计算为 `segment_offset + segments.size() < detail_segment_count`，而不是拿 `total_segment_count` 直接计算，因为 total 还包含已压缩前缀；
+- `recovery_findings_available=true` 必然蕴含 `recovered=true`；`recovered=true && recovery_findings_available=false` 表示该 Task 已被 startup Recovery 检查/分类，但没有产生需要向查询层暴露的 finding；`recovered=false && recovery_findings_available=true` 为非法组合。
+
+### TaskList
+
+```cpp
+struct TaskList {
+    std::vector<TaskInfo> items;
+
+    std::size_t scanned_entries = 0;
+    bool scan_truncated = false;
+    bool has_more = false;
+};
+```
+
+组合语义：
+
+| has_more | scan_truncated | 含义 |
+|---:|---:|---|
+| false | false | 本次已扫描集合没有下一页，且 scan 覆盖了本轮可见候选全集 |
+| true | false | 常规分页：已扫描集合中仍有下一页 |
+| true | true | 已扫描集合仍有下一页，同时 output_root 还可能存在本次未扫描 Task |
+| false | true | 本次已扫描集合没有下一页，但仍可能存在完全未扫描 Task |
+
+因此 `has_more=false` 从不覆盖 `scan_truncated=true` 的不确定性。
+
+V1 不提供 `total_count/cursor/next_token/stable snapshot id`，因为 `list_tasks()` 是 bounded BEST_EFFORT scan。
+
+## 2.8 Recorder API
+
+```cpp
+class Recorder {
+public:
+    Completion<TaskInfo> start(const StartOptions& options);
+
+    Completion<void> stop(
+        std::string_view recording_id,
+        std::uint64_t generation);
+
+    Completion<void> pause(
+        std::string_view recording_id,
+        std::uint64_t generation);
+
+    Completion<void> resume(
+        std::string_view recording_id,
+        std::uint64_t generation);
+
+    Completion<TopicInfo> add_topic(
+        std::string_view recording_id,
+        std::uint64_t generation,
+        const TopicOptions& options,
+        const OperationId& operation_id);
+
+    Completion<void> remove_topic(
+        std::string_view recording_id,
+        std::uint64_t generation,
+        TopicId topic_id,
+        std::uint64_t topic_epoch,
+        const OperationId& operation_id);
+
+    State state() const;
+
+    Result<std::vector<DiscoveredTopic>, Error> discover_topics() const;
+
+    Result<TaskDetail, Error> get_task(
+        std::string_view recording_id,
+        std::size_t segment_offset = 0,
+        std::size_t segment_limit = 100) const;
+
+    Result<TaskList, Error> list_tasks(
+        std::size_t offset,
+        std::size_t limit) const;
+
+    Result<TopicOperationState, Error> topic_operation_state(
+        std::string_view recording_id,
+        const OperationId& operation_id) const;
+
+    Completion<void> shutdown();
+};
+```
+
+不定义：
+
+```text
+Request/Response
+Target/Guard
+RecorderControlHandle
+RecorderShutdownHandle
+HistoryQuery
+HistoryPage
+TopicOperationEvidence
+```
+
+
+
+### `get_task()` 分页边界
+
+- `segment_offset` 可以大于实际可分页 Segment 数，此时 Result 成功且 `segments=[]`、`segment_has_more=false`；
+- `segment_limit` 合法范围为 `1..200`；超出范围返回 `InvalidArgument / Effects::None`，Recorder C++ API 不做静默 clamp；
+- offset 只作用于仍保留明细的 Segment 记录，已安全压缩的 REMOVED 前缀通过 `segment_history_summary` 表达。
+
+### `state()` 生命周期
+
+只要 Recorder 对象仍然存活，`state()` 都可调用，包括 Shutdown 已完成但 Runtime 尚未析构 Recorder 的短暂阶段。
+
+Shutdown 完成后预期：
+
+```text
+RecorderState::Idle
+shutting_down = true
+current Task = none
+```
+
+`state()` 中的 `shutting_down` 从第一次 `shutdown()` API 调用成功设置 sticky admission barrier 起即为 true，而不是等 Shutdown 事件进入串行域后才变化。
+
+对象析构后当然不存在可调用的 C++ 接口，不额外定义“析构后 state()”语义。
+
+## 2.9 recording_id
 
 ```text
 ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$
 ```
 
-即：
+要求：
+
+- 1～64 bytes；
+- ASCII；
+- case-sensitive；
+- 禁止空格；
+- 禁止 `.`；
+- 禁止 `/`、`\`；
+- 禁止 `%`；
+- 禁止 Unicode。
+
+非法 recording_id：
 
 ```text
-1～64 字节
-ASCII
-区分大小写
+InvalidArgument / None
 ```
 
-不允许：
+并且：
 
 ```text
-空格
-点号
-斜杠
-反斜杠
-百分号
-Unicode
+不得创建 Task directory
+不得写 Manifest
+不得产生其他 durable side effect
 ```
 
-Recorder 是最终权威校验者。
+---
 
-Server/Client 可以提前执行同一校验，但不能放宽。
+# 3. 并发、状态变更与生命周期
 
-任务目录使用原值作为单层目录名。
+## 3.1 唯一串行 mutation 域
 
-目录已存在一律返回：
+Recorder 必须有一个唯一串行领域 mutation 域，决定以下动作的线性化顺序：
 
 ```text
-RECORDING_EXISTS
-```
-
-不做 Unicode、大小写或路径归一化后的“同名修正”。
-
-### Shutdown
-
-Shutdown 是 Runtime 生命周期控制，不是普通外部 Control。
-
-`request_shutdown()` 必须：
-
-```text
-O(1)
-幂等
-```
-
-行为：
-
-1. 关闭 Recorder 外部 mutation admission；
-2. 对当前 Task generation 原子关闭 ingress gate；
-3. 向 RecorderControlSequencer 的保留系统槽提交一次 Shutdown；
-4. 重复调用返回指向同一个 `ShutdownCompletion` 的轻量句柄。
-
-实现可用：
-
-```text
-std::once_flag
-```
-
-或等价原子发布保证只创建一次 Completion。
-
-不能为每次调用创建互不关联的关闭事务。
-
-Runtime 持续强持有 Recorder，并在独立管理/deadline 执行域等待 `RecorderShutdownHandle`。
-
-Sequencer 合并已在途 Stop，随后向：
-
-```text
-Writer
-CleanupWorker
-ResourceMonitor
-```
-
-发停止请求。
-
-只有对应线程已真实退出后才 join/释放对象并完成 Handle。
-
-若 Worker 永久卡在：
-
-```text
-Writer I/O
-remove_all()
-statvfs()
-```
-
-Handle 保持未完成。
-
-Runtime 超时进入：
-
-```text
-UNSAFE_TO_DESTROY
-```
-
-并保留整个对象图，禁止进入 Recorder 普通析构。
-
-### Control Result 的值语义
-
-`RecorderControlHandle` 是**进程内完成对象，不是 Operation Registry**：
-
-- 不持久化；
-- 不提供跨进程查询；
-- 不改变 Protocol 的 UNKNOWN 规则。
-
-Recorder 内部只对当前请求及其 Lease 保留共享 Completion。
-
-所有 waiter 消失后，已经 STARTED 的请求仍继续到 DONE。
-
-Server Control Worker 必须在取得 Handle 后继续观察其真实 DONE，网络 ResponseSink 可以更早超时/释放。
-
-`StartInfo` 与 `TopicOperationInfo` 是**有界轻量成功值对象**。`RecorderError`、`RecorderErrorCode`、`RecorderPhase` 和 `DomainEffects` 仅作为 `Result<T, RecorderError>` 的领域错误，不再定义第二套 Result-like 状态。
-
-V1.0 不允许 Control Result 持有：
-
-```text
-大型 Payload
-完整 Topic 列表
-完整 Segment 列表
-无界诊断
-```
-
-因此：
-
-```cpp
-std::optional<Result<T, RecorderError>> result() const;
-```
-
-`optional` 表示领域 Result 尚未或已经产生；产生后 Result 只能是 Value 或 Error。`CancelledNotStarted` 是 Handle 生命周期终态，不伪造成 Recorder Error；caller wait timeout 不产生虚假 Result。Protocol `UNKNOWN` 是 observer deadline/断线的 wire 语义，不是 Result 的第三态。可恢复失败的只读接口同样使用 `Result<T, RecorderError>`，纯快照和 predicate 不机械包装 Result。
-
-按值返回快照是正式 API 语义，不引入第二层 `shared_ptr<const Result>` 生命周期。
-
-### StartCommand 与 EffectiveTaskConfig
-
-`StartCommand` 是**唯一任务模式输入**。
-
-Runtime `RecorderConfig` 不保存“当前 recording.mode”。
-
-它只保存：
-
-```text
-output_root
-Rolling 默认 segment/retention
-允许范围
-StorageProfile
-QoS 默认
-全局资源预算
-```
-
-Server 将 Protocol Start 解析为 StartCommand。
-
-Recorder 在 Sequencer 内验证并生成 `EffectiveTaskConfig`：
-
-| Start mode | `duration` | `segment_duration / retention_duration` | 结果 |
-|---|---|---|---|
-| NORMAL | 必须 null | 必须 null | 有效 |
-| TIMED | 必须正值 | 必须 null | 有效 |
-| ROLLING | 必须 null | 可缺省；缺省取 Runtime 默认，最终均为正值 | 有效 |
-| 任意非法组合 | — | — | INVALID_ARGUMENT / effects:NONE |
-
-Compression 和 TimestampPolicy **不由 StartCommand 接受覆盖**。
-
-它们从启动时验证通过的 Runtime Storage Profile 复制到新任务的 `EffectiveTaskConfig`。
-
-每个 Segment 都必须使用该 Task 的冻结 Storage Profile。
-
-**QoS 不属于 EffectiveTaskConfig。**
-
-Runtime QoS Default 只参与每次 Add Topic 的 QoS 归一化。
-
-最终实际使用 QoS 冻结在该 Topic ID/Epoch 的：
-
-```text
-TopicInfo
-TopicRuntime
-```
-
-中。
-
-动态 Add 之间互不借用“任务级 QoS”。
-
-`CompressionMode` V1.0 仅允许：
-
-```text
-NONE
-LZ4
-```
-
-默认 LZ4。
-
-如果使用 rosbag2 storage config file，Runtime 必须在 Start 时把已解析、验证的 MCAP Profile 物化为任务目录内只读：
-
-```text
-storage_config.yaml
-```
-
-或使用等价 Writer 原生 Options。
-
-后续 Rolling Segment 始终引用这个任务副本，避免：
-
-```text
-config/mcap.yaml
-```
-
-在任务中途变化。
-
-`RecorderStatus.mode/duration/effective_config` 在存在当前 Task 时必须来自该 Task 的 EffectiveTaskConfig。
-
-**Idle 且不存在当前 Task 时这些字段为 `nullopt`**。
-
-Protocol 映射为：
-
-```text
-null
-```
-
-不得用：
-
-```text
-NORMAL
-Runtime 默认值
-```
-
-伪装活动任务配置。
-
-Manifest 同样持久化这些实际值，使 History/Recovery 能解释录制行为。
-
-RuntimeConfig 在进程启动时一次加载并保持不可变。
-
-修改磁盘上的 YAML **不会**影响当前或下一 Task。
-
-必须安全重启 Runtime 才重新加载。
-
-每次 Start 只从：
-
-```text
-immutable RuntimeConfig
-+
-StartCommand
-```
-
-形成新的 EffectiveTaskConfig。
-
-### 只读接口
-
-只读接口使用拥有自身数据的有界值对象。
-
-`TopicDiscoveryQuery/Result`、`HistoryQuery/Page`、`TopicOperationEvidence` 均由 Recorder 定义。
-
-V1 History 与 Graph 统一采用：
-
-```text
-limit + offset
-```
-
-的 **BEST_EFFORT** 分页。
-
-它不提供：
-
-```text
-数据库式 Cursor
-稳定跨请求快照
-全局稳定 offset
-```
-
-Topic Evidence 返回：
-
-```text
-CONFIRMED_SUCCESS
-CONFIRMED_FAILURE
-UNCERTAIN
-NOT_FOUND
-```
-
-并只读取受限事件文件。
-
-同步控制接口通用契约：
-
-| 条件 | 契约 |
-|---|---|
-| 输入身份 | recording_id、Topic 名称和 operation_id 的格式、长度和字符集合受限；空/非法身份不得有副作用 |
-| 资源生存期 | 每个调用开始时取得合法 Recorder/Task/Topic 所有权；Shutdown 一旦关闭入口，不允许获得新的任务句柄 |
-| 成功返回 | 领域同步阶段完成；需要持久化的操作已有经验证终态，且成功不表示 HTTP 应答已送达 |
-| 失败返回 | 不能假定完全没有副作用；必须说明是否留下 PREPARED、可能的半完成对象或已接纳消息 |
-| 超时与取消 | 内部协作超时必须确保异步执行没有持有悬空栈参数/回调；不能让下一代 Task 复用未清理对象 |
-| 异常边界 | 运行期第三方异常不得跨 ROS 回调和 Worker 线程边界泄漏；转换成域错误并安全关闭 |
-| 诊断 | 错误携带代码与可读取说明；不要只返回模糊 false，也不泄露任务数据或凭证 |
-
-Stop 和 Shutdown 的“幂等”是**安全意义的幂等**：
-
-重复请求不执行第二次：
-
-```text
-文件删除
-Writer close
-任务提交
-```
-
-调用是否返回成功要根据：
-
-```text
-已经处于终态
-此前是否发生失败
-```
-
-区分。
-
-不能用幂等掩盖第一次失败。
-
-对 `add_topic` 和 `remove_topic`：
-
-```text
-operation_id
-```
-
-是事件关联参数。
-
-**不自动提供任意重试去重保障。**
-
-若要求幂等重试，必须明确 identity 与持久化去重边界，不能仅依赖相同字符串。
-
-### 锁与回调生命周期
-
-应明确：
-
-```text
-Coordinator 状态锁
-TopicMap 锁
-WriterRequest 同步原语
-PoolState 锁
-```
-
-各自保护范围。
-
-正常代码优先不嵌套持有不同子系统锁。
-
-确有跨状态更新时给出唯一锁顺序并用注释/测试固定。
-
-不得持有锁调用：
-
-```text
-rclcpp::Executor::remove_*
-Writer close
-fsync
-remove_all
-等待 ROS Executor 回调
-```
-
-在所有 Async/Executor 协作结构中，回调捕获应持有：
-
-```text
-共享生命周期对象
-或
-受控 weak reference
-```
-
-禁止捕获可能提前销毁的：
-
-```text
-栈上 error 指针
-Promise
-裸 this
-```
-
-### 并发操作
-
-Server 外部变更串行化是一道入口约束，但 Recorder 内部：
-
-```text
-Timed Stop
-Disk Protection
-Writer Failure
-Rolling Timer
-```
-
-不经过 Server。
-
-对一个 Task，只有 Recorder 自己的状态同步点可以裁定哪个转移生效。
-
-不得让多个线程都从：
-
-```text
-Recording → Stopping
-```
-
-并各自关闭 Writer。
-
-### 1.3.1 原生控制目标守卫的线性化接口
-
-Server 的 Control Worker 可以在：
-
-```text
-入队
-出队
-native 入口前
-```
-
-反复验证：
-
-```text
-expected_runtime_instance_id
-recording_id
-recording_generation
-```
-
-但仅在 Server 中前置读取 `status()` 不能构成 Recorder 层线性化目标守卫。
-
-Timed Stop、Disk Protection 或 Stop 完成后，另一个 Task 可能在：
-
-```text
-Server 校验
-与
-实际 native mutation
-```
-
-之间切换。
-
-因此 V1.0 对 Server 暴露的：
-
-```text
+Start
 Stop
 Pause
 Resume
-Add
-Remove
+Add Topic
+Remove Topic
+Timed Stop
+Rolling Rotate
+Disk Safety
+Writer Failure
+Cleanup Completion
+Shutdown
 ```
 
-领域 API **必须显式接收 Recording/Topic Guard**。
+不冻结额外类名。
 
-不带目标代际的便利入口不得作为跨层正式接口。
-
-目标身份、Recorder State 的允许转移与关闭 ingress 副作用必须在**同一 Recorder 域状态线性化临界区**里联合判定。
-
-Guard 失配时，在**任何** Topic/Task 副作用前返回：
+可由：
 
 ```text
-STALE_RECORDING
-STALE_TOPIC_EPOCH
-INVALID_STATE
+Recorder private event loop
 ```
 
-以及：
+或等价 private helper 实现。
+
+必须满足：
+
+1. Server Control Worker 不是第二个 Recorder 状态机；
+2. Writer 不自行提交 Task/Manifest 终态；
+3. Cleanup 不自行提交 REMOVED；
+4. ROS Executor 不推进 Stop/Rotate/Manifest；
+5. Producer hard gate 只关闭 admission 并发布最小内部事件；
+6. 不持 Recorder 热路径锁等待 Writer/Executor/filesystem；
+7. 无 Server 的单元测试环境中仍完整正确。
+
+## 3.2 Start / Stop / Pause / Resume
+
+### Start
+
+外部 Start API 首先检查 sticky：
 
 ```text
-effects:NONE
+shutdown_requested == false
 ```
 
-不得在业务变更期间持 Coordinator 锁等待 Writer/Executor。
-
-先在域内原子取得：
+若此时已经为 true，直接返回一个已经 Done 的 Completion：
 
 ```text
-正确 Task/Topic Epoch Lease
-状态转移权
+InvalidState / Effects::None
 ```
 
-然后锁外等待子操作真实完成。
+不进入 mutation queue。
 
-Runtime UUID 属于 Runtime/Server 作用域，由 Server 入口 gate 验证。
-
-Recorder 不新增 HTTP UUID 身份类型。
-
-### Start 守卫
-
-Start 没有已有 Task generation 可校验。
-
-Server 校验：
+若提交时尚未 shutdown，则提交到 Recorder 串行 mutation 域。真正线性化时再次检查：
 
 ```text
-expected_runtime_instance_id
+RecorderState == Idle
+shutdown_requested == false
+recording_id valid
+target Task directory absent
+disk admission fresh and safe
+persistence authority not poisoned
 ```
 
-并放入唯一 Control Worker。
+`RecorderState == Idle` 已经隐含当前没有 active Task。
 
-Recorder 在自身状态线性化点联合判断：
+Storage Profile 在 Runtime 启动时一次验证并冻结；Start 只复用已验证结果，不重新读取 YAML。
+
+Start 状态链：
 
 ```text
-Idle
-output_root 无冲突
-recording_id 无冲突
-没有正在初始化 Task
+all pre-side-effect validation
+→ create controlled Task directory
+→ attempt first durable INITIALIZING Manifest
 ```
 
-原子取得启动权并分配新 Task Generation。
+三种边界必须区分：
 
-Start 不得凭之前读取的：
+1. **INITIALIZING durable 前明确失败**：清理尚未形成 durable authority 的临时资源，Recorder 保持 Idle，返回对应 Error/`Effects::None`；
+2. **INITIALIZING durable outcome uncertain**：受控 Task directory 通常已经创建，但第一份 Manifest 是否 durable 不可证明；Recorder 进入 Failed/persistence poison，停止新 Start，返回 StorageError/`Effects::Possible`，等待 Runtime restart + Recovery。该目录不能在当前进程中“清掉重试”；Recovery 下次将其作为 interrupted-start/orphan candidate 检查：能识别 Task identity/Manifest 事实时按介质事实形成 Incomplete/Failed 视图，缺少可信 Manifest 时记录 Recovery finding 并保守保留目录，不自动删除；
+3. **INITIALIZING durable confirmed**：Task 正式存在，`RecorderState::Initializing`，继续 Writer ready / Schema preflight 等 Start 工作。
+
+只有 §2.1 的完整 Start completion boundary 被证明并 durable 写入 `TaskState::Recording` 后，才：
 
 ```text
-status()==Idle
+RecorderState::Initializing -> RecorderState::Recording
+→ maybe_open_ingress()
+→ Start Completion Success
 ```
 
-证明 Idle。
+Initializing 期间 Pause/Resume/Add/Remove 均 `InvalidState / None`。Runtime Shutdown 可直接接管该 Task 的失败/关闭收尾，不要求用户先 Stop。
 
-两个并发 Start 只允许一个取得启动权。
+### Stop
 
-Writer/Manifest 初始化真正完成后才能对外宣称 Recording。
-
-失败保留真实产生的文件与诊断。
-
-`request_id` 和 `operation_id` 不构成 Start 幂等键。
-
-### 1.4 配置生效边界
-
-Recorder 配置分两层：
-
-**RuntimeConfig**
-
-管理：
+Stop 执行时重新验证：
 
 ```text
-Executor
-output_root
-Queue
-Pool
-Writer
+recording_id
+generation
+RecorderState allows Stop
+```
+
+Stop 一旦取得关闭权：
+
+```text
+close Task ingress
+→ RecorderState::Stopping
+```
+
+后续 Pause/Resume：
+
+```text
+InvalidState / Effects::None
+```
+
+Stop 成功：
+
+```text
+all finalization boundaries proven
+→ durable TaskState::Completed
+→ release active Task resources
+→ RecorderState::Idle
+```
+
+Stop 失败：
+
+```text
+Writer Drain/Close failure
+file/directory fsync failure
+Manifest terminal failure
+...
+→ RecorderState::Failed
+```
+
+持久 TaskState 按 §2.1 可证明边界处理，不能在 Manifest 本身失败时伪造 Failed。
+
+外部 Stop 一旦已经进入 Failed，不提供“再次 Stop 以重放 Close/fsync/Manifest 副作用”的恢复路径。Recorder 继续完成已经拥有的安全 terminalization；若最终证明所有 ownership 已安全释放且 persistence authority 可信，可按 Failed → Idle 规则结束。若无法安全收尾，只允许 Runtime Shutdown/进程级重启 + Recovery，不允许用户重复 Stop 绕过失败边界。
+
+### Stop 与 Shutdown
+
+如果 Shutdown 到来时同 generation 的 Stop 已经执行：
+
+- 已在执行的 Stop 继续使用同一 Task finalization 流程；
+- Stop 自己的 Completion 与 Shutdown 的 Completion **相互独立**；
+- Shutdown Completion 还必须等待 Recorder-owned Worker、Resource Monitor 等全部达到安全释放边界；
+- 不创建第二套并行 Task close 流程。
+
+### Pause / Resume
+
+规则见 §2.3。
+
+Stopping / Failed / Idle 上：
+
+```text
+Pause  -> InvalidState / Effects::None
+Resume -> InvalidState / Effects::None
+```
+
+三种状态的语义一致：没有一个可以合法接受新的暂停控制意图。
+
+Task Finalize 时 PauseState 被清空，不持久化成历史 Pause 状态。
+
+## 3.3 操作目标再验证
+
+Stop / Pause / Resume：
+
+```text
+recording_id
+generation
+```
+
+Remove Topic：
+
+```text
+recording_id
+generation
+topic_id
+topic_epoch
+```
+
+都在真正执行时再次验证。
+
+目标再验证顺序固定为：
+
+```text
+1. recording_id / generation
+2. topic_id / topic_epoch（仅 Topic 目标操作）
+```
+
+若第 1 步失败：
+
+```text
+StaleRecording / None
+```
+
+若 recording identity 正确、但第 2 步失败：
+
+```text
+StaleTopicEpoch / None
+```
+
+不能使用通用 `Conflict` 再让 Server 从 message 或当前 State 猜是哪一种 stale。旧请求绝不能作用于新 Task 或新 Topic Epoch。
+
+## 3.4 有界 mutation admission
+
+普通外部 mutation 使用有界队列。
+
+队列满且可证明 Recorder 尚未接管：
+
+```text
+ResourceExhausted / None
+```
+
+安全事件：
+
+```text
+Writer Failure
+Shutdown
+```
+
+必须使用：
+
+```text
+fixed reserved slot
+OR
+separate bounded system-event path
+OR
+equivalent non-droppable mechanism
+```
+
+不能与普通外部操作竞争到完全丢失。
+
+V1 冻结的是“这些安全/结果事件不可丢失”而不是某一种队列布局。允许 reserved slot、独立内部队列、sticky atomic flag + wakeup 等等价实现；代码 review 必须证明容量满和 Shutdown 竞态下仍不会丢事件。这里不为了让文档看起来更具体而冻结一个并无领域语义的队列结构。
+
+同 generation 的：
+
+```text
+Timed Stop
+Disk Safety
+Rolling Rotate
+```
+
+允许合并 pending 标志。
+
+## 3.5 ROS Executor 边界
+
+ROS Executor 负责：
+
+```text
+Topic discovery
+Subscription create/remove
+Subscription callback
+DDS/RMW lifecycle
+```
+
+禁止在 ROS Timer 中同步执行：
+
+```text
+Stop
+Rotate
+Writer Close
+Manifest commit
 Cleanup
-Disk
-Rolling 默认值
-Storage Profile
-QoS Profile
 ```
 
-**EffectiveTaskConfig**
+Subscription create/remove 跨线程时：
 
-是 Start 时形成的不可变任务行为。
+- 尚未开始可以内部安全取消；
+- 已经开始不能 fake Done；
+- 调用数据必须独立拥有生命周期；
+- Runtime Shutdown 必须保持 Executor/Context 可运行直到 Recorder 不再依赖。
 
-mode/duration/segment/retention 由 StartCommand 解析。
-
-Compression/TimestampPolicy 从当前已验证 Runtime Storage Profile 复制。
-
-QoS Default 只在 Add Topic 时参与 Topic Epoch QoS 冻结。
-
-活动任务只允许显式动态 Topic Add/Remove。
-
-磁盘、状态采样等安全参数可以按独立 Runtime 生命周期工作，但不得改变已经冻结的：
+内部实现必须能区分至少：
 
 ```text
-Task Storage
-模式语义
+not started
+started
+finished
+cancelled before start
 ```
 
-recording_id 是安全单层名称，不得包含路径穿越或跨目录引用。
+以证明“只有尚未开始的工作才能安全取消”。这是一条内部生命周期契约，不冻结公开 `ExecutorCallState` 类型或文件名。
 
-**不得覆盖已有录制目录或旧恢复证据。**
-
-失败后遗留任务同样受保护。
-
-输出根目录应规范化并在恢复或写入前由 Runtime 取得独占锁。
-
-库调用宿主需履行等价所有权约束。
-
-# 2. 状态机、Topic 与控制语义
-
-## 2.1 Recorder 状态和操作完成边界
-
-Recorder 稳定状态：
+一旦 native Executor work 已进入 started：
 
 ```text
-Idle
-Recording
-Paused
-Stopping
-Failed
+不能安全撤销
+不能 fake finished
+不能通过切换内部状态让引用提前失效
 ```
 
-Writer 打开、准备新 Segment、等待 Producer 与 Finalize 均是内部阶段。
+若其永久阻塞，相关 Recorder Completion 保持未完成；Shutdown 依赖仍保持存活，最终由 Runtime grace 进入 `UNSAFE_TO_DESTROY`。
 
-未经上层架构/协议评审，不额外引入对外状态。
+不建立公开 `ExecutorCall` API。
 
-Manifest 中的：
+## 3.6 Shutdown
+
+`shutdown()`：
+
+- O(1) 提交；
+- 幂等；
+- 重复调用观察同一个内部 `Completion<void>`；
+- 单向、不可取消。
+
+### sticky admission barrier
+
+第一次调用 `shutdown()` 时，在把 Shutdown 事件交给串行域之前立即原子设置：
 
 ```text
-recording_state
+shutdown_requested = true
 ```
 
-是**历史 Task 的持久化生命周期**，不是当前 Recorder 实例状态的直接序列化。
+该 flag：
 
-V1.0 固定值域：
+- sticky 到 Recorder 析构；
+- 只负责 admission/lifecycle barrier，不是第二个领域状态机；
+- 立即阻止新的 Start/Stop/Pause/Resume/Add/Remove 进入 Recorder mutation queue；
+- 防止“shutdown 已调用但事件尚未出队”的窗口继续接受 Start。
 
-```text
-INITIALIZING
-RECORDING
-FINALIZING
-COMPLETED
-FAILED
-INCOMPLETE
-```
-
-状态关系：
-
-```text
-INITIALIZING → RECORDING → FINALIZING → COMPLETED
-       │            │            └────→ FAILED / INCOMPLETE
-       │            └─────────────────→ FAILED / INCOMPLETE
-       └──────────────────────────────→ FAILED / INCOMPLETE
-```
-
-### INITIALIZING 的精确边界
-
-`INITIALIZING` 不是“Start API 已被调用”。
-
-在以下阶段：
-
-```text
-参数验证
-StartCommand 模式验证
-recording_id 验证
-磁盘安全检查
-output_root ownership 检查
-```
-
-失败时：
-
-```text
-不创建 Task
-不创建 Task directory
-不存在 PersistentTaskState
-```
-
-如果：
-
-```text
-create_directory(task_directory)
-```
-
-失败，同样不存在 durable Task。
-
-任务目录创建成功后，Recorder 内存中的 Task 进入初始化阶段。
-
-但只有**首个包含 `recording_state=INITIALIZING` 的 Manifest 成功 durable 提交**之后，该任务才成为一个可信的 durable Task。
-
-因此存在两个不同情况：
-
-```text
-directory created
-manifest INITIALIZING not durable
-```
-
-此时目录只是：
-
-```text
-orphan / interrupted-start evidence
-```
-
-Recovery 必须保守报告，不能把它自动当成完整 INITIALIZING Task。
-
-一旦 INITIALIZING Manifest durable：
-
-```text
-durable Task exists
-```
-
-之后 Writer Open、Schema Preflight 或必要 Topic 初始化失败，Recorder 应尽力提交：
-
-```text
-INITIALIZING → FAILED
-```
-
-如果 FAILED Manifest 也无法 durable，保留现有目录和原始证据，下一次 Recovery 只能按：
-
-```text
-INCOMPLETE
-或
-Recovery Finding
-```
-
-处理。
-
-不得删除目录后重新使用相同 recording_id 来掩盖失败。
-
-### PersistentTaskState 含义
-
-- `INITIALIZING`：首个 INITIALIZING Manifest 已 durable，但 Writer/必要 Topic 尚未形成可宣称 Recording 的完成边界。
-- `RECORDING`：Task 已成功启动；Runtime `Paused` 仍属于同一持久 Task 的 RECORDING 生命周期。
-- `FINALIZING`：Task 已关闭新准入并进入 Stop/Finalize，尚未完成全部 Writer/Data/Manifest durable 边界。
-- `COMPLETED`：所有要求的 Writer Close、数据/目录同步与 Manifest 终态均完成；历史任务正常完成。
-- `FAILED`：本进程已确认任务发生领域失败并成功持久化失败事实；不等于资源已经安全析构。
-- `INCOMPLETE`：Recovery 对异常终止或无法证明完整完成的旧任务给出的保守持久状态；不会因为 Reader 能打开就自动升级为 COMPLETED。
-
-`RecorderState::Idle` 只表示当前 Recorder 没有活动 Task。
-
-**绝不能**写成某个历史 Task 的：
-
-```text
-recording_state=IDLE
-```
-
-Recovery 发现崩溃前遗留：
-
-```text
-INITIALIZING
-RECORDING
-FINALIZING
-```
-
-只能依据 durable evidence 形成：
-
-```text
-INCOMPLETE
-FAILED
-```
-
-等保守结果。
-
-不能凭最终文件“看起来正常”补造 COMPLETED。
-
-```mermaid
-stateDiagram-v2
-    [*] --> Idle
-    Idle --> Recording: Start / Timed Start 完成
-    Recording --> Paused: User Pause / Disk Protection
-    Paused --> Recording: Resume 安全生效
-    Recording --> Stopping: Stop / Timed 到期
-    Paused --> Stopping: Stop / Timed 到期
-    Stopping --> Idle: Writer Close + Manifest 完成
-    Stopping --> Failed: Finalize 失败
-    Recording --> Failed: Writer / 持久化错误
-    Paused --> Failed: 恢复或收尾失败
-    Failed --> Stopping: 尽可能安全 Stop
-```
-
-| 操作 | 允许条件 | 完成或拒绝的领域语义 |
-|---|---|---|
-| Start | Idle、合法 StartCommand、磁盘安全、StorageProfile 可用、任务目录不存在 | 原子生成 Generation + EffectiveTaskConfig，Writer/Manifest 初始化完成后才开放 ingress；失败不得宣称 Recording |
-| Pause | Recording，或 Paused 且 reasons 中尚无 USER | 原子增加 USER；若本来 Recording 则先关闭 ingress，若已因系统原因 Paused 则保持关闭。已接纳数据不可静默丢弃；已有 USER 时返回 ALREADY_PAUSED/effects:NONE |
-| Resume | Paused，且 reasons 中存在 USER 或 DISK_RECOVERY_PENDING | 先取得新鲜磁盘安全样本；移除 USER，并在磁盘已安全且稳定期满足时移除 DISK_RECOVERY_PENDING。活动 DISK_CRITICAL/DISK_UNKNOWN 绝不由 Resume 清除。若清理后 reasons 为空且未进入 Timed deadline/Stopping/Failed，开放 ingress 并成功；若本次确实移除了 USER/PENDING 但仍有活动系统危险原因，返回对应 DISK_FULL/DISK_STATE_UNKNOWN 且 effects:CONFIRMED_PARTIAL |
-| Stop | Recording/Paused/可安全收尾的 Failed | 禁止新接入、在途 Producer 屏障、排空/故障诊断、Writer 关闭、持久化终态；反复 Stop 不得重放危险副作用 |
-| Add/Remove Topic | Recording/Paused 且实例状态允许 | Topic 终态成功依据订阅实际状态与持久化证据，不能以 PREPARED 代替 |
-| Status/Discover/History | 存活期 | 不改变录制状态、存储事实或清理意图 |
-| Shutdown | 存活期任意可安全进入的状态 | 幂等并等待受管理线程；不得先终止必需 Executor 再等待其回调 |
-
-### PauseReasons
-
-暂停归因使用集合/位掩码：
-
-```text
-USER
-DISK_CRITICAL
-DISK_UNKNOWN
-DISK_RECOVERY_PENDING
-```
-
-RecorderStatus 对外始终转为：
-
-```text
-paused_reasons[]
-```
-
-没有原因时为空数组。
-
-不存在会覆盖其他原因的单一标量。
-
-规则：
-
-- 外部 Pause 在 reasons 尚无 USER 时增加 USER。
-- Recording 状态先关闭 ingress。
-- 系统原因已使任务 Paused 时只增加归因，不重复执行关闭动作。
-- 已有 USER 的重复 Pause 明确拒绝且无副作用。
-- Disk CRITICAL/UNKNOWN 分别表示当前仍生效的危险条件。
-- 用户 Resume 不能清除活动 DISK_CRITICAL/DISK_UNKNOWN。
-- 当磁盘重新达到安全阈值并持续 `resume_stable_sec`：
-  - `auto_resume=true`：Sequencer 移除已解除的系统原因；
-  - `auto_resume=false`：替换为 `DISK_RECOVERY_PENDING`。
-- Resume 可移除 USER/PENDING，但只有所有禁止条件解除后才重新开放 ingress。
-- 若用户意图已成功移除但系统保护仍在，返回：
-  ```text
-  effects:CONFIRMED_PARTIAL
-  ```
-- Failed/Stopping 收尾可清空集合，但绝不触发恢复。
-
-### 状态转移线性化与竞态矩阵
-
-**线性化点是“何时对其他线程生效”，不一定等于“所有文件已持久化”。**
-
-| 操作 | 对并发线程生效的状态点 | 完成返回前必须完成 | 失败后允许看到 |
-|---|---|---|---|
-| Start | 新任务代际、Writer 和订阅准备后才开放 ingress | 初始化 Writer、合法任务记录、必要 Topic 准备、磁盘安全复核 | Idle 或 Failed + 安全保留，不能假装 Recording |
-| Pause | 在 Topic 回调开始新消息准入之前关闭 ingress | 记录 Pause 原因；已接纳消息仍可写完 | Recording/Paused/Failed |
-| Resume | 校验 USER/SYSTEM Pause 归因与磁盘后才开放 ingress | 确认 Writer 和 Topic 恢复条件 | Paused/Failed |
-| Stop | 一次性将 active Task 标识为关闭 ingress / Stopping | Producer Barrier、Queue/Writer Drain、Close/Manifest 终态 | Stopping/Failed |
-| Add | 原任务 Topic 集合保留 ADDING/ARMED 的新 Epoch | Writer 注册、Subscription 有效、TOPIC_ADDED durable、随后按 Task gate 决定 Topic gate | FAILED/已关闭 ingress/UNCERTAIN Event |
-| Remove | 对选定 Epoch 标记 REMOVING 并阻止新接入 | 在途 Producer Drain、订阅释放、TOPIC_REMOVED durable | REMOVING/FAILED |
-| Timed Stop | steady 截止点使停止条件成立 | 同 Stop，且与手动 Stop 合并为一次收尾 | Stopping/Failed |
-| 磁盘保护 | coherent Disk snapshot 证明 CRITICAL/UNKNOWN 或 safe sample freshness 已过期 | 关闭 ingress 与归因；必要时安全收尾 | Paused/Failed |
-
-### 竞态优先级
-
-- Stop 对同一任务是**终结性请求**。
-- Timed Stop 与手动 Stop 同时发生，只允许一个 Finalize owner。
-- 外部 Pause 与磁盘 CRITICAL 同时发生，同时保存 USER 与 SYSTEM 原因。
-- Remove Topic 与 Stop 重叠时，不能提前析构 TopicRuntime。
-- Add Topic 与 Rolling 边界重叠时，由 Sequencer 决定目标 Segment/Writer 注册顺序。
-- Writer 出错后，普通 Resume 或自动磁盘恢复不得使 Failed 进入 Recording。
-- Shutdown 优先关闭新的外部 mutation admission。
-
-### Topic 操作持久化顺序
-
-```text
-TOPIC_*_PREPARED
-必须早于不可逆/不易回滚副作用
-
-TOPIC_ADDED / TOPIC_REMOVED
-必须晚于对应原生动作完成
-```
-
-并进一步规定：
-
-> **TOPIC_ADDED durable 成功之前，该新 Topic Epoch 的 ingress gate 必须保持 CLOSED。**
-
-因此 Add 的数据接入不会发生在：
-
-```text
-Writer 已注册
-Subscription 已创建
-但 TOPIC_ADDED 仍未 durable
-```
-
-这一不确定窗口。
-
-这比“先开 ingress、再写终态 Event”更容易建立恢复与证据边界。
-
-若 TOPIC_ADDED durable 成功后进程立即崩溃，但尚未来得及打开 Topic gate，历史仍可以确认：
-
-> Add 领域操作已经 durable 成功。
-
-它不保证在崩溃前一定收到过消息。
-
-### 时间域
-
-V1.0 固定三个时钟边界：
-
-- `std::chrono::steady_clock`：Timed/Rolling deadline、Resume stable、retention、freshness、retry；
-- `std::chrono::system_clock`：Recorder RECEIVE Unix timestamp、History 展示/筛选；
-- ROS Clock/Header.stamp：**不参与 V1.0 Recorder receive timestamp 或安全 deadline**。
-
-不同时间域不能直接比较。
-
-系统墙钟跳变可以影响历史展示，但不得改变：
-
-```text
-Timed
-Rolling
-Retention
-Disk freshness
-```
-
-等进程内安全判定。
-
-### 2.1.1 内部定时控制不得占用 ROS Executor 等待域
-
-Timer/安全回调不能直接执行可能等待：
-
-```text
-Writer
-Producer
-Executor
-```
-
-的领域动作。
-
-默认单 ROS Executor Worker 时，这样做可能造成自等待。
-
-V1.0 只允许 Timer 做：
-
-```text
-O(1) trigger
-+
-必要的无阻塞安全 Gate
-```
-
-真正控制动作由 RecorderControlSequencer 串行执行。
-
-可使用一个 C++17 受管线程及有界事件队列实现。
-
-Executor wall timer 只做：
-
-```text
-steady deadline
-→ event kind + TaskGeneration
-```
-
-投递。
-
-不执行：
-
-```text
-fsync
-Writer close
-Subscription Drain
-condition_variable wait
-```
-
-同一 TaskGeneration 的重复：
-
-```text
-TimedStop
-RollingRotate
-DiskSafety
-```
-
-允许 coalesce。
-
-STOP/SHUTDOWN 与安全事件优先于普通 Rotate。
-
-### Timed hard admission
-
-Timed Task 的 `TaskIngressState` 保存不可变：
-
-```text
-steady deadline
-```
-
-每个 Producer 在同一个准入协议中检查：
-
-```text
-Task/Topic identity
-accepting
-now < deadline
-```
-
-一旦：
-
-```text
-now >= deadline
-```
-
-该 Producer：
-
-1. 拒绝当前准入；
-2. 原子关闭当前 Task accepting gate；
-3. 提交/合并 `TimedStop(generation)`。
-
-因此：
-
-> Timer 只是提前触发器，不承担截止正确性。
-
-截止前已取得 ProducerToken 的消息仍可以完成 enqueue/write。
-
-### Disk hard admission
-
-ResourceMonitor 发布的 `DiskAdmissionState` 包含：
-
-```text
-state
-valid_until
-```
-
-Producer 必须使用 §3.3.1 定义的**版本化 coherent snapshot**。
-
-只有 coherent snapshot 满足：
-
-```text
-state == NORMAL or WARNING
-且
-now <= valid_until
-```
-
-才允许继续。
-
-以下两种情况含义不同：
-
-#### 真实磁盘不安全
-
-coherent snapshot 明确为：
-
-```text
-CRITICAL
-UNKNOWN
-```
-
-或 coherent safe sample：
-
-```text
-now > valid_until
-```
-
-这表示 Recorder 已经获得了**磁盘安全事实**。
-
-此时 Producer 可以：
-
-```text
-拒绝当前消息
-关闭 Task accepting
-提交/合并 DiskSafety
-```
-
-#### Snapshot 发布竞争
-
-如果只因为：
-
-```text
-sequence odd
-或
-前后 sequence 不一致
-```
-
-导致 bounded coherent read 没有成功，这只表示：
-
-> Producer 恰好撞上了一个很短的 DiskAdmission 发布临界区。
-
-它**不等价于磁盘状态 UNKNOWN**。
-
-此时：
-
-```text
-只拒绝当前这条消息
-增加 dropped_disk_snapshot_busy
-增加 disk_admission_snapshot_busy
-```
-
-不得：
-
-```text
-关闭整个 Task accepting
-写入 PauseReason::kDiskUnknown
-提交 DiskSafety(UNKNOWN)
-```
-
-下一条 Producer 重新读取。
-
-禁止使用：
-
-```text
-retry_failed > 某个魔数
-```
-
-自动把同步竞争升级成磁盘安全状态。
-
-真正的 DiskSafety UNKNOWN 只能来自：
-
-```text
-coherent state == UNKNOWN
-或
-coherent sample freshness 已过期
-```
-
-ResourceMonitor 的 `statvfs()` 和所有慢计算必须在 snapshot publish 临界区**之外**完成。
-
-Odd sequence 只允许覆盖几次 atomic store。
-
-### Rolling
-
-Rolling 的 `segment_duration` 是目标轮转周期，不是硬 Stop admission deadline。
-
-到期仅提交 Rotate。
-
-若 Sequencer 正在处理更高优先级控制，当前 Segment 可以安全延长。
-
-Rotate 完成：
-
-```text
-Close old
-Open/Register new
-Snapshot Replay
-```
-
-之后不得直接：
-
-```text
-accepting=true
-```
-
-必须调用统一：
-
-```text
-maybe_open_ingress()
-```
-
-### maybe_open_ingress() 的正式语义
-
-V1.0 将 ingress 分成两层：
-
-```text
-Task Gate
-Topic Gate
-```
-
-`maybe_open_ingress()` 先决定 Task 是否允许接受消息，再逐 Topic 决定该 Topic Epoch 是否开放。
-
-Task-level 条件等价于：
+伪代码：
 
 ```cpp
-bool task_can_accept =
-    recorder_state == RecorderState::kRecording &&
-    pause_reasons.empty() &&
-    !stop_claimed &&
-    !shutdown_claimed &&
-    !writer_failed &&
-    !task_failed &&
-    !timed_deadline_expired &&
-    writer_ready &&
-    disk_snapshot_is_coherent &&
-    disk_snapshot_is_safe &&
-    disk_snapshot_is_fresh;
+Completion<void> Recorder::shutdown() {
+    if (!shutdown_requested_.exchange(true)) {
+        publish_non_droppable_shutdown_event();
+    }
+    return shared_shutdown_completion_;
+}
 ```
 
-任一条件不满足：
+第一次 Shutdown 事件被串行域领取后：
 
 ```text
-Task accepting = false
+close current Task ingress if any
+→ merge/own current Task finalization
+→ stop Topic/Writer/Pool
+→ request Cleanup stop
+→ request Resource Monitor stop
+→ wait real finished
+→ join only already-finished threads
+→ Completion Done(Success)
 ```
 
-且不得通过某个 Topic 的局部状态绕过。
+### Shutdown Done 的唯一含义
 
-当 Task 可以接受时，Topic 根据自身生命周期处理：
+`Completion<void>::result()` 类型为：
 
-| Topic 状态 | 行为 |
-|---|---|
-| ACTIVE | Topic gate 可以 OPEN |
-| ARMED | 仅在 Resume/Task reopen 的受控路径中转为 ACTIVE，然后 OPEN |
-| ADDING | gate CLOSED；不阻塞其他 ACTIVE Topic |
-| REMOVING | gate CLOSED；不阻塞其他 ACTIVE Topic |
-| REMOVED | gate CLOSED |
-| FAILED | gate CLOSED；普通 Topic-local failure 不阻塞其他 ACTIVE Topic |
-| ABSENT | 无 gate |
+```cpp
+std::optional<Result<void, Error>>
+```
 
-如果失败属于：
+但 V1 Shutdown 契约故意收敛为：
 
 ```text
-Writer-wide
-Task-wide
-Generation violation
-Schema/Storage fatal
+Done + Success
+→ Recorder 已完全 quiescent
+→ 所有析构前必须终结的 worker/native ownership 已安全结束
+→ 可以正常释放 Recorder 与 Runtime 依赖
 ```
 
-则它不是 Topic-local failure，必须关闭整个 Task gate。
-
-`maybe_open_ingress()` 返回结果应至少能够诊断首个阻止开放的 Task-level 原因：
+Task 自身 Finalize 可以失败：
 
 ```text
-Paused
-TimedExpired
-DiskUnsafe
-DiskSnapshotBusy
-Stopping
-Shutdown
-WriterFailure
-TaskFailure
-WriterNotReady
+Task durable Failed / future Recovery Incomplete
 ```
 
-但诊断优先级不能改变真实状态集合。
+只要 Recorder 最终仍安全 quiescent，Shutdown Completion **仍为 Success**；Task failure 记录在 Task/Manifest/结构化日志，而不是把“业务 Task 失败”重新包装成 Shutdown Failure。
 
-`DiskSnapshotBusy` 在 reopen 路径只表示：
+Shutdown 期间出现但不阻止安全 quiescence 的诊断问题，例如 Cleanup warning threshold、Resource Monitor 最后一次采样失败、已被降级记录的 secondary diagnostic，只写入结构化日志/State/Task diagnostic；它们**不改变** Shutdown Completion 的 Success。只有“仍有 owner/native work 无法安全结束”才阻止 Done。
 
-> 当前无法证明可安全开放。
-
-因此保持 gate CLOSED，等待下一次 ResourceMonitor publish、Resume 或 Sequencer reevaluation。
-
-它**不得**把 Task 状态改为 Disk UNKNOWN。
-
-### rotation_lag
-
-Rotate pending：
+如果 Recorder 无法安全满足 shutdown contract，例如 started Writer/Executor/Cleanup/native work 永久阻塞：
 
 ```text
-rotation_lag =
-max(0, now_steady - intended_window_deadline)
+Shutdown Completion remains unfinished
 ```
 
-完成后冻结：
+V1 不使用常规 `Done + Error` 作为 Shutdown 的第三条路径。Runtime grace 到期后进入 `UNSAFE_TO_DESTROY`。
+
+### Shutdown 期间 `state()`
+
+只要 Recorder 对象仍存活，`state()` 继续可读。
+
+`shutting_down` 与 RecorderState 正交：
+
+- `shutdown_requested=true` 后立即 `shutting_down=true`；
+- Initializing Task 被 Shutdown 接管时，可先观察 Initializing，随后进入 Failed/Stopping 取决于能否建立安全 finalization 边界；
+- 有活动 Task 正在 Finalize：`RecorderState::Stopping`；
+- Task Finalize 已失败并在安全收尾：`RecorderState::Failed`；
+- 已无活动 Task但仍等待 Recorder worker 收尾：`RecorderState::Idle`、`shutting_down=true`；
+- Shutdown Done 后 Runtime 尚未析构 Recorder：`Idle + shutting_down=true + current Task none`。
+
+### UNSAFE_TO_DESTROY
+
+若：
 
 ```text
-max(
-  0,
-  rotate_completed_steady
-  - intended_window_deadline
-)
+Writer I/O
+ROS Executor started work
+Cleanup remove_all()
+statvfs()
 ```
 
-它是调度诊断，不把 `segment_duration` 宣传为物理文件严格最大时长。
-
-### 2.1.2 ROS Executor Bridge
-
-动态 Subscription create/remove 如果需要 ROS Executor 上下文，使用 heap-owned：
+等已开始且不可安全中断的工作永久阻塞：
 
 ```text
-ExecutorCallState
+Shutdown Completion remains unfinished
+Runtime deadline expires
+→ UNSAFE_TO_DESTROY
 ```
 
-状态：
+禁止：
 
 ```text
-PENDING
-STARTED
-DONE
-CANCELLED_NOT_STARTED
+fake Done
+detach
+destroy referenced objects
+shutdown ROS Context too early
+release output_root lock too early
 ```
 
-规则：
+## 3.7 Worker 结果与 Recorder 串行域
 
-1. Executor 回调首先 CAS：
-   ```text
-   PENDING → STARTED
-   ```
-2. Sequencer 等待预算到期只能尝试：
-   ```text
-   PENDING → CANCELLED_NOT_STARTED
-   ```
-3. 若 CAS 失败说明已经 STARTED，不允许释放相关 Task/Topic Lease。
-4. `clear_task()` 必须有明确 Completion。
-5. 回调只捕获拥有自身生命周期的数据。
+### Writer
 
-`ExecutorCallState` 与 `RecorderControlHandle` 是不同层级。
+Writer Thread 完成控制工作或需要上报错误时，生成有界 `WriterResult` 内部事件。
 
-一个 ControlRequest 可包含多个 ExecutorCallState。
-
-ControlHandle 只有在所有影响其完成边界的原生子操作：
+Recorder 串行域领取后重新核对：
 
 ```text
-DONE
-或
-CANCELLED_NOT_STARTED
+generation
+segment_id
+current Task / Segment state
 ```
 
-后才能进入 DONE。
+再推进 Rotate、Close、Failure 等领域状态。
 
-## 2.2 发现、类型和 QoS
+Writer 不直接修改 Manifest TaskState。
 
-可用 Topic 查询不是 Add Topic 的副作用。
+### Cleanup
 
-发现接口至少提供：
+Cleanup 是 Recorder-owned 独立单线程 worker。
+
+流程：
 
 ```text
-名称
-已观测类型集合
-发布端数量
-端点/QoS 元数据
-查询状态
-失败诊断
+Recorder durable DELETING
+→ Cleanup receives DeleteWork
+→ filesystem delete
+→ Cleanup produces CleanupResult
+→ Recorder internal event path
+→ serial mutation domain revalidates current Manifest
+→ DELETING -> REMOVED or idempotent/conflict branch
 ```
 
-Graph 当前未发现不等于 Topic 永不存在。
+`remove_all()` 未返回前 CleanupResult 不存在。Cleanup Thread 阻塞不会阻塞 Recorder 串行域继续处理其他独立事件，但 Shutdown 若必须等它安全退出，则 Shutdown Completion 保持未完成。
 
-仅在 Graph 可见但 Publisher 数量为零时报告：
+Cleanup worker 不增加 heartbeat/watchdog。worker 在开始 delete 时记录 `active_since`；超过 `cleanup.warning_sec` 只产生诊断 warning/State 指标。Shutdown 必须等待 Cleanup 退出，是因为它仍可能持有 Recorder-owned DeleteWork/路径身份并正在修改文件系统；在其 native 调用返回前析构 worker、Task path authority 或 output_root ownership 都不安全。 Cleanup 可能持有的资源包括 DeleteWork 中的 recording_id/segment_id/path identity、删除目标路径的生命周期引用、当前 native filesystem call 栈以及完成结果投递所需的 Recorder-owned channel/queue ownership；因此不能在其阻塞时销毁 Recorder、释放 output_root lock 或复用同一路径建立新 authority。
+
+### ROS Executor
+
+Subscription create/remove 的结果同样作为内部结果回到 Recorder 串行域；Executor callback 本身不提交 Topic terminal Event。
+
+# 4. Topic 与消息数据路径
+
+## 4.1 Topic discovery、identity 与 QoS
+
+### Topic identity
+
+一个运行期 Topic Epoch：
 
 ```text
-可见
-无发布者
+generation
+topic_id
+topic_epoch
 ```
 
-没有频率采样时：
+唯一标识。
+
+同名 Topic Remove 后再 Add：
 
 ```text
-actual_hz = unknown
+new topic_epoch
 ```
 
-不能伪造为 0。
+### Discovery
 
-添加前校验：
+Discovery：
 
-```text
-绝对 Topic 名
-ROS 类型字符串
-同名唯一类型
-```
-
-多个已发现类型时拒绝自动选取。
-
-GenericSubscription 依赖运行环境可用类型支持。
-
-类型支持缺失返回明确错误。
+- 返回 `DiscoveredTopic`，不返回已 Add 的 `TopicInfo`；
+- 有明确 timeout；
+- 有最大返回数量 `topics.discovery_max_results`，默认 4096；
+- 每个结果中的 endpoint QoS profile 数受 `topics.discovery_max_endpoint_profiles`（默认 64）限制；一次 discovery 的 endpoint profile 最坏总量因此由 `discovery_max_results * discovery_max_endpoint_profiles` 严格有界，默认最多 262144 个 profile；实现必须使用 overflow-safe checked multiplication/容量检查，不能因配置乘法溢出形成无界分配；
+- 不在 `state()` 中同步执行完整 Graph discovery。
 
 ### QoS 白名单
 
-V1.0 只支持：
+V1.0 仅支持：
 
-```text
-reliability
-durability
-history
-depth
-```
+| 字段 | 允许值 |
+|---|---|
+| reliability | `RELIABLE`, `BEST_EFFORT` |
+| durability | `VOLATILE`, `TRANSIENT_LOCAL` |
+| history | `KEEP_LAST`, `KEEP_ALL` |
+| depth | `KEEP_LAST: 1..10000`；KEEP_ALL 时 `depth` 必须缺省/nullopt |
 
 未支持字段不得静默忽略。
 
-`reliability`：
-
-```text
-RELIABLE
-BEST_EFFORT
-```
-
-`durability`：
-
-```text
-VOLATILE
-TRANSIENT_LOCAL
-```
-
-`history`：
-
-```text
-KEEP_LAST
-KEEP_ALL
-```
-
-KEEP_LAST：
-
-```text
-depth 1..10000
-```
-
-RepeatPolicy：
-
-```text
-enabled=false
-→ max 字段无意义
-
-enabled=true
-→ max_messages 1..65536
-→ max_bytes    1..16777216
-```
-
-还受 Snapshot 全局预算。
-
-选取优先级：
+选择优先级：
 
 ```text
 explicit user QoS
 >
-Publisher compatible set
+publisher compatible set
 >
 validated runtime default
 ```
 
-QoS 在 Topic Epoch 创建时冻结。
+Topic Epoch 创建后 QoS 冻结。
 
-Publisher 集合后续变化仅影响诊断，不偷偷修改已创建 Subscription QoS。
+显式用户 QoS 只要属于白名单且字段组合合法，就作为用户意图接受；即使当前已发现 Publisher 与之不兼容，也不把它重分类为 `UnsupportedQos`。Recorder 只在当前 `TopicState` 中暴露 Publisher visibility / QoS compatibility 等动态诊断；`TopicInfo` 保持冻结事实。用户可以选择等待未来 Publisher。`UnsupportedQos` 只表示输入不在 V1.0 支持范围或字段组合非法。
 
-### Type Hash 与 Schema
+Publisher 后续变化只影响诊断，不偷偷修改 Subscription QoS。
 
-类型名不同：
+Auto 模式不因为“当前 Publisher 之间不存在一个 QoS 能同时与全部 endpoint 兼容”而返回 `UnsupportedQos`。V1 Auto selection 固定为：
 
-```text
-TYPE_CONFLICT
-```
+1. 枚举 V1 白名单内可构造的有限 candidate；
+2. 计算每个 candidate 与当前已观察 Publisher endpoint 的兼容数量；
+3. 优先选择兼容 endpoint 数最多的 candidate；
+4. 并列时优先选择 Runtime validated default；
+5. 仍并列时按稳定枚举顺序选择，保证相同 Graph snapshot 得到相同结果。
 
-双方 hash 可比且相等：
-
-```text
-允许继续
-```
-
-双方 hash 可比但不同：
+V1.0 的稳定 candidate tuple 顺序固定为：
 
 ```text
-TYPE_CONFLICT
+reliability: Reliable < BestEffort
+durability:  TransientLocal < Volatile
+history:     KeepLast < KeepAll
+depth:       KeepLast 时按数值升序
 ```
 
-hash 不可取得：
+Runtime default 的并列优先级高于上述 tuple 顺序；tuple 只负责最后的确定性 tie-break，不代表 QoS 质量高低。
+
+如果最佳 candidate 仍不能覆盖全部 Publisher：
 
 ```text
-保留 Unknown Hash
-继续 Schema 验证
+DiscoveredTopic.recordability = QosIncompatible
+Add 仍可继续尝试
+TopicState.qos_compatible = false
 ```
 
-无法构造完整类型支持/Schema：
+这是明确的“部分 Publisher 当前可能收不到”诊断，不允许静默宣称全部兼容；用户显式 QoS 则始终优先于 Auto。
+
+不支持：
 
 ```text
-TYPE_SUPPORT_UNAVAILABLE
-SCHEMA_UNAVAILABLE
+UnsupportedQos / None
 ```
 
-不得降级为只保存类型名。
+### Type / Schema 前置检查
 
-## 2.3 Topic 身份和生命周期
-
-每条录制消息携带：
+Type support 不可用：
 
 ```text
-(recording_generation, topic_id, topic_epoch)
+TypeUnavailable / None
 ```
 
-`recording_generation`：
+无法生成完整 Schema：
 
 ```text
-区分连续 Task
+SchemaUnavailable / None
 ```
 
-`topic_id`：
+同名 Topic storage identity / frozen type-signature 冲突：
 
 ```text
-任务内逻辑 Topic
+TopicTypeConflict / None
 ```
 
-`topic_epoch`：
+## 4.2 Add Topic
+
+### 正常时序
+
+```mermaid
+sequenceDiagram
+    participant R as Recorder
+    participant E as Topic Events
+    participant W as Writer
+    participant X as ROS Executor
+
+    R->>E: ADD_PREPARED + fsync
+    E-->>R: durable
+    R->>W: Register Schema/Channel
+    W-->>R: success
+    R->>X: Create Subscription (gate CLOSED)
+    X-->>R: success
+    R->>E: TOPIC_ADDED + fsync
+    E-->>R: durable
+    R->>R: ACTIVE / ARMED
+```
+
+核心保证：
+
+> TOPIC_ADDED durable 之前，该 Epoch 的 Live gate 必须 CLOSED。
+
+### Writer register 成功，Subscription create 失败
+
+V1.0 明确：
 
 ```text
-同名 Topic 的订阅世代
+不回滚已经注册到当前 Segment 的 Writer Channel
 ```
 
-同名重添加可以复用 topic_id，但必须分配新的 topic_epoch。
+原因：
 
-### TopicStorageSignature
+- rosbag2/MCAP metadata rollback 不属于已证明安全能力；
+- “回滚”可能制造比保留空 Channel 更复杂的状态。
 
-同一 recording task 内，同名 Topic 的 StorageSignature 不可变化：
+处理：
 
 ```text
-normalized_type
-serialization_format
-schema_encoding
-schema_sha256
+gate remains CLOSED
+→ append ADD_FAILED
+→ if ADD_FAILED durable
+   → Completion Failure / ConfirmedPartial
+→ if failure Event commit uncertain
+   → EventCommitFailed / Possible
 ```
 
-第一次通过 Schema preflight 的 Add 建立绑定。
+已注册但没有消息的空 Channel 允许保留在当前 Segment。
 
-之后同名重添加必须完全相同。
 
-类型、encoding 或 Schema SHA 改变：
+
+### PREPARED durable barrier
+
+`ADD_PREPARED` 是进入 Writer Register 的硬 barrier。
+
+如果 append/fsync：
 
 ```text
-TYPE_CONFLICT
-或
-SCHEMA_UNAVAILABLE
+明确失败
+OR
+返回结果不足以证明 durable
 ```
 
-并且必须在：
+则：
 
 ```text
-Writer 新注册
-Subscription 创建
-TOPIC_ADD_PREPARED
+EventCommitFailed / Effects::Possible
+→ 设置 Topic Event uncertainty watermark（按 §6.3）
+→ 不进入 Writer register
+→ 不创建 Subscription
+→ gate 始终 CLOSED
 ```
 
-之前拒绝。
+之所以是 `Possible`，是因为一次 write/fsync 失败并不能普遍证明介质上绝对没有留下 PREPARED 字节。
 
-V1 不自动切 Segment 来允许换类型。
-
-需要换类型：
+一旦因此设置 Topic Event uncertainty watermark，**当前 Task 的所有新的外部 Add/Remove 都被 fail-safe 禁止**。V1 不提供在线清除 watermark 或“重试同一 Topic mutation”的 repair 通道。用户路径固定为：
 
 ```text
-Stop current task
-Start new task
+State / read-only evidence query remains available
+→ Stop current Task
+→ start a new Task after safe terminalization / Recovery as required
+→ retry with a new operation_id
 ```
 
-### Schema SHA
+这是有意的 fail-safe，而不是遗漏的重试能力。
 
-`schema_sha256` 对 Resolver 最终冻结、用于 Writer 的 encoded definition bytes 计算。
+### TOPIC_ADDED 后 gate
 
-只允许：
+`TOPIC_ADDED` durable 成功后立即建立该 Epoch 的运行态：
 
 ```text
-CRLF/CR → LF
+Task Gate allows ingress
+→ Topic = ACTIVE
+→ Topic gate OPEN
+
+Task Gate currently closed（例如 User/Disk Pause）
+→ Topic = ARMED
+→ Topic gate CLOSED
 ```
 
-这样的确定换行规范化。
+Topic 状态转换与 gate 是否开放都由 Recorder 串行域在 durable TOPIC_ADDED 后决定。
 
-不得：
+## 4.3 Remove Topic
+
+```mermaid
+sequenceDiagram
+    participant R as Recorder
+    participant E as Topic Events
+    participant P as Producer
+    participant X as ROS Executor
+
+    R->>E: REMOVE_PREPARED + fsync
+    E-->>R: durable
+    R->>R: close Topic gate
+    R->>P: wait producer barrier
+    P-->>R: drained
+    R->>X: detach Subscription
+    X-->>R: done
+    R->>E: TOPIC_REMOVED + fsync
+    E-->>R: durable
+    R->>R: mark removed
+```
+
+仅从 map erase Topic 不能代表 Remove 完成。
+
+旧 Epoch 已经进入 Queue 的消息可以按 Writer drain 规则继续消费。
+
+
+
+### REMOVE_PREPARED durable barrier
+
+`REMOVE_PREPARED` 是关闭 Topic gate / detach Subscription 的 hard barrier。
+
+如果其 append/fsync 结果不能证明 durable：
 
 ```text
-删除注释
-字段排序
-依赖排序
-语义重写
+EventCommitFailed / Effects::Possible
+→ 设置 Topic Event uncertainty watermark
+→ 不关闭 Topic gate
+→ 不进入 producer barrier
+→ 不 detach Subscription
 ```
 
-### Topic 生命周期
+这样避免出现“已经移除运行期 Topic，但 durable Event chain 连 PREPARED 都无法证明”的不可解释状态。
 
-```text
-ABSENT
-  ↓
-ADDING
-  ↓
-ACTIVE
-  ↓
-REMOVING
-  ↓
-REMOVED
+设置 watermark 后该 Topic 继续保持原运行态（这里仍 ACTIVE/原 gate），但新的外部 Add/Remove 全部被拒绝；只允许 Stop/Shutdown 和只读查询，用户必须结束当前 Task 后在新 Task 重试。
 
-Paused Add:
-ADDING → ARMED → ACTIVE
-```
-
-FAILED 可以从 ADDING/ACTIVE/REMOVING 的失败路径进入。
-
-### Add Topic 正式顺序
-
-1. 验证参数、Task Guard、Topic 容量与 StorageSignature。
-2. 分配：
-   ```text
-   topic_id
-   topic_epoch
-   ```
-3. durable：
-   ```text
-   TOPIC_ADD_PREPARED
-   ```
-4. Writer Thread 注册：
-   ```text
-   TopicMetadata
-   frozen Schema
-   ```
-   Topic gate 仍 CLOSED。
-5. 通过 ExecutorCall 创建 GenericSubscription。
-6. ExecutorCall 真实 DONE，Subscription 有效后，**Topic gate 仍保持 CLOSED**。
-7. durable：
-   ```text
-   TOPIC_ADDED
-   ```
-8. 终态 Event durable 后：
-   - 若 Task 当前 Recording 且 `maybe_open_ingress()` 允许：
-     ```text
-     Topic → ACTIVE
-     gate OPEN
-     ```
-   - 若 Task 当前 Paused：
-     ```text
-     Topic → ARMED
-     gate CLOSED
-     ```
-9. 返回 Add success。
-
-这样：
-
-```text
-TOPIC_ADDED durable
-```
-
-总是早于该新 Epoch 的第一条可接纳消息。
-
-如果 Writer 注册成功而 Subscription 创建失败：
-
-```text
-不做不安全的 Writer metadata 回滚
-TOPIC_ADD_FAILED durable
-gate CLOSED
-```
-
-如果 Subscription 创建成功但 TOPIC_ADDED durable 失败：
-
-```text
-关闭/保持 gate CLOSED
-进入 event persistence failure 处理
-不得返回成功
-```
-
-### Remove Topic
-
-1. durable：
-   ```text
-   TOPIC_REMOVE_PREPARED
-   ```
-2. 标记：
-   ```text
-   REMOVING
-   ```
-3. gate CLOSED。
-4. 等待该 Epoch Producer Drain。
-5. ExecutorCall 移除 GenericSubscription。
-6. STARTED ExecutorCall 必须真实完成。
-7. 旧 Epoch 已入 Queue 的消息允许继续写完。
-8. 清除该 Epoch Snapshot。
-9. durable：
-   ```text
-   TOPIC_REMOVED
-   ```
-10. 状态：
-   ```text
-   REMOVED
-   ```
-11. 返回 success。
-
-### Executor 与动态订阅
-
-资源分三层：
-
-```text
-TopicRuntime 强所有权
-Executor CallbackGroup/Node 关系
-RMW/DDS WaitSet/Reader
-```
-
-销毁顺序：
-
-```text
-关闭 Topic gate
-→ Producer Drain
-→ Executor detach
-→ Writer consume old Epoch
-→ release TopicRuntime
-```
-
-不能：
-
-```text
-TopicMap.erase()
-```
-
-后就认为 DDS Reader 已经销毁。
-
-### Executor 默认配置
-
-V1.0 默认：
-
-```text
-executor.thread_count=1
-```
-
-是保守生命周期选择。
-
-必须在标准负载验证单 Worker。
-
-如果性能不够：
-
-1. 优先优化回调/Queue 路径；
-2. 再评审多 Executor Worker；
-3. 多 Worker 必须重新证明 Humble/Fast DDS 动态 Add/Remove 生命周期安全。
-
-不能自行降低 requirements。
-
-### 2.3.1 Topic Event 来源
-
-`operation_id` 只标识外部调用方主动的一次逻辑变更。
-
-新的逻辑重试使用新的 UUID。
-
-UNKNOWN 后重试不能复用旧 UUID 期待自动去重。
-
-来源：
-
-| 来源 | origin | operation_id | cause |
-|---|---|---|---|
-| 外部 Add/Remove | EXTERNAL | UUID | CLIENT_REQUEST |
-| Stop/Shutdown 自动解绑 | INTERNAL | null | TASK_STOP / RUNTIME_SHUTDOWN |
-| Writer/Recovery 收尾 | INTERNAL | null | WRITER_FAILURE / RECOVERY |
-
-`lookup_topic_operation()` 只聚合：
-
-```text
-origin=EXTERNAL
-operation_id exact match
-```
-
-V1.0 不提供完整：
-
-```text
-query_topic_history
-```
-
-Status 只保留有限最近移除实例。
-
-完整原始 Topic Event 日志属于受保护离线证据。
-
-## 2.4 控制证据与 UNKNOWN
-
-`topic_events.jsonl` 保存：
-
-```text
-operation_id
-recording_id
-Topic ID/Epoch
-Event state
-```
-
-只有 Topic Add/Remove 具备本协议定义的持久化 operation evidence。
-
-确认成功必须同时满足：
-
-```text
-请求身份唯一
-终态 durable
-Event 身份一致
-Event 类型合法
-Event 顺序合法
-```
-
-只有 PREPARED、当前 Status、QoS 诊断或 MCAP 中存在 Channel 均不能单独证明该请求成功。
-
-### Topic Evidence 查询
-
-Recorder 提供：
-
-```text
-lookup_topic_operation(
-    recording_id,
-    operation_id
-)
-```
-
-只读取：
-
-```text
-topic_events.jsonl
-必要 recovery evidence
-当前进程已知 event commit result
-```
-
-不读取/修改 MCAP。
-
-不触发：
-
-```text
-Recovery write
-Cleanup
-```
-
-需校验：
-
-```text
-recording_id
-operation_id
-event type
-topic_id
-topic_epoch
-event_seq
-terminal conflict
-truncated tail
-```
-
-### fsync 失败与 event_log_uncertain_from_seq
-
-Recorder 在活动 `TaskRuntime` 内维护：
-
-```text
-event_log_uncertain_from_seq
-```
-
-类型：
-
-```text
-optional<uint64_t>
-```
-
-语义：
-
-> 这是 Task 级全局 poison watermark，不是 Topic 级水位。
-
-一旦某个关键 Topic Event 的：
-
-```text
-write/fsync
-```
-
-不能确认成功：
-
-```text
-event_log_uncertain_from_seq =
-min(existing, failed_seq)
-```
-
-从该 seq 起，当前进程对后续 Event 的 durable causal chain 不再声称完全可信。
-
-任何：
-
-```text
-event_seq >= event_log_uncertain_from_seq
-```
-
-的 Topic Evidence，在本进程内不得升级为：
-
-```text
-CONFIRMED_SUCCESS
-```
-
-即使后来文件中的 JSON 行暂时可读。
-
-这是 V1.0 为保证：
-
-```text
-有界内存
-+
-保守证据
-```
-
-作出的明确取舍。
-
-### Event durability failure 后的 Task 行为
-
-关键 Event durability 一旦不可确认，Recorder 不允许继续接受新的外部：
-
-```text
-Add Topic
-Remove Topic
-```
-
-mutation。
-
-Sequencer 必须：
-
-1. 关闭新的 Topic mutation admission；
-2. 防止新的 Topic Epoch 继续产生更多不可解释 Event；
-3. 保留已经 STARTED 的原生子操作生命周期；
-4. 关闭相关危险 ingress；
-5. 进入安全 Task 收尾/Failed 路径。
-
-已经在途的内部收尾 Event 可以继续尝试写入用于诊断，但：
-
-```text
-seq >= uncertain watermark
-```
-
-仍保持 UNCERTAIN。
-
-这样避免：
-
-```text
-Topic A Event commit failure
-→ Topic B/C/D 继续运行
-→ 整个 Task 后续 Evidence 全部变得难以解释
-```
-
-V1.0 不为每个 Topic 建立单独 fsync receipt registry。
-
-如果未来要求 Topic 级隔离的 durable receipt，需要新持久化事务设计，不属于 V1.0。
-
-### TaskRuntime 生命周期
-
-`event_log_uncertain_from_seq` 是：
-
-```text
-TaskRuntime 内部成员
-```
-
-由 Event persistence path 更新。
-
-`status()` 只复制：
-
-```text
-当前水位
-或
-派生 uncertain flag
-```
-
-绝不修改。
-
-TaskRuntime 生命周期结束后，进程内水位随之释放。
-
-后续历史 Evidence 只依据：
-
-```text
-持久 Event
-Recovery evidence
-```
-
-### 重启后的证据
-
-进程重启后无法从“某行仍存在”反推出：
-
-> 原进程当时的 fsync syscall 曾成功返回。
-
-因此必须区分：
-
-```text
-A. 原 HTTP/native 调用当时结果
-B. Recovery 后当前介质上能够确认的领域事实
-```
-
-若 Recovery 重新校验：
-
-```text
-完整终态行
-Event chain
-identity
-sequence
-```
-
-均可信，则可说：
-
-> 该领域副作用现在在恢复后的持久介质上得到确认。
-
-但不能倒填：
-
-```text
-原 HTTP 一定 success
-原 fsync 一定返回 success
-```
-
-只有 PREPARED、截断、身份冲突：
-
-```text
-UNCERTAIN
-```
-
-Start/Stop/Pause/Resume 不提供通用持久化 Operation Registry。
-
-网络超时：
-
-```text
-UNKNOWN
-```
-
-Status 只是当前事实，不能替代原请求终态。
-
-### 2.4.1 Recovery 后 Topic 历史证据
-
-**Recovery 不恢复旧 Task 继续录制。**
-
-进程重启后，旧崩溃任务不会重新创建：
-
-```text
-TopicRuntime
-GenericSubscription
-ACTIVE Topic
-```
-
-因此：
-
-```text
-ACTIVE
-ARMED
-ADDING
-REMOVING
-```
-
-只属于**当前活动 Task 的运行期状态**。
-
-旧 Task 的 Topic 在 Recovery 后只以**Historical Topic Evidence** 存在。
-
-内部恢复解释至少区分：
-
-```text
-CONFIRMED_ADDED
-CONFIRMED_REMOVED
-CONFIRMED_FAILED
-UNCERTAIN
-```
-
-映射：
-
-| 持久证据 | Historical Topic Evidence |
-|---|---|
-| `TOPIC_ADDED` 完整且 durable chain 可确认 | CONFIRMED_ADDED |
-| `TOPIC_REMOVED` 完整且 durable chain 可确认 | CONFIRMED_REMOVED |
-| 明确 durable `TOPIC_ADD_FAILED` / `TOPIC_REMOVE_FAILED` | CONFIRMED_FAILED |
-| 只有 PREPARED | UNCERTAIN |
-| Event tail 截断 | UNCERTAIN |
-| terminal conflict | UNCERTAIN |
-| 原进程已知 fsync 失败，但重启后只能看到完整行 | Recovery 可以确认“当前介质事实”，但不能倒填原 HTTP success；recovery.json 保留该语义差异 |
-
-Historical Topic Evidence 和 Task Persistent State 可以组合：
-
-```text
-Task = INCOMPLETE
-Topic A = CONFIRMED_ADDED
-```
-
-表示：
-
-> Topic A 的 Add 已被 durable 确认，但整个 recording task 非正常结束，因此不能宣称 Task 完整。
-
-这不表示 Topic A 在新 Runtime 中 ACTIVE。
-
-### History / Status 展示
-
-当前 `RecorderStatus`：
-
-- 只包含当前 Runtime/current Task Topic；
-- Runtime Idle 时不展示旧 Task ACTIVE Topic；
-- 不把历史 Topic 重新注入当前 Topic 列表。
-
-History Task detail 可以提供有界摘要，例如：
-
-```text
-confirmed_topic_add_count
-confirmed_topic_remove_count
-failed_topic_operation_count
-uncertain_topic_operation_count
-has_topic_evidence_uncertainty
-```
-
-但 V1.0 仍**不提供完整 Topic 历史分页 API**。
-
-精确 operation 继续通过：
-
-```text
-lookup_topic_operation(recording_id, operation_id)
-```
-
-查询。
-
-更完整取证通过：
-
-```text
-topic_events.jsonl
-recovery.json
-```
-
-的受保护离线分析完成。
-
-# 3. 录制数据路径与内存所有权
-
-## 3.1 RecordedMessage、时间戳与复制边界
-
-ROS 2 GenericSubscription 接收：
-
-```text
-rclcpp::SerializedMessage
-```
-
-Recorder 通过 `shared_ptr` 保有 owner。
-
-回调返回后 Writer 延迟消费仍有效。
-
-领域类型：
+## 4.4 RecordedMessage
 
 ```cpp
 struct RecordedMessage {
-    uint64_t recording_generation;
+    std::uint64_t generation;
+
     TopicId topic_id;
-    uint64_t topic_epoch;
+    std::uint64_t topic_epoch;
 
-    std::shared_ptr<const TopicInfo>
-        topic_info;
+    std::shared_ptr<rclcpp::SerializedMessage> message;
+    std::size_t payload_bytes = 0;
 
-    std::shared_ptr<
-        rclcpp::SerializedMessage>
-        serialized_message;
+    std::int64_t receive_timestamp_ns = 0;
 
-    size_t payload_bytes;
-
-    int64_t receive_timestamp_ns;
-
-    TimestampPolicy timestamp_policy =
-        TimestampPolicy::kReceive;
-
-    bool is_replayed;
+    bool replayed = false;
 };
 ```
 
-V1.0 接收时间戳固定：
+correctness-critical 字段：
+
+| 字段 | 原因 |
+|---|---|
+| generation | 防止跨 Task 数据串入 |
+| topic_id / epoch | 防止动态 Topic 生命周期串入 |
+| message owner | payload 生命周期覆盖 Writer |
+| payload_bytes | byte budget |
+| receive_timestamp_ns | MCAP 时间 |
+| replayed | Rolling live window 判定 |
+
+V1 TimestampPolicy 固定为 Receive，已经冻结在 TaskConfig，因此不要求每条消息重复存 TimestampPolicy。
+
+是否缓存 `shared_ptr<const TopicInfo>` 由实现决定，不属于必须字段。
+
+### Timestamp
+
+接收时间：
 
 ```text
 std::chrono::system_clock
 Unix epoch nanoseconds
 ```
 
-不读取：
+不使用：
 
 ```text
 ROS Clock
@@ -2470,1165 +2363,374 @@ use_sim_time
 Header.stamp
 ```
 
-WriterAdapter 映射：
+MCAP：
 
 ```text
-MCAP log_time     = receive_timestamp_ns
-MCAP publish_time = receive_timestamp_ns
+log_time     = receive_timestamp_ns
+publish_time = receive_timestamp_ns
 ```
 
-`publish_time` 只是兼容填充，不代表真实 Publisher 发送时刻。
+publish_time 只是兼容填充。
 
-系统墙钟可以跳变。
+Safety deadline 全部使用 steady clock。
 
-安全 deadline 仍全部使用 steady clock。
+`receive_timestamp_ns` 的单位固定为纳秒；实际有效精度取决于目标平台 `system_clock`，低于纳秒精度时只是按纳秒单位表示，不伪造不存在的时间分辨率。这不影响基于 `steady_clock` 的 safety deadline。
 
-消息包装、Queue 和 WriterAdapter 不主动深拷贝整个 CDR Payload。
+## 4.5 Message Pool
 
-这不等于 DDS→MCAP 全链路零拷贝。
+V1.0 使用**固定有界 Pool**。
 
-Writer 使用临时 `SerializedBagMessage` 时必须保持原 owner 活到 Writer 完成。
+不使用 fallback allocation。
 
-## 3.2 PoolState 与 MessageHandle
-
-Pool 负责包装节点，不重复缓存 CDR Payload。
-
-`MessageHandle` 携带：
+明确删除：
 
 ```text
-shared_ptr<PoolState>
-NodeIndex / fallback identity
+max_fallback_in_use
+fallback_registry
+fallback identity
+fallback=1024
 ```
 
-短生命周期 facade 结束后，句柄仍能安全 release。
-
-正式 V1.0：
+Pool exhausted：
 
 ```text
-pool.mode=global_mutex
+drop current message
+increment dropped_pool_exhausted
 ```
 
-短临界区只维护 Free List。
+不进入第二级动态分配路径。
 
-不得把 DDS/Queue/Writer/File I/O 放进 Pool mutex。
-
-普通容量失败：
-
-```text
-返回空句柄
-增加统计
-```
-
-不能 abort。
-
-只有确认的内部不变量破坏：
-
-```text
-NodeIndex 越界
-DoubleRelease
-跨 Pool
-Stopped 后合法 release
-```
-
-走：
-
-```text
-fail_fast()
-std::abort()
-```
-
-不属于 `RecorderErrorCode`。
-
-### Pool 生命周期
+### 生命周期
 
 ```text
 Running
-  ↓ begin_stop
-Stopping
-  ↓ prove quiescence
-Stopped
+→ Stopping
+→ Stopped
 ```
 
 Running：
 
 ```text
-允许 acquire/release
+acquire/release allowed
 ```
 
 Stopping：
 
 ```text
-禁止新的 acquire 成功
-允许已有 Handle release
+new acquire rejected
+existing owner release allowed
 ```
 
 Stopped：
 
 ```text
-无合法 Handle
-无 fallback
-无 active acquire/release
+in_use == 0
+active acquire/release == 0
+all nodes returned
 ```
 
-**`begin_stop()` 绝不能阻塞已有 Handle 的 release。**
+`begin_stop()` 不得阻塞合法 release。
 
-Stop 只关闭后续借出。
-
-已有 Handle 可以继续从任意合法线程归还。
-
-静止条件：
+默认实现：
 
 ```text
-in_use = 0
-fallback_in_use = 0
-registry empty
-active acquire/release = 0
+global_mutex
 ```
 
-global_mutex 模式：
+短临界区只维护 free list。
+
+禁止在 Pool mutex 内：
 
 ```text
-tls_free = 0
-capacity = in_use + global_free
+DDS
+Queue
+Writer
+filesystem
 ```
 
-Stopped：
+容量耗尽：
 
 ```text
-global_free = capacity
+return empty
+counter++
+drop current message
 ```
 
-### Fallback registry
-
-备用分配受：
+只有内部不变量破坏允许 fail-fast：
 
 ```text
-pool.max_fallback_in_use
+invalid node index
+double release
+cross-pool release
 ```
 
-限制。
 
-登记表只保存当前借出的 fallback。
 
-任何失败：
+### `begin_stop()` 与并发 acquire
+
+`begin_stop()` 与 acquire 必须在线性化点竞争：
+
+- 在 stop 线性化点之前已经成功取得节点的 acquire → 形成合法 owner，后续 release 必须正常；
+- stop 线性化点之后的新 acquire → 立即失败；
+- 正在进入 Pool 临界区但尚未取得节点的 acquire → 在同一锁/状态检查下观察到 Stopping 并失败；
+- Stopping 不禁止既有 owner release。
+
+Pool capacity 计算见 §7.5，不由运行期动态扩容。
+
+Stopping → Stopped 由 Pool 自身在 `release()` 或 active acquire/release 临界操作退出时检查 quiescence 条件并通知等待者：
 
 ```text
-new failure
-insert failure
-Handle construction failure
+state == Stopping
+in_use == 0
+active_ops == 0
+all nodes returned
+→ state = Stopped
 ```
 
-必须 RAII 回滚。
+如果某个合法 owner 永久泄漏，Pool 保持 Stopping；Recorder Shutdown Completion 不得 Done，最终 Runtime grace 可以进入 `UNSAFE_TO_DESTROY`。不能因为等待超过阈值就把它当成已证明 invariant violation；只有 double release、cross-pool release 等确定破坏才 fail-fast。
 
-不得泄漏孤儿对象。
+## 4.6 Message Queue 与 Producer admission
 
-### TLS
-
-TLS 只保留实验。
-
-正式 V1 不依赖 TLS。
-
-如果以后重新启用，必须解决：
+Queue 同时限制：
 
 ```text
-per-task flush
-thread exit
-cross-thread release
-Pool identity
-ARM64
-TSan
+max_messages
+max_bytes
 ```
 
-## 3.3 QueueBudget、ProducerToken 与消息准入
-
-任务为 Queue 创建独立：
+预算守恒：
 
 ```text
-QueueBudget
-MessageQueue
+reserve
+→ enqueue
+→ dequeue/release
 ```
 
-消息所有权：
+所有失败路径必须归还预算。
+
+ProducerToken 生命周期必须覆盖所有 callback。
+
+### 数据路径
+
+```mermaid
+flowchart LR
+    MSG["ROS Message"]
+    ID["Generation / Epoch"]
+    GATE["Task / Topic Gate"]
+    TIME["Timed Deadline"]
+    DISK["Disk Snapshot"]
+    BUDGET["Queue Budget"]
+    POOL["Message Pool"]
+    QUEUE["Message Queue"]
+    WRITER["Writer"]
+
+    MSG --> ID --> GATE --> TIME --> DISK --> BUDGET --> POOL --> QUEUE --> WRITER
+```
+
+### Admission 顺序
+
+1. generation / topic epoch；
+2. Task / Topic accepting；
+3. Timed hard deadline；
+4. Disk coherent snapshot；
+5. Disk safety/freshness；
+6. Queue budget；
+7. Message Pool；
+8. Queue ownership transfer。
+
+### Drop counters
+
+至少固定：
 
 ```text
-QueuedMessage {
-    MessageHandle,
-    BudgetLease
-}
-```
-
-QueueBudget 同时限制：
-
-```text
-used_messages
-used_bytes
-```
-
-申请必须原子检查：
-
-```text
-used_messages + 1 <= max_messages
-used_bytes + payload <= max_bytes
-```
-
-用：
-
-```text
-payload > max_bytes - used_bytes
-```
-
-避免 unsigned overflow。
-
-BudgetLease move-only。
-
-失败自动回滚。
-
-### 技术选型
-
-V1.0 底层并发队列已经由：
-
-```text
-docs/system_technology_selection.md
-```
-
-选定为：
-
-```text
-moodycamel concurrentqueue
-```
-
-因此本文**不保留“底层 Queue 技术尚未冻结”的语义**。
-
-本文中的伪代码只是不冻结：
-
-```text
-MessageQueue wrapper
-Queue Producer wrapper
-Recorder 内部类拆分/API 命名
-```
-
-的具体实现形式。
-
-底层并发队列技术选型本身已经确定。
-
-因此使用：
-
-```cpp
-moodycamel::ProducerToken
-```
-
-作为实现示意是合法的。
-
-如果后续替换底层并发队列，属于技术选型变更，须同步修改 `system_technology_selection.md` 和相关性能/并发验证。
-
-### 接入流程
-
-```text
-GenericSubscription
-  ↓
-Task/Topic admission
-  ↓
-QueueBudget
-  ↓
-PoolState
-  ↓
-RecordedMessage init
-  ↓
-MessageQueue enqueue
-  ↓
-Writer Thread
-```
-
-失败统计：
-
-```text
-dropped_capacity
-dropped_allocation_failure
-dropped_enqueue_failure
+dropped_stale_identity
+dropped_not_accepting
+dropped_timed_deadline
+dropped_disk_unsafe
 dropped_disk_snapshot_busy
+dropped_queue_full
+dropped_pool_exhausted
+dropped_enqueue_failure
 ```
 
-### Producer 回调示意
+这些计数进入当前 State。
+
+其中：
+
+- `dropped_stale_identity`：步骤 1 generation/epoch 不匹配；
+- `dropped_not_accepting`：Task/Topic gate 关闭；
+- `dropped_timed_deadline`：步骤 3 hard deadline；
+- `dropped_disk_snapshot_busy`：步骤 4 无法在 bounded retry 内取得 coherent snapshot；**不改变 Task/Disk 状态**；
+- `dropped_disk_unsafe`：步骤 5 snapshot 成功，但判断为 Critical/Unknown/stale；对应安全事件会关闭 admission；
+
+步骤 5 发现真实 Critical/Unknown/stale 时，Producer fast path 立即通过原子 Task admission gate 拒绝当前及后续新消息，并发布合并 Disk Safety 内部事件；**Producer 不直接修改 PauseState/RecorderState**。Recorder 串行域领取事件后设置对应 `DiskPauseReason` 并把运行态推进到 Paused（若已 Stopping/Failed 则保持更高优先级状态）。
+- `dropped_queue_full`：message count 或 byte budget 任一超限；
+- `dropped_pool_exhausted`：固定 Pool 无可用节点；
+- `dropped_enqueue_failure`：预算/Pool 已取得但底层 enqueue 失败，必须同时释放 MessageHandle/Pool ownership 并归还 message-count + byte BudgetLease；rollback 完成后才能返回 callback。
+
+### Timed hard deadline
+
+```text
+steady_start + duration = hard_deadline
+```
+
+callback 直接判断：
+
+```text
+steady_now >= hard_deadline
+```
+
+越界：
+
+```text
+drop current message
+close Task admission
+publish coalesced Timed Stop
+```
+
+Timer 只提高及时性，不承担 hard cutoff correctness。
+
+## 4.7 DiskAdmissionState
+
+Producer fast path 不同步 `statvfs()`。
+
+至少：
 
 ```cpp
-void on_serialized_message(
-    std::shared_ptr<
-        rclcpp::SerializedMessage> owner,
-    const TopicInstanceToken& topic)
-{
-    auto producer =
-        task_ingress_.try_enter(
-            topic,
-            SteadyClock::now());
-
-    if (!producer) {
-        count_admission_rejection(topic);
-        return;
-    }
-
-    const auto bytes =
-        serialized_size(*owner);
-
-    auto budget =
-        queue_budget_->try_acquire(bytes);
-
-    if (!budget.valid()) {
-        count_capacity(topic);
-        return;
-    }
-
-    auto handle =
-        pool_->try_acquire();
-
-    if (!handle) {
-        count_alloc_failure(topic);
-        return;
-    }
-
-    initialize_recorded_message(
-        *handle,
-        std::move(owner),
-        topic,
-        sample_receive_time());
-
-    QueuedMessage item{
-        std::move(handle),
-        std::move(budget)
-    };
-
-    if (!producer.try_enqueue(&item)) {
-        count_enqueue_failure(topic);
-        return;
-    }
-
-    count_enqueued(topic);
-}
-```
-
-成功 enqueue 后：
-
-```text
-BudgetLease + MessageHandle
-```
-
-整体移交 Queue。
-
-Queue API 必须明确：
-
-```text
-accepted
-not accepted
-```
-
-不能出现：
-
-> item 已经被 Queue 接管，但返回 false 让 Producer 再次释放。
-
-### Producer 进入/退出协议
-
-1. ROS callback 先 RAII 增加：
-   ```text
-   producers_in_flight
-   ```
-2. `try_enter()` 成功后才进入 Budget/Pool/Queue。
-3. `close_ingress()` 阻止新的 Producer 成功准入。
-4. 已取得 Producer admission 的回调允许完成唯一 enqueue 或 rollback。
-5. Drain 等到 `producers_in_flight==0`。
-6. 再允许 Executor detach。
-7. Queue Drain 后再进入 Pool Stop。
-8. Generation 变化不能让旧 Token 绑定新 Queue。
-
-### QueueBudget 守恒
-
-静止：
-
-```text
-used_bytes = 0
-used_messages = 0
-acquire_count = release_count
-```
-
-不能只用平均 Queue depth 判定。
-
-### 3.3.1 TaskIngressState 与 DiskAdmission coherent snapshot
-
-```cpp
-using SteadyTimePoint =
-    std::chrono::steady_clock::time_point;
-
-inline std::int64_t steady_time_ns(
-    SteadyTimePoint tp) noexcept
-{
-    return std::chrono::duration_cast<
-        std::chrono::nanoseconds>(
-            tp.time_since_epoch()).count();
-}
-
-struct DiskAdmissionSnapshot {
-    DiskSafetyState state =
-        DiskSafetyState::kUnknown;
-
-    std::int64_t valid_until_steady_ns = 0;
-};
-
 struct DiskAdmissionState {
-    // even = stable
-    // odd  = writer publishing
     std::atomic<std::uint64_t> sequence{0};
 
     std::atomic<DiskSafetyState> state{
-        DiskSafetyState::kUnknown};
+        DiskSafetyState::Unknown};
 
-    std::atomic<std::int64_t>
-        valid_until_steady_ns{0};
-};
-
-struct TaskIngressState {
-    const std::uint64_t recording_generation;
-
-    const std::optional<SteadyTimePoint>
-        deadline;
-
-    std::shared_ptr<MessageQueue> queue;
-    std::shared_ptr<QueueBudget> budget;
-    std::shared_ptr<PoolState> pool;
-
-    std::shared_ptr<DiskAdmissionState>
-        disk_admission;
-
-    std::atomic<bool> accepting{false};
+    std::atomic<std::int64_t> valid_until_steady_ns{0};
 };
 ```
 
-### steady time 编码
-
-`steady_time_ns()` 是 V1.0 唯一 steady scalar 编码：
+Producer 还需要的其他 payload：
 
 ```text
-duration_cast<nanoseconds>(
-    tp.time_since_epoch()
-).count()
-```
-
-不依赖平台原始 steady_clock tick 单位。
-
-它只允许：
-
-```text
-当前进程
-同一 steady_clock domain
-```
-
-内比较。
-
-不得：
-
-```text
-持久化
-跨进程解释
-当成 Unix epoch
-与 system_clock 比较
-```
-
-### DiskAdmission 发布协议
-
-`statvfs()`、阈值计算、错误转换等**全部在发布临界区之外执行**。
-
-ResourceMonitor 先在本地构造完整：
-
-```text
-DiskAdmissionSnapshot next
-```
-
-然后仅用极短 atomic 发布区：
-
-```text
-sequence even → odd
-state.store(next.state)
-valid_until.store(next.valid_until)
-sequence odd → next even
-```
-
-Odd 状态**不能跨越 `statvfs()`**。
-
-否则慢文件系统会让所有 Producer 长时间只看到 publish in progress，这是禁止的。
-
-### Reader coherent snapshot
-
-Producer 固定执行少量 bounded read attempts。
-
-V1.0 建议实现常量：
-
-```cpp
-static constexpr int
-kDiskSnapshotReadAttempts = 3;
-```
-
-每次：
-
-```text
-seq1 = acquire(sequence)
-
-if odd:
-    retry
-
-read state
-read valid_until
-
-seq2 = acquire(sequence)
-
-accept only if:
-seq1 == seq2
-且
-seq1 even
-```
-
-所有 payload 字段保持 atomic。
-
-禁止 seqlock 中混入普通非原子字段造成 C++ data race。
-
-### Snapshot busy 的处理
-
-经过固定次数仍不能获得 coherent snapshot：
-
-```text
-snapshot busy
-```
-
-表示：
-
-> 当前 Producer 无法在热路径预算内证明磁盘 admission 状态。
-
-它不表示：
-
-```text
-DiskSafetyState::kUnknown
-```
-
-因此 Producer：
-
-```text
-reject current message
-increment dropped_disk_snapshot_busy
-increment disk_admission_snapshot_busy
-```
-
-然后立即返回。
-
-它不得：
-
-```text
-accepting=false
-PauseReason::kDiskUnknown
-submit DiskSafety(UNKNOWN)
-```
-
-也不使用累计次数阈值把它升级成磁盘状态。
-
-Start/Resume/maybe_open_ingress 在无法读取 coherent snapshot 时：
-
-```text
-本次不开放
-```
-
-可以返回/保留：
-
-```text
-DISK_STATE_UNKNOWN
-或
-temporary unavailable diagnostic
-```
-
-但同样不改变 ResourceMonitor 已发布的真实 `DiskSafetyState`。
-
-下一次 ResourceMonitor publish 或后续控制调用重新评估。
-
-### try_enter() fast path 顺序
-
-固定：
-
-```text
-1. recording_generation + topic_id/epoch
-2. accepting
-3. Timed deadline
-4. coherent Disk snapshot
-5. Disk state / freshness
-6. QueueBudget
-7. Pool
-8. Queue ownership transfer
-```
-
-#### 1. identity
-
-失败：
-
-```text
-dropped_stale_generation
-```
-
-#### 2. accepting
-
-已 CLOSED：
-
-```text
-按 IngressCloseReason 分类
-Pause
-Stop
-Shutdown
-WriterFailure
+free_bytes
+used_percent
 ...
 ```
 
-#### 3. Timed
+也必须 atomic 或使用等价无 data-race 同步。
 
-若：
+禁止：
 
 ```text
-now >= deadline
+atomic sequence
++
+ordinary non-atomic payload
 ```
 
-则：
+假装 seqlock。
+
+### Publisher
 
 ```text
-close Task accepting
-submit/coalesce TimedStop
-reject current message
+even
+→ publish odd
+→ update atomic payload
+→ publish next even with release
 ```
 
-不需要再读取 Disk。
-
-#### 4. Disk snapshot coherent read
-
-如果只是 snapshot busy：
+### Reader
 
 ```text
-reject current message only
+seq1 = acquire
+if odd -> retry
+
+read payload
+
+seq2 = acquire
+
+accept iff:
+seq1 == seq2
+AND even
+```
+
+retry 次数固定有界。
+
+snapshot contention：
+
+```text
+drop current message
 dropped_disk_snapshot_busy++
 ```
 
-**不关闭 Task。**
+不能污染 DiskSafetyState。
 
-#### 5. Disk safety
-
-coherent snapshot：
+真正 Disk Unknown 只由：
 
 ```text
-CRITICAL
-UNKNOWN
-或
-freshness expired
+sample stale
+consecutive sample failure threshold
+monitor explicitly unable to establish safety
 ```
 
-才允许：
+产生。
+
+---
+
+
+
+### Fast-path snapshot 与观测 sample 的边界
+
+`DiskAdmissionState` 只包含 Producer hard gate 必需的最小字段，例如：
 
 ```text
-close Task accepting
-submit/coalesce DiskSafety
-reject
+state
+valid_until_steady_ns
 ```
 
-`WARNING` 仍允许录制。
-
-### ProducerToken
-
-```cpp
-class ProducerToken {
-public:
-    explicit ProducerToken(
-        std::shared_ptr<MessageQueue> queue);
-
-private:
-    std::shared_ptr<MessageQueue> queue_;
-
-    std::unique_ptr<
-        moodycamel::ProducerToken>
-        token_;
-};
-```
-
-这里的 `moodycamel::ProducerToken` 反映已经冻结的底层技术选型。
-
-`ProducerToken` 这个 Recorder wrapper 的具体类名、构造方式和是否内联持有第三方 token 不属于跨层 API 冻结内容。
-
-### Stop 生命周期
+Resource Monitor 另外维护用于 `state()` 展示的 `DiskSample`：
 
 ```text
-Task/Topic gate CLOSED
-↓
-producers_in_flight == 0
-↓
-Executor detach DONE
-↓
-MessageQueue drain
-↓
-Writer no longer owns QueuedMessage
-↓
-PoolState.begin_stop()
-↓
-in_use == 0
-fallback == 0
-registry empty
-active ops == 0
-↓
-PoolState Stopped
-↓
-release Queue/Pool/TopicRuntime
+sampled_at
+free_bytes
+used_percent
+state
 ```
 
-任一步超出 warning/watchdog：
+Producer 不读取 `DiskSample`，因此这些展示字段不必塞进同一个 seqlock。若未来某个新字段要进入 Producer fast path，则它必须是 atomic 并纳入同一 coherent snapshot 协议，或使用等价的无 data-race 方案。
+
+`valid_until_steady_ns` 精确定义为：
 
 ```text
-不能跳过屏障 reset 后续资源
+steady_now <= valid_until_steady_ns
+→ sample fresh
+
+steady_now > valid_until_steady_ns
+→ sample stale
+→ Producer 按 DiskUnknown 安全处理
 ```
 
-## 3.4 Generation 安全与数据损失分类
 
-Writer 每次写入检查：
+# 5. Writer、录制模式与 Schema
 
-```text
-recording_generation
-topic_id
-topic_epoch
-```
+## 5.1 Writer Thread
 
-旧 Task 消息不得写入新 Task。
-
-旧 Epoch 不得归新 Epoch。
-
-Generation violation：
+所有 `rosbag2_cpp::Writer` API：
 
 ```text
-dropped_stale_generation
-GENERATION_VIOLATION
-```
-
-并进入安全失败。
-
-### 计数
-
-| 事件 | 计数 | 含义 |
-|---|---|---|
-| gate closed | dropped_paused / close reason | 未接纳 |
-| QueueBudget 满 | dropped_capacity | 未接纳 |
-| Pool 失败 | dropped_allocation_failure | 未接纳 |
-| Queue reject | dropped_enqueue_failure | 未接纳 |
-| Disk snapshot publish contention | dropped_disk_snapshot_busy | 未接纳；不表示磁盘危险 |
-| stale Task/Epoch | dropped_stale_generation | 身份拒绝 |
-| Writer error | write_errors | 已接纳后的失败 |
-
-写入计数：
-
-```text
-written_live
-replayed_to_new_segment
-```
-
-不提供混合语义的公开 `written`。
-
-MCAP 成功 write call 总次数可派生：
-
-```text
-written_live
-+
-replayed_to_new_segment
-```
-
-但这不表示：
-
-```text
-Segment durable COMPLETE
-```
-
-### admission_drop_rate
-
-内部诊断：
-
-```text
-(
-    dropped_capacity
-  + dropped_allocation_failure
-  + dropped_enqueue_failure
-  + dropped_disk_snapshot_busy
-)
-/ received
-```
-
-不包含：
-
-```text
-dropped_paused
-dropped_stale_generation
-write_errors
-```
-
-它不是 requirements 中端到端丢失率。
-
-真正 AC/NFR 丢失率由发布序号与最终 MCAP 可读序列集合计算。
-
-# 4. 录制模式、MCAP、持久化与恢复
-
-## 4.1 Normal、Timed 与 Rolling
-
-### Normal
-
-显式 Start/Stop。
-
-零消息合法。
-
-V1.0 不强制唯一的空任务物理表示：
-
-- 实现如果在首条消息到达前延迟 Writer Segment 创建：
-  ```text
-  segments=[]
-  ```
-  合法。
-- 实现如果为 Writer/Schema 初始化真实创建过一个空 Segment：
-  ```text
-  一个真实 empty Segment
-  ```
-  也合法。
-
-关键要求：
-
-> Manifest 必须如实反映真实创建过的物理 Segment，不能既产生目录/MCAP 又声称 `segments=[]`，也不能伪造未存在的空 Segment。
-
-不得周期性生成无意义空 Segment。
-
-### Timed
-
-调用方给定正 duration。
-
-deadline 用 steady clock。
-
-Pause 时间仍计入期限。
-
-每个 Producer admission 检查 deadline。
-
-Timer 仅做早期唤醒。
-
-截止前已进入 Producer 屏障的消息可以在 deadline 后完成写入。
-
-### Rolling
-
-单任务按目标 segment_duration 轮转。
-
-Retention 以 Segment durable COMPLETE 后的 steady completion time 计算。
-
-暂停期间 retention 继续。
-
-当前打开、FINALIZING、INCOMPLETE、没有可靠终态的 Segment 不自动删除。
-
-目录：
-
-```text
-output_root/
-  <recording_id>/
-    manifest.json
-    topic_events.jsonl
-    recovery.json
-    segment_000000/
-      metadata.yaml
-      segment_000000_0.mcap
-    segment_000001/
-      metadata.yaml
-      segment_000001_0.mcap
-```
-
-路径必须防：
-
-```text
-absolute injection
-..
-symlink escape
-```
-
-### Retention
-
-完成时记录：
-
-```text
-completed_at_utc_ns
-completed_at_steady
-```
-
-本进程：
-
-```text
-completed_at_steady
-+
-retention_duration
-```
-
-决定最早删除资格。
-
-跨 Runtime 重启：
-
-```text
-steady 不可比较
-```
-
-对仍为 COMPLETE 的 Segment，从本次 Recovery 发现时重新计满一个完整 retention。
-
-这可能保留更久，但不能提前删除。
-
-durable DELETING 已经获得删除授权，重启后不重新等待 retention。
-
-`retention_duration` 可以小于 `segment_duration`。
-
-例如：
-
-```text
-segment=60s
-retention=30s
-```
-
-Segment durable COMPLETE 后再等 30s 才可 DELETING。
-
-Retention 是：
-
-> COMPLETE 后最小等待时间。
-
-不是：
-
-> 精确保留最近 N 秒。
-
-由于 Segment 粒度、当前 Segment 不可删除和 Cleanup 延迟，实际历史常常**大于** retention。
-
-### 4.1.1 Rolling 逻辑窗口与物理 Segment
-
-定义：
-
-```text
-window_deadline
-physical segment_id
-live_window_started_at
-```
-
-`segment_id`：
-
-```text
-真实物理 Segment
-从 0 连续递增
-```
-
-逻辑空窗口不创建假的 Segment。
-
-#### 规则 1：Start 空 Segment
-
-Start 可为了：
-
-```text
-Writer metadata
-Channel registration
-```
-
-创建最多一个空 Writer Segment。
-
-真实存在必须写 Manifest。
-
-#### 规则 2：无 Live 时不周期 Rotate
-
-如果当前物理 Segment：
-
-```text
-written_live == 0
-```
-
-即使逻辑 window deadline 到期：
-
-```text
-只推进逻辑时间
-不 close/open
-不分配新 segment_id
-```
-
-可以 O(1) 跳过多个空窗口。
-
-#### 规则 3：Live window 只由第一条 Live 开始
-
-每个新物理 Segment 维护：
-
-```text
-optional<SteadyTimePoint>
-live_window_started_at
-```
-
-Snapshot Replay：
-
-```text
-不会设置
-live_window_started_at
-```
-
-只有该 Segment 第一条**真实 Live message 成功写入**时：
-
-```text
-live_window_started_at =
-first_live_write/admission-associated steady point
-```
-
-并据此建立：
-
-```text
-window_deadline =
-live_window_started_at
-+ segment_duration
-```
-
-具体使用 first-live admission 还是 Writer success steady point必须在实现中保持单一口径；推荐用第一条 Live 成功写入 Writer 时刻，因为它与“物理 Segment 已开始承载实时数据”直接对应。
-
-一旦冻结，后续消息不重置。
-
-因此：
-
-```text
-Replay-only Segment
-```
-
-可以长时间保持打开，而不会仅因 Replay 时间过去不断 Rotate。
-
-#### 规则 4：Replay-only 不无限创建 Segment
-
-新 Segment Open/Register 后可能立即 Snapshot Replay。
-
-如果之后没有新的 Live：
-
-```text
-written_live == 0
-live_window_started_at == null
-```
-
-则后续任意多个 rolling interval 均不得仅因时间到期再创建新的后继 Segment。
-
-因此一个任务在长时间无 Live 时最多保留当前这个打开的：
-
-```text
-empty/replay-only successor
-```
-
-不会形成：
-
-```text
-replay-only segment
-replay-only segment
-replay-only segment
-...
-```
-
-的无限增长。
-
-#### 规则 5：Replay-only Segment 的 Stop
-
-如果任务最终 Stop，而当前 Segment 只包含 Replay：
-
-```text
-它仍是一个真实、有可读消息的物理 Segment
-```
-
-正常 Close 后可以进入 COMPLETE。
-
-一旦 COMPLETE，和其他 COMPLETE Segment 一样按照 retention/任务结束策略处理。
-
-不能因为：
-
-```text
-written_live == 0
-```
-
-就把已经写入真实 Replay 数据的 Segment 当成“空目录”直接删除。
-
-#### 规则 6：普通 Rotate
-
-已有 Live 的 Segment deadline 到达：
-
-```text
-close ingress
-→ Producer Drain
-→ Writer Drain
-→ Finalize old
-→ durable COMPLETE
-→ Open/register successor
-→ Snapshot Replay
-→ maybe_open_ingress()
-```
-
-新后继 Segment 的 live window 仍要等第一条 Live。
-
-#### 规则 7：Snapshot Replay 不改变原时间戳
-
-Replay：
-
-```text
-保留原 receive timestamp
-保留 Topic ID/Epoch
-is_replayed=true
-```
-
-不伪造成新的 ROS arrival。
-
-### Rolling 验证
-
-FakeSteadyClock 覆盖：
-
-```text
-1000 个空窗口
-1000 个暂停窗口
-长时间 replay-only
-首条 live 在长 idle 后到达
-Replay-only 后首次 live
-deadline 与 Stop 交错
-```
-
-验证：
-
-```text
-物理 Segment ID 连续
-无空窗口爆炸
-Replay 不启动 live window
-首条 Live 才开始 segment_duration
-```
-
-## 4.2 WriterAdapter、控制公平性与 Segment 边界
-
-WriterAdapter 封装：
-
-```text
-open_segment
-register_topic
+open
+register
 write
+rotate
 close
+metadata finalize
 statistics
-Humble/Jazzy 差异
 ```
 
-所有 Writer API 仅 Writer Thread 调用。
+只由 Writer Thread 调用。
 
-控制请求通过有界 Writer queue。
+其他线程只能提交 Writer 内部工作。
 
-操作要求：
+### Writer 内部命令
 
-| 操作 | 条件 |
-|---|---|
-| OPEN_SEGMENT | Segment 未打开、配置合法 |
-| REGISTER_TOPIC | Schema/Channel 完整，重复注册需一致 |
-| WRITE | Topic 已注册、owner 有效、Generation 正确 |
-| CLOSE | ingress 停止、Producer/Queue Drain 完成 |
-
-Writer 调度需要有界公平。
-
-持续控制不能饿死数据，持续数据不能永久延迟 Stop/Register/Rotate。
-
-配置：
-
-```text
-writer.control_queue_capacity
-writer.max_control_batch
-queue.batch_size
-```
-
-安全 Stop/Shutdown 必须有可达控制路径。
-
-### WriterRequest 生命周期
+真实存在跨线程工作队列，因此内部可以使用：
 
 ```cpp
 enum class WriterCommand {
@@ -3638,112 +2740,155 @@ enum class WriterCommand {
     Rotate,
     Close
 };
-
-struct WriterCommandInfo {
-    std::string detail;
-};
-
-// Writer completion is Result<WriterCommandInfo, RecorderError>.
-
-struct WriterRequest {
-    WriterCommand command;
-    std::uint64_t recording_generation;
-
-    std::shared_ptr<CompletionState>
-        completion;
-
-    bool drain_before_command = false;
-};
 ```
 
-调用者超时不能销毁 Writer 仍在使用的 Request data。
+Writer Request：
 
-Writer 退出时尚未执行的请求必须被完成为：
+- 拥有自身数据；
+- 不引用调用线程栈；
+- waiter timeout 不销毁 Writer 正在访问的数据；
+- Writer 停止时未开始 Request 必须显式完成失败/取消。
+
+Recorder 顶层 API 仍不使用 Request/Response。
+
+### Fairness
+
+配置：
 
 ```text
-cancelled/stopped
+writer.control_queue_capacity
+writer.max_control_batch
+message_queue.batch_size
 ```
 
-不能留永久 pending future。
+持续数据不能永久饿死：
 
-### Drain
+```text
+Stop
+Register
+Rotate
+```
+
+持续 control 也不能永久饿死普通数据。
+
+
+
+### Writer control queue 满
+
+普通 Writer control request 的 enqueue 是 non-blocking/bounded：提交时立即检查容量；若满，调用方在提交点立即得到内部 `ResourceExhausted`，不先排队再异步等待“队列满结果”，也不阻塞提交线程。
+
+但以下安全终结动作不能因为普通 control queue 已满而永久丢失：
+
+```text
+Close required by Stop/Shutdown
+fatal Writer failure notification
+```
+
+V1.0 冻结“安全动作不可丢失”的行为，不强制具体采用 reserved slot 还是独立 system-control path。
+
+`control_queue_capacity=64` 是等待中的 control 总容量；`max_control_batch=8` 是 Writer 每轮最多连续处理的 control 数，用来和数据写入做公平调度，两者语义独立。
+
+### WriterResult 回流
+
+Writer control request 完成后生成 `WriterResult` 回到 Recorder 串行域。
+
+特别是第一条 Live message：Writer Thread 在**成功写入**后产生一次内部通知，至少携带：
+
+```text
+generation
+segment_id
+first_live_written = true
+steady time of successful write
+```
+
+Recorder 串行域重新验证当前 generation/segment，且仅在 `live_window_started_at` 尚未设置时接受该通知。
+
+只有成功写入 Live message 才能产生 `first_live_written=true`。如果第一条 Live write 本身失败，Writer 产生普通 Writer failure result；不得设置 live window。后续 Task 是否继续取决于该 Writer failure 的领域处理，不能因为“first live 没有通知”而偷偷继续等待下一条。
+
+## 5.2 Drain 与 Segment Close
 
 Pause：
 
 ```text
-关闭 ingress
-可不强制立即 Drain
+close ingress
+full drain not required immediately
 ```
 
 Remove：
 
 ```text
-至少 Topic Producer Drain
-旧 Epoch Queue item 可继续 consume
+Topic producer barrier
+old Epoch queued messages may drain
 ```
 
 Stop：
 
 ```text
-完整 Drain
+full drain
 ```
 
 Rotate：
 
 ```text
-旧 Segment Drain
-→ Finalize
+close old ingress
+→ producer drain
+→ writer drain
+→ finalize old
 → successor
 ```
 
-Writer Failure：
+### Close 成功边界
 
-```text
-不重复写造成计数虚增
-```
-
-### Writer Close 成功边界
-
-Stop 成功不是：
+Stop Success 不等于：
 
 ```text
 queue empty
 ```
 
-也不是仅：
+也不等于：
 
 ```text
-writer.close() returns
+rosbag2_writer.close() returned
 ```
 
-完整成功：
+完整成功至少：
 
 ```text
-Writer close
+rosbag2 Writer close
 +
-metadata path valid
+expected data / metadata path belongs to current Segment
 +
-required file fsync
+required files exist
++
+file fsync
 +
 directory fsync
 +
 Manifest terminal durable
 ```
 
-`rosbag2_writer.close()` 正常返回说明 rosbag2 自身 metadata finalize/write 没有向 Recorder 抛错。
+`rosbag2_writer.close()` 正常返回表示 rosbag2 自身 metadata finalize/write 没有向 Recorder 抛错。
 
-Recorder 仍需确认：
+正常 Close 路径：
 
 ```text
-预期 MCAP/metadata 路径属于当前 Segment
-必要普通文件存在
-文件 fsync 成功
-目录 fsync 成功
+不要求重新完整 parse metadata.yaml
+不要求重新统计全部 message count/topic count
 ```
 
-V1 不要求每次正常 Close 后完整 YAML parse 并重新统计全部 Topic/message count/compression。
+Recorder 只验证：
 
-完整语义由：
+```text
+expected Segment path 位于受控 Task directory 下
+path 对应当前 segment_id 的预期命名/目录
+file/directory exists as expected
+fsync
+directory fsync
+```
+
+V1.0 不要求 inode pinning 或内容 hash 来证明“belongs to current Segment”；path containment + segment identity + Writer 当前 ownership 已足够。
+
+完整 metadata 语义验证由：
 
 ```text
 Recovery
@@ -3753,518 +2898,410 @@ Schema readback
 
 负责。
 
-### POSIX durability
 
-支持范围：
 
-```text
-本地 POSIX filesystem
-```
+### Close / fsync 失败后的状态
 
-并依赖其正确实现：
+任一 finalization 关键步骤失败：
 
 ```text
-fsync
-directory fsync
-atomic rename
-write barrier
+RecorderState::Stopping
+→ RecorderState::Failed
 ```
 
-不通过简单文件系统类型检测来“证明”这些语义。
+Recorder 能否 durable 写入 `TaskState::Failed` 由 Manifest 当前可靠性决定；不能在 Manifest durability 已失去可信基础时继续假装写入 Failed。详见 §2.1 与 §6.1。
 
-V1.0 不新增：
+## 5.3 Normal / Timed / Rolling
+
+### Normal
+
+持续录制直到：
 
 ```text
-storage.allow_network_fs
+explicit Stop
+safety Stop
+Runtime Shutdown
+unrecoverable failure
 ```
 
-强制开关。
+零消息 Task 可以合法完成。
 
-实现可以对已知 network/fuse filesystem 输出 warning，但它只是诊断。
+### Timed
 
-Segment COMPLETE 顺序：
+Producer hard deadline 是 correctness boundary。
 
-1. ingress closed；
-2. Producer Drain；
-3. Writer Drain；
-4. Writer close；
-5. fsync 必要文件；
-6. fsync segment directory；
-7. 如新建目录，fsync task directory；
-8. durable Manifest COMPLETE。
+Timer 只是及时触发 Stop。
 
-Start 创建 task directory 后，首个 durable Manifest 之前还要：
-
-```text
-fsync(output_root)
-```
-
-## 4.3 MCAP Schema、CDR、时间戳和独立分析
+### Rolling
 
 使用：
 
 ```text
-rosbag2_cpp
-mcap storage plugin
-cdr
+segment_duration
+retention_duration
 ```
 
-Compression：
+逻辑 live window 与物理 Segment 分离。
 
-```text
-NONE
-LZ4
+#### live_window_started_at
+
+每个物理 Segment 内部维护：
+
+```cpp
+std::optional<std::chrono::steady_clock::time_point>
+    live_window_started_at;
 ```
 
-Task 开始时冻结。
+Snapshot replay 不设置该字段。
 
-### Schema 目标
-
-每个实际写入 Channel 必须拥有：
+只有该 Segment 第一条**成功写入 Writer 的 Live message**：
 
 ```text
-正确 Topic name
-ROS type
-serialization format
-Schema
-传递依赖闭包
+live_window_started_at = now
+window_deadline = live_window_started_at + segment_duration
 ```
 
-自定义消息在分析机没有原始 ROS package 时仍需能够解码。
+后续消息不重置。
 
-无法取得完整闭包：
+#### 空窗口
+
+没有 Live：
 
 ```text
-SCHEMA_UNAVAILABLE
+do not periodically close/open
+do not allocate new segment_id
 ```
 
-不允许：
+#### Rotate
 
-```text
-type-name-only degraded success
+```mermaid
+sequenceDiagram
+    participant R as Recorder
+    participant W as Writer
+    participant M as Manifest
+    participant S as Snapshot
+
+    R->>R: close ingress
+    R->>W: Drain old Segment
+    W-->>R: drained
+    R->>W: Close old Segment
+    W-->>R: closed
+    R->>M: durable COMPLETE
+    M-->>R: committed
+    R->>W: Open/register successor
+    W-->>R: ready
+    R->>S: replay Snapshot
+    S-->>W: replay messages
+    R->>R: maybe_open_ingress()
 ```
 
-### Timestamp
+
+
+#### first-live 通知机制
+
+Producer 不直接设置 `live_window_started_at`，因为“成功进入 Queue”不等于“成功写入物理 Segment”。
+
+正确流程：
 
 ```text
-MCAP log_time
-=
-receive_timestamp
-
-MCAP publish_time
-=
-receive_timestamp
+first Live message reaches Writer
+→ Writer write succeeds
+→ WriterResult(first_live_written, segment_id, steady_time)
+→ Recorder serial mutation domain
+→ revalidate generation + segment_id
+→ if live_window_started_at is null: set it and arm deadline
 ```
 
-不声称是真实 source publish time。
+失败写入不启动 live window。
 
-### ResolvedMessageDefinition
+#### Rolling timer
 
-Topic preflight 生成不可变：
+V1 不增加 ROS Timer 或独立 Rolling timer thread。
+
+Recorder 的唯一串行 mutation thread 本身维护下一次 steady deadline，并使用：
 
 ```text
-normalized type
-schema encoding
-full dependency text
-optional type hash
-schema_sha256
+condition_variable::wait_until(next_deadline)
 ```
 
-### Jazzy
+或同一 event-loop 上等价的 steady timed wait。
 
-使用官方：
+任何新的内部/外部事件入队后：
 
 ```text
-LocalMessageDefinitionSource
+notify_one()
 ```
 
-等公开 API。
+让 mutation loop 重新计算最早 deadline。
 
-Writer 可显式传入 MessageDefinition 时，必须传入冻结定义。
+当 wait_until 因 deadline 到达返回时，**同一个串行 mutation loop**把它当作 `RotateDue` 内部事件处理，不需要再把 timer 事件转发到第二条普通队列，因此不会产生“第二个 Timer thread 与 Recorder mutation loop 谁先入队”的额外状态机。
 
-### Humble
-
-Humble 0.15.x 标准 Writer 路径不能稳定依赖 internal Header。
-
-V1 提供项目自己的：
+first-live WriterResult 到达时必须重新验证：
 
 ```text
-HumbleMessageDefinitionResolver
+generation == current generation
+segment_id == current segment
+live_window_started_at is null
 ```
 
-兼容层。
+任一不满足都说明通知已 stale，直接忽略；绝不能把旧 Segment 的迟到通知用于启动 successor Segment 的 timer。
 
-算法/格式以锁定的 Humble MCAP resolver 行为为基线。
+#### Pause 期间
 
-项目自身 LICENSE 为：
+Pause 关闭 Live ingress，但 steady-clock live window 不倒退。
+
+若已有 Live 的当前 Segment 在 Pause 期间到达 deadline：
 
 ```text
-Apache License 2.0
+rotate_pending = true
 ```
 
-rosbag2 上游相关代码同样采用 Apache-2.0。
+V1.0 不为了 Pause 本身立即创建新的 successor Segment。
 
-因此在项目内复用、移植或修改对应 Apache-2.0 resolver 实现不存在许可证模型冲突，但必须遵守上游许可证要求。
-
-若复制/修改上游源码：
+Resume 在 reopen ingress 之前：
 
 ```text
-保留原 copyright/license header
-保留适用 attribution
-若上游发行包含适用 NOTICE，则维护对应 NOTICE
-记录来源 repository/tag/commit
-对修改文件标识已修改
+if rotate_pending:
+    finalize current Segment
+    durable COMPLETE
+    open/register successor
+    replay Snapshot
+    clear rotate_pending
+
+then maybe_open_ingress()
 ```
 
-不得只把代码复制进项目而丢失来源信息。
+Retention/Cleanup 与 Paused 状态独立：旧 COMPLETE Segment 仍可以按 retention 进入 DELETING/REMOVED。
 
-Resolver：
+如果 Pause 后最终直接 Stop，则不必为了 `rotate_pending` 额外创建 successor；直接按 Stop finalization 完成当前 Segment。
+
+#### Replay-only Segment
+
+如果 successor 已经写入真实 replay message，但一直没有 Live：
 
 ```text
-每 Topic Epoch 只完整 resolve 一次
+written_live == 0
+live_window_started_at == null
 ```
 
-冻结：
+则：
 
-```text
-encoding
-schema bytes
-SHA-256
+- 不启动 rolling live timer；
+- 不周期性再 Rotate；
+- Stop 时正常 Close；
+- 作为真实物理 Segment 进入 COMPLETE；
+- 与其他 COMPLETE Segment 一样参与 retention。
+
+不得因为 `written_live==0` 就删除一个已经含真实 replay 数据的 Segment。
+
+## 5.4 Snapshot
+
+Snapshot 为 Rolling successor Segment 提供边界重放。
+
+### 进入 Snapshot 的唯一来源
+
+Snapshot **只保存来自 ROS callback、`RecordedMessage::replayed == false`、并且已经成功写入 Writer 的 Live message**。
+
+形式化规则：
+
+```cpp
+if (!message.replayed && writer_write_succeeded) {
+    snapshot.push(message);
+}
 ```
 
-Rolling 后续 Segment 直接复用。
-
-不每分钟重新扫描 ROS package dependency tree。
-
-### Humble 每 Segment readback
-
-因为 Humble Writer 无法显式把冻结 Definition 注入 Plugin，需要验证实际写盘结果。
-
-每 Segment Close 后只做：
+Replay message：
 
 ```text
-bounded Schema/Channel metadata readback
+replayed == true
+→ 可以写入 successor Segment
+→ 永远不再次进入 Snapshot
 ```
 
-比较：
+这是硬不变量，用来防止：
 
 ```text
-topic type
-schema encoding
-schema hash
+Live M1
+→ Snapshot M1
+→ replay M1
+→ Snapshot replay M1 again
+→ replay forever
 ```
 
-不扫描 Payload。
+### 参与范围
 
-复杂度目标：
+Rolling 模式下所有 ACTIVE Topic 默认参与 Snapshot。
 
-```text
-O(topic_count + total_schema_bytes)
-```
+V1 不提供 per-topic enable/disable 或旧 RepeatPolicy。
 
-不能：
+Topic 在 Pause 中变成 ARMED/非 ACTIVE 时，不新增 Live Snapshot；已有 Snapshot 项仍按正常配额保留，直到被驱逐或 Topic epoch 失效。
 
-```text
-O(segment payload size)
-```
-
-如果实际 Plugin Schema 与冻结定义不一致：
+### 配置
 
 ```text
-Humble V1 verification fail
-```
-
-不得降级。
-
-## 4.3.1 自包含 MCAP Schema 解析闭包与 Writer 失败决策
-
-GenericSubscription CDR bytes + type string 不足以构造自定义闭包。
-
-Resolver 需要递归解析：
-
-```text
-root message
-nested custom messages
-std messages
-arrays
-bounded sequences
-builtin time/duration
-```
-
-完整类型名去重。
-
-需要处理：
-
-```text
-missing dependency
-cycle
-unsupported format
-```
-
-负例必须拒绝。
-
-验证 fixture 至少包含：
-
-```text
-Outer
-  → Inner[]
-      → CustomNested
-  → Header
-  → bounded sequence
-```
-
-分析端不能安装原自定义 package。
-
-必须依赖 MCAP 自包含 Schema 解码。
-
-## 4.3.2 启动恢复检查与证据边界
-
-Runtime 构建 Recorder、开放 mutation service 之前，取得 output_root：
-
-```text
-non-blocking POSIX advisory exclusive lock
-```
-
-锁文件：
-
-```text
-.ros2_bag_recorder.lock
-```
-
-fd 生命周期覆盖 Runtime。
-
-退出：
-
-```text
-close fd
-```
-
-不 unlink。
-
-锁权威来自：
-
-```text
-inode advisory lock
-```
-
-不是文件文本。
-
-锁文件内容可写：
-
-```text
-pid
-runtime_instance_id
-normalized output_root
-```
-
-仅用于诊断。
-
-目录复制/迁移后，锁文件旧文本不能成为拒绝新根目录的理由。
-
-### Recovery
-
-异常：
-
-```text
-WRITING
-FINALIZING
-```
-
-→ INCOMPLETE。
-
-durable DELETING：
-
-```text
-可安全幂等继续 delete
-```
-
-真正删除成功后才：
-
-```text
-REMOVED
-```
-
-只读取证据：
-
-1. rosbag2 Reader；
-2. MCAP Schema/Channel；
-3. 独立完整 Verification。
-
-Reader 可打开不等于：
-
-```text
-Task COMPLETE
-Schema 完整
-全部 chunk 完整
-```
-
-recovery.json 记录：
-
-```text
-source identity
-check stages
-uncertain operations
-file anomalies
-```
-
-### Startup Recovery scan 的有界策略
-
-Runtime 启动 Recovery 可能面对大量历史 Task。
-
-V1.0 不建立持久化 Recovery database。
-
-启动扫描使用：
-
-```text
-streaming
-bounded-memory
-full discovery
-```
-
-方式。
-
-含义：
-
-- 一次只打开/解析有限数量的 Task Manifest；
-- 不把所有历史 Task/Segment 常驻内存；
-- CleanupWorkIndex 只保留当前有限 claim；
-- 扫描游标只是当前启动过程内的临时状态；
-- 进程重启重新扫描，不恢复旧内存 cursor。
-
-启动扫描应周期性检查：
-
-```text
-shutdown requested
-fatal root error
-```
-
-并更新有界诊断：
-
-```text
-tasks_scanned
-manifests_valid
-manifests_invalid
-deleting_found
-incomplete_found
-recovery_findings
-```
-
-实现可以记录：
-
-```text
-Recovery scan: 500 / discovered task directories
-```
-
-作为日志/启动诊断。
-
-V1.0 **不为了缩短启动时间而在 Recovery 尚未完成时提前开放普通 Recorder mutation service**。
-
-规范顺序仍是：
-
-```text
-output_root lock
-→ Recovery full safety scan
-→ Cleanup initial workset
-→ Recorder construction/open
-→ Server mutation admission
-```
-
-否则会重新引入：
-
-```text
-Recovery × Start
-Recovery × Cleanup
-Recovery × History
-```
-
-并发状态。
-
-如果未来有明确启动时间 NFR，再单独设计增量 Recovery。
-
-## 4.4 Snapshot 与分段重放
-
-Snapshot 只保存：
-
-```text
-成功写入
-RepeatPolicy.enabled
-```
-
-的消息。
-
-共享 SerializedMessage owner。
-
-按 Topic：
-
-```text
-max_messages
-max_bytes
-```
-
-按全局：
-
-```text
+snapshot.max_messages_per_topic
+snapshot.max_bytes_per_topic
 snapshot.max_total_bytes
 ```
 
-限制。
-
-超过配额：
+可选：
 
 ```text
-确定性驱逐
+snapshot.max_age
 ```
 
-不得突破内存预算。
+未配置 max_age 时只受 count/bytes 限制。
 
-Rolling：
+### 确定性驱逐
+
+Snapshot 维护一个**仅在 Snapshot 内部存在的运行期全局单调计数器**：
 
 ```text
-old Drain
-→ Finalize old
-→ open/register new
-→ replay snapshot
-→ maybe_open_ingress
+snapshot_sequence
 ```
 
-Replay：
+它：
+
+- 在每条成功 Live write 被接受进入 Snapshot 时分配；
+- 跨 Topic 全局递增，因此不同 Topic item 可以直接比较先后；
+- 不放入 RecordedMessage；
+- 不写 MCAP/Manifest/Topic Events；
+- Replay message 不分配 sequence，因为 Replay 永不进入 Snapshot。
+
+每次插入顺序固定为：
 
 ```text
-Topic ID/Epoch 保持
-timestamp 保持
-is_replayed=true
+1. assign snapshot_sequence
+2. insert new Live item
+3. enforce this Topic's max_messages/max_bytes/max_age
+4. enforce global max_total_bytes
 ```
 
-REMOVED/Epoch changed Topic 不重放。
+Per-topic 超限：
+
+```text
+只从该 Topic 删除 snapshot_sequence 最小（最旧）的 item
+```
+
+直到该 Topic 满足全部 per-topic 配额。
+
+然后检查 global budget：
+
+```text
+如果 total_bytes 仍超限
+→ 跨全部 Topic 删除全局 snapshot_sequence 最小的 item
+→ 直到满足 max_total_bytes
+```
+
+因此同时触发 per-topic/global 超限时，结果唯一、可复现，不取决于容器遍历顺序。
+
+### Replay
+
+Replay 时：
+
+- 保留 topic_id / epoch；
+- 保留 receive timestamp；
+- 构造 `RecordedMessage::replayed=true`；
+- 再次核对 Topic 当前仍属于相同 generation/epoch 且允许写入该 successor 的 schema/channel；
+- REMOVED、epoch changed 或不再属于当前 Task 的 Topic 不 replay。
 
 Replay failure：
 
 ```text
 Writer failure
+→ do not reopen ingress
 ```
 
-不得继续开放 ingress。
+Replay 本身永不修改 Snapshot，因此不存在 replay feedback loop。
 
-**Replay 本身不会启动新的 rolling live window。**
+## 5.5 Schema
 
-详见 §4.1.1。
+### 目标
 
-## 4.5 Manifest 与 Topic Event 的持久化契约
+每个 MCAP Segment 必须能够在缺少业务 ROS package 的条件下提供完整 Schema。
 
-任务至少：
+Topic Epoch 创建时解析并冻结 Schema。
+
+同一 Epoch 后续 Segment 不重复扫描依赖树。
+
+### Resolved Schema
+
+至少：
+
+```text
+root type
+encoding
+full dependency closure
+frozen definition bytes
+schema SHA
+```
+
+只允许必要稳定化：
+
+```text
+CRLF -> LF
+```
+
+不重排字段，不改写语义。
+
+### Jazzy
+
+优先使用目标 rosbag2 的可靠接口。
+
+### Humble
+
+项目内补齐缺失能力。
+
+若参考 rosbag2 MCAP resolver：
+
+- 固定来源与版本；
+- 保留 Apache attribution；
+- 测试 recursive dependency closure。
+
+### Per-Segment readback
+
+Humble 每个 Segment Close 后进行有界：
+
+```text
+Schema / Channel readback
+```
+
+确认预期自包含 Schema 实际写入 MCAP。
+
+“有界”表示只读取/枚举本 Segment 的 Schema/Channel metadata 以及对应 schema bytes，不扫描 Message payload，不按消息数量增长做全文件内容校验。
+
+Topic Add 的 Schema 解析失败：
+
+```text
+SchemaUnavailable / Effects::None
+→ 不进入 Writer register
+→ 不创建 Subscription
+```
+
+用户修复运行环境后可以重新发起 Add；Recorder 不在后台无限自动重试 Schema resolution。
+
+不要求运行时每次 Close 全量解析 payload。
+
+---
+
+# 6. 持久化、Cleanup 与 Recovery
+
+## 6.1 Manifest
+
+每个 Task 至少：
 
 ```text
 manifest.json
 topic_events.jsonl
 ```
 
-异常恢复：
+Recovery 可以产生：
 
 ```text
 recovery.json
 ```
 
-### Manifest
+### Manifest fields
 
 至少：
 
@@ -4272,11 +3309,11 @@ recovery.json
 schema_version
 manifest_revision
 recording_id
-recording_generation
-effective_config
-recording_state
+generation
+task_config
+task_state
 topic_events_file
-last_error
+error
 secondary_errors
 segments
 segment_history_summary
@@ -4297,1321 +3334,1044 @@ completed_at_ns
 null
 ```
 
-不用 0 sentinel。
+不使用 0 sentinel。
 
-删除授权：
+### Primary / secondary error
+
+`error`：
+
+> 第一个决定 Task 失败终态的根因。
+
+后续失败：
 
 ```text
-segments[].state == DELETING
+secondary_errors[]
 ```
 
-是唯一 durable truth。
-
-不维护：
+最多：
 
 ```text
-cleanup_pending[]
-```
-
-### manifest_revision
-
-V1.0 固定类型：
-
-```text
-uint64_t
-```
-
-语义：
-
-#### 新 Task
-
-首个 durable Manifest：
-
-```text
-manifest_revision = 1
-```
-
-#### 同一 Manifest 后续 mutation
-
-每次成功 durable 提交：
-
-```text
-N → N + 1
-```
-
-只有成功完成：
-
-```text
-temp write
-fsync(temp)
-rename
-fsync(parent)
-```
-
-后，新的 revision 才进入 durable fact。
-
-#### Runtime restart / Recovery
-
-同一个 Task Manifest 的 revision **不得重置为 0 或 1**。
-
-Recovery 读取当前可信：
-
-```text
-manifest_revision = N
-```
-
-下一次 mutation：
-
-```text
-N + 1
+8
 ```
 
 例如：
 
 ```text
-27 → Runtime restart → Recovery mutation → 28
+Writer Close failed        -> error
+Manifest follow-up failed  -> secondary_errors[0]
+Cleanup shutdown failed    -> secondary_errors[1]
 ```
 
-不是：
+后续错误不能覆盖根因。
+
+如果 secondary error 本身无法再 durable：
+
+- 不伪造已经持久化；
+- 尽力写结构化进程日志。
+
+
+
+### 持久化 Error 字段
+
+Manifest 中 primary `error` 与 `secondary_errors[]` 保存：
 
 ```text
-27 → 1
+ErrorCode
+Effects
+bounded sanitized message
 ```
 
-否则 revision 无法用于 stale baseline / unexpected external mutation 诊断。
+message 最大 512 bytes，禁止写入：
+
+```text
+credential
+API key
+未经脱敏的绝对外部路径
+raw exception dump / stack trace
+```
+
+完整底层诊断进入受控结构化日志。
+
+内存中的 `Error.message` 可以更长；Manifest 中 message 的**最终总长度严格不超过 512 bytes**。需要截断时先为 ASCII `...` 预留 3 bytes，再保留最长的合法 UTF-8 code-point 前缀（最多 509 bytes），最后追加 `...`；因此实际前缀可能小于 509 bytes，但最终总长度始终 `<= 512`。不能因为 message 超长拒绝整个 Manifest commit，也不能产生非法 UTF-8。
+
+### manifest_revision
+
+```text
+uint64_t
+first durable Task Manifest = 1
+same Task durable mutation N -> N+1
+restart/recovery continues current N
+never wrap
+```
 
 #### Overflow
 
-如果：
+当：
 
 ```text
 manifest_revision == UINT64_MAX
 ```
 
-禁止下一次 Manifest mutation。
+下一次需要 Manifest mutation 时：
 
-不得 wrap 为 0。
+1. 禁止 mutation；
+2. 关闭 Task ingress；
+3. 返回 `StorageError`；
+4. 内存态进入失败收尾；
+5. 不允许 wrap 到 0；
+6. 不声称 durable 写入 Failed；
+7. Recovery 下次按现存非终态 Manifest 保守形成 INCOMPLETE/诊断。
 
-任务进入：
+当前进程运行态固定为：
 
 ```text
-STORAGE_UNAVAILABLE
-或
-FAILED / Recovery intervention
+RecorderState::Failed
+Task ingress CLOSED
+new Start disabled
 ```
 
-并保留现有 Manifest。
+Recorder 只完成能够安全执行且不需要新的 Manifest mutation 的资源收尾；本 Runtime 不再回 Idle 接受新 Start，必须 Runtime restart + Recovery 重新建立 persistence authority。
 
-现实运行中几乎不会达到该值，但协议不允许整数回绕。
+### Recovery 遇到 revision exhaustion
 
-### Manifest commit
+如果 startup Recovery 读取到：
+
+```text
+manifest_revision == UINT64_MAX
+```
+
+它不能再通过 Manifest mutation 把该 Task 写成新的 `Incomplete`，因为不存在合法的 `N+1` revision。V1 固定行为：
+
+- 原 `manifest.json` 保持只读，不 wrap、不改写；
+- Recovery 的历史视图把该 Task 分类为 `TaskState::Incomplete`；
+- 记录 recovery finding：`manifest_revision_exhausted`；
+- 如需 `recovery.json`，使用其独立 atomic replace 诊断文件记录该 finding，不声称它改变了 Manifest TaskState；
+- 该旧 Task 永远不再接受任何 Manifest mutation；
+- 新 Runtime 可以继续服务新的 recording_id，但不能复用/恢复该 exhausted Task。
+
+因此“Recovery 形成 Incomplete”在此处是**恢复后的领域读取视图**，不是伪造一个不存在的 durable Manifest revision。
+
+### Commit
+
+每个 durable transition 独立：
 
 ```text
 write temp
-→ fsync(temp)
-→ close
-→ rename
-→ fsync(parent)
+→ fsync temp
+→ atomic rename
+→ directory fsync
 ```
 
-rename 后 parent fsync 失败：
+V1.0：
 
 ```text
-durability UNKNOWN
+no Manifest batch timer
+no min update interval batching
 ```
 
-不能报告成功。
+Manifest 只有一个逻辑 writer。
 
-### Topic Events
+### directory fsync 失败：durable outcome uncertain
 
-字段：
+如果：
 
 ```text
-schema_version
-event
+old revision = N
+write/fsync temp for N+1 success
+rename success
+directory fsync fails or result cannot be trusted
+```
+
+当前进程无法安全证明重启后磁盘会看到 N 还是 N+1。
+
+因此必须：
+
+```text
+StorageError / Effects::Possible（按调用上下文）
+→ mark Manifest durable outcome uncertain
+→ close Task ingress
+→ stop further Manifest mutations in this Task
+→ do not assume current durable revision is N
+→ do not assume current durable revision is N+1
+```
+
+`manifest_durability_uncertain` 是纯当前进程内存 poison state。不能为了“记录这个 flag”再尝试写一个新的 Manifest 字段，因为问题本身就是 Manifest durability 已无法证明。进入该状态后：
+
+```text
+RecorderState = Failed
+Task ingress CLOSED
+new Start disabled
+```
+
+尤其禁止继续基于“内存里的 N+1”提交 N+2、N+3，因为 durable revision chain 已失去可信基线。
+
+当前进程仍可做不需要新增 Manifest mutation 的最小安全资源收尾，但不能再声称新的 Task/Segment durable terminal。
+
+下次 Recovery：
+
+```text
+read actual manifest.json from media
+→ validate whichever complete revision is visible
+→ rebuild facts from media
+```
+
+不能用上次进程的内存 revision 推断介质事实。
+
+## 6.2 Topic Events
+
+`topic_events.jsonl` 保存 Topic 生命周期 durable 事实，不是应用日志。
+
+每个 Task 内 `event_seq` 使用单一 `uint64_t` 单调递增序列，所有 Topic / Add / Remove Event 共享同一 seq 空间；不是 per-topic 或 per-operation 序列。
+
+每条至少：
+
+```text
 event_seq
-recording_id
 origin
-operation_id
-cause
+operation_id if external
 topic_id
 topic_epoch
-name
-type
-error_code
-error_message
-details
-at_ns
+event type
+timestamp
 ```
 
-正式 Event：
+Add：
 
 ```text
-TOPIC_ADD_PREPARED
+ADD_PREPARED
 TOPIC_ADDED
-TOPIC_ADD_FAILED
-TOPIC_REMOVE_PREPARED
+ADD_FAILED
+```
+
+Remove：
+
+```text
+REMOVE_PREPARED
 TOPIC_REMOVED
-TOPIC_REMOVE_FAILED
+REMOVE_FAILED
 ```
 
-Event append 要处理：
+### TopicOperationState
 
-```text
-short write
-fsync failure
-close failure
-truncated tail
+```cpp
+enum class TopicOperationState {
+    ConfirmedSuccess,
+    ConfirmedFailure,
+    Uncertain,
+    NotFound
+};
 ```
 
-### 示例
+Add/Remove 使用同一规则：
 
-```json
-{
-  "schema_version": 1,
-  "manifest_revision": 27,
-  "recording_id": "robot_test_001",
-  "recording_generation": 12,
-  "effective_config": {
-    "mode": "ROLLING",
-    "duration_seconds": null,
-    "segment_duration_seconds": 60,
-    "retention_duration_seconds": 600,
-    "compression": "LZ4",
-    "timestamp_policy": "RECEIVE"
-  },
-  "recording_state": "RECORDING",
-  "topic_events_file": "topic_events.jsonl",
-  "last_error": null,
-  "secondary_errors": [],
-  "segments": [
-    {
-      "segment_id": 0,
-      "path": "segment_000000",
-      "state": "COMPLETE",
-      "completed_at_ns": 1790000000000000000
-    },
-    {
-      "segment_id": 1,
-      "path": "segment_000001",
-      "state": "WRITING",
-      "completed_at_ns": null
-    }
-  ]
-}
-```
-
-### Manifest single writer
-
-运行期 Manifest mutation 只能由：
-
-```text
-RecorderControlSequencer
-```
-
-提交。
-
-以下组件不能直接 Manifest read-modify-write：
-
-```text
-Writer
-CleanupWorker
-ResourceMonitor
-History
-Server
-```
-
-Recovery 是启动阶段唯一例外。
-
-### CleanupCompletion
-
-Cleanup claim 携带：
-
-```text
-recording_id
-segment_id
-segment_path_identity
-authorized_manifest_revision
-```
-
-`authorized_manifest_revision` 是：
-
-> Segment 获得 durable DELETING 授权时的 Manifest baseline。
-
-它是诊断信息，不要求 Completion 时：
-
-```text
-current revision ==
-authorized revision
-```
-
-因为删除期间可能发生：
-
-```text
-Rolling
-Topic Event related manifest mutation
-其他合法 Segment mutation
-```
-
-Sequencer Completion 重新验证：
-
-```text
-recording_id
-segment_id
-segment_path_identity
-current state
-```
-
-当前：
-
-```text
-DELETING
-```
-
-→ 在最新 revision 基础上提交 REMOVED。
-
-当前：
-
-```text
-REMOVED
-```
-
-→ duplicate completion，幂等 no-op。
-
-当前：
-
-```text
-COMPLETE
-WRITING
-FINALIZING
-INCOMPLETE
-```
-
-或 path identity 改变：
-
-```text
-严重 Manifest/Storage invariant conflict
-```
-
-不能把它悄悄当普通 stale claim 丢弃。
-
-只有：
-
-```text
-DELETING claim
-+
-current already REMOVED
-```
-
-属于普通可忽略 stale/duplicate completion。
-
-### Topic Event crash matrix
-
-PREPARED 前崩溃：
-
-```text
-无 durable operation evidence
-```
-
-PREPARED 后、实际动作前：
-
-```text
-UNCERTAIN
-```
-
-Writer registered、Subscription 未创建：
-
-```text
-不能用 Channel 证明 Add success
-```
-
-Subscription created、TOPIC_ADDED 未 durable：
-
-在 v0.2.10 中该 Topic gate 仍 CLOSED，因此：
-
-```text
-不会有该 Epoch 的 live data admission
-```
-
-Recovery：
-
-```text
-UNCERTAIN
-```
-
-TOPIC_ADDED durable、gate 尚未开放就崩溃：
-
-```text
-Historical Evidence = CONFIRMED_ADDED
-消息数可以为 0
-```
-
-这不是矛盾。
-
-REMOVE_PREPARED durable、detach 未完成：
-
-```text
-UNCERTAIN
-```
-
-REMOVED durable：
-
-```text
-CONFIRMED_REMOVED
-```
-
-### Cleanup crash matrix
-
-| 阶段 | Recovery |
+| durable evidence | TopicOperationState |
 |---|---|
-| COMPLETE | 未授权 delete |
-| DELETING durable、尚未删除 | 幂等继续 |
-| 删除一半 | 幂等继续 |
-| 路径已不存在、REMOVED 未 durable | 验证 identity 后提交 REMOVED |
-| REMOVED durable 但目录存在 | 事实冲突，保留诊断 |
-| INCOMPLETE | 不自动 delete |
+| success terminal | ConfirmedSuccess |
+| failure terminal | ConfirmedFailure |
+| PREPARED 后缺可信 terminal | Uncertain |
+| 完整可信扫描后无匹配 operation_id | NotFound |
 
-## 4.6 Segment 清理授权与异常恢复
-
-Segment：
+Remove 成功就是：
 
 ```text
-WRITING
-→ FINALIZING
-→ COMPLETE
-→ DELETING
-→ REMOVED
-
-FINALIZING failure/crash
-→ INCOMPLETE
+TOPIC_REMOVED durable
+→ ConfirmedSuccess
 ```
+
+Remove failure terminal：
+
+```text
+→ ConfirmedFailure
+```
+
+### TaskState 与 TopicOperationState 独立
+
+合法：
+
+```text
+TaskState::Incomplete
++
+TopicOperationState::ConfirmedSuccess
+```
+
+表示某个 Topic 操作 durable 成功，但 Task 后续因其他原因 INCOMPLETE。
+
+## 6.3 Topic Event uncertainty watermark
+
+关键 Event append/fsync 结果无法确认：
+
+```text
+topic_events_uncertain_from_seq = current_seq
+```
+
+`current_seq` 就是这次无法确认 durable outcome 的 Event sequence；watermark 从该 seq **包含式**生效：
+
+```text
+event_seq >= topic_events_uncertain_from_seq
+→ poisoned / cannot become ConfirmedSuccess in current process
+```
+
+因此如果第一条 PREPARED（seq=1）就发生 uncertainty，当前 Task 的 Topic Event chain 从第一条开始全部进入 fail-safe uncertainty。这是刻意设计，不是 off-by-one。
+
+一旦设置：
+
+- 禁止新的外部 Topic mutation；
+- 原始文件保留；
+- 在途安全收尾可以继续尝试；
+- 后续一次 fsync 成功不能清除 watermark；
+- 当前进程不再把 watermark 覆盖范围内的 durable chain 升级为 confirmed success。
+
+对：
+
+```text
+event_seq >= watermark
+```
+
+的外部在途 Add/Remove：
+
+```text
+Completion 最终不能返回 Success
+→ EventCommitFailed / Effects::Possible
+```
+
+触发 watermark 的**当前 operation 自己也属于该范围**。例如 `ADD_PREPARED` 的 `event_seq == current_seq` 且其 fsync outcome 无法确认时，该 Add Completion 立即确定为 `EventCommitFailed / Effects::Possible`；不能因为 Writer register 尚未开始就降成 `Effects::None`。
+
+即使后续 TOPIC_ADDED / TOPIC_REMOVED 行文本在当前文件中可读，也不能在同一进程里撤销这次 uncertainty。
+
+### 当前进程查询
+
+```text
+topic_operation_state()
+→ Uncertain
+```
+
+只要目标 operation 的证据落入 watermark 覆盖的因果链。
+
+### 重启 Recovery 后
+
+watermark 是**当前进程观察到 durable outcome 不确定**的内存安全边界，不需要把“fsync 曾返回失败”这一调用过程事实持久化到 Event 文件中。
+
+新 Runtime 启动 Recovery 时，可以重新基于**当前介质事实**验证整个 Topic Event chain。要把某个 operation 从 Uncertain 提升为 ConfirmedSuccess/ConfirmedFailure，至少必须同时满足：
+
+1. Event 文件从头到 EOF 可完整安全读取，无截断尾行；
+2. 每行 JSON / schema_version / 必需字段合法；
+3. `event_seq` 在 Task 内从合法起点严格连续递增，无重复、回退和跳号；
+4. Manifest 记录的 Task identity 与 Event 文件中的 recording_id/generation 一致；
+5. 同一 `operation_id` 只关联一个 operation kind；
+6. PREPARED 与 terminal 的 topic_id/topic_epoch/operation kind 完整一致；
+7. 同一 operation 不存在多个互相矛盾 terminal；
+8. Event 顺序满足合法状态转换，不出现 terminal-before-prepared 等因果倒置；
+9. 若 Manifest/Recovery 已记录 Event uncertainty/corruption finding，不得被局部一行 terminal 直接覆盖。
+
+验证后：
+
+```text
+合法 success terminal
+→ ConfirmedSuccess
+
+合法 failure terminal
+→ ConfirmedFailure
+
+只有 PREPARED 或仍存在无法解释缺口/冲突
+→ Uncertain
+```
+
+这只说明**现在可确认的持久化领域事实**，不能改写旧 HTTP 请求当时的 UNKNOWN/FAILURE 回执历史。
+
+V1 不提供运行期在线 `rerun_recovery()` / repair API。启动 Recovery 后仍然 Uncertain 的 Task 保持 Uncertain，直到下一次 Runtime restart 再次 Recovery，或管理员离线分析/修复；Recorder 不为了提升可用性在运行期主动重写旧 Event chain。
+
+### watermark 后的当前 Task 用户路径
+
+watermark 设置后：
+
+```text
+new external Add/Remove = rejected
+State/read-only query = allowed
+Stop/Shutdown = allowed
+```
+
+不允许“清 watermark 后重试”。用户需要安全结束当前 Task，并在新的 Task 使用新的 operation_id 重试。
+
+## 6.4 Segment 生命周期与 Cleanup
+
+```mermaid
+stateDiagram-v2
+    WRITING --> FINALIZING
+    FINALIZING --> COMPLETE
+    FINALIZING --> INCOMPLETE
+    COMPLETE --> DELETING
+    DELETING --> REMOVED
+```
+
+`DELETING` 是唯一 durable delete authorization。
 
 ### 删除协议
 
-1. 只有 COMPLETE 可获得 retention cleanup 资格。
-2. Sequencer durable：
-   ```text
-   COMPLETE → DELETING
-   ```
-3. durable 后才能进入 Cleanup execution cache。
-4. Worker 执行文件删除。
-5. Worker 回报 Completion。
-6. Sequencer 验证 current Manifest。
-7. durable：
-   ```text
-   DELETING → REMOVED
-   ```
+```text
+COMPLETE
+→ durable DELETING
+→ enqueue bounded cleanup work
+→ filesystem delete
+→ Cleanup completion
+→ Recorder revalidate current Manifest
+→ durable REMOVED
+```
 
-### CleanupWorker
+### Cleanup claim
 
-单线程。
+运行期 claim：
+
+```text
+recording_id
+segment_id
+segment path identity
+authorized_manifest_revision
+retry state
+```
+
+`authorized_manifest_revision`：
+
+```text
+diagnostic only
+```
+
+不是完成时必须相等的 CAS 条件。
+
+### Completion revalidation
+
+Cleanup 返回后：
+
+```text
+current state == DELETING
+→ commit REMOVED
+
+current state == REMOVED
+→ stale duplicate / idempotent no-op
+
+anything else
+→ invariant conflict
+→ do not commit REMOVED
+→ severe diagnostic
+```
+
+仅：
+
+```text
+current_manifest_revision != authorized_manifest_revision
+```
+
+不是 conflict。
+
+### Cleanup queue
 
 默认：
 
 ```text
-cleanup.queue_capacity=16
-cleanup.retry_interval_sec=2
+cleanup.queue_capacity = 16
+cleanup.retry_interval_sec = 2
 ```
 
-队列满：
+queue full：
 
-```text
-不阻塞 Sequencer
-不 drop oldest durable authorization
-cleanup_queue_full_count++
-```
-
-因为 durable DELETING 仍在 Manifest，可稍后重新 claim。
-
-### CleanupWorkIndex
-
-只是：
-
-```text
-runtime
-bounded
-rebuildable
-```
-
-的执行索引。
-
-不是持久化真相。
-
-entry：
-
-```text
-recording_id
-segment_id
-task directory
-segment_path_identity
-authorized_manifest_revision
-retry state
-queued/active
-```
-
-Runtime Recovery 从 Manifest 重建。
-
-### 启动扫描
-
-沿用 §4.3.2：
-
-```text
-streaming bounded-memory scan
-```
-
-不要求把所有 DELETING 常驻内存。
-
-初始发现大量 DELETING：
-
-```text
-只把 Queue/WorkIndex 能容纳的有限部分 claim
-其余仍由 durable Manifest 保存
-```
-
-Worker 完成一项后按运行期扫描游标补充。
-
-启动阶段不开放普通 mutation service。
-
-### Retry
-
-Worker 失败后：
-
-```text
-Sequencer 保持 DELETING
-attempt_count++
-next_retry_at
-```
-
-本进程 next_retry_at 使用 steady clock。
-
-重启后重新建立 retry schedule。
-
-### CleanupWorkIndex 与 Manifest 冲突
-
-claim 回来时：
-
-```text
-current == DELETING
-→ 可以继续/完成
-
-current == REMOVED
-→ stale duplicate
-→ 丢弃 claim
-
-current != DELETING && current != REMOVED
-→ invariant conflict
-→ 不继续删除
-→ severe diagnostic
-```
-
-不能把后一类冲突全部当普通 stale claim。
-
-### 阻塞
+- 不阻塞 Recorder mutation 域；
+- 不 drop durable DELETING；
+- 后续从 Manifest 重新 claim。
 
 `remove_all()` 永久阻塞：
 
-```text
-不增加 Worker
-不由 Coordinator/Writer 线程兜底
-不 detach 继续析构
-```
+- CleanupResult 在调用返回前保持不存在/unfinished；
+- Recorder 串行域不等待在 Cleanup Thread 的调用栈上，因此可继续处理其他独立事件；
+- 不创建额外 Worker 绕过；
+- 不 detach；
+- Shutdown 若必须等待 Cleanup 退出，最终可以进入 `UNSAFE_TO_DESTROY`。
 
-Shutdown 进入 Runtime watchdog/UNSAFE_TO_DESTROY。
+## 6.5 Recovery
 
-# 5. 资源保护、状态快照与配置
+### 启动顺序
 
-## 5.1 ResourceMonitor 与磁盘保护
-
-ResourceMonitor 提供：
+Runtime 编排启动顺序，但调用的是 Recorder 领域的 `recovery.*` 能力：
 
 ```text
-Disk Safety
-Process Telemetry
+Runtime acquire output_root lock
+→ invoke recorder::Recovery (startup-only)
+→ construct/open Recorder runtime execution domains
+→ Recorder normal mutation admission
+→ Server admission
 ```
 
-普通 telemetry 可配置关闭。
+Recovery 未完成前不开放普通 mutation。
 
-Disk Protection 不可因：
-
-```text
-resource.enabled=false
-```
-
-关闭。
-
-### Disk Sample
-
-包含：
-
-```text
-total
-available
-used_percent
-last_success
-last_attempt
-failure_count
-```
+### 扫描
 
 使用：
 
 ```text
-f_bavail * f_frsize
+streaming
+bounded memory
 ```
 
-计算可用空间。
-
-状态：
+检查：
 
 ```text
-NORMAL
-WARNING
-CRITICAL
-UNKNOWN
+Manifest
+Topic Events
+Segment paths/states
+DELETING
+INCOMPLETE
+Schema/metadata
+path containment
 ```
 
-UNKNOWN 条件：
+不把所有历史 Task 常驻内存。
+
+### 保守原则
+
+Recovery：
+
+- 不继续旧 Task Recording；
+- 不把旧 Topic 恢复 ACTIVE；
+- 不把缺 terminal 的 operation 伪造成成功；
+- 不自动删除 INCOMPLETE；
+- 不覆盖无法解释的数据。
+
+### Topic operation query error
+
+`topic_operation_state()`：
 
 ```text
-无可信 sample
-failure threshold
-sample too old
+文件正常可读，但证据不足
+→ Result value = Uncertain
+
+完整可信扫描无匹配
+→ Result value = NotFound
+
+文件无法安全读取/解析/验证
+→ Result error = StorageError
 ```
 
-旧数字可以保留用于诊断，但不能继续当 CURRENT。
+不能把“文件损坏”降级为 NotFound。
 
-### Disk Protection
 
-CRITICAL/UNKNOWN：
+
+### recovery.json
+
+`recovery.json` 不是每个正常 Task 的必备文件。
+
+只有 Recovery 产生需要保留的 finding、修正解释或诊断证据时才写。
+
+对每个需要写 recovery.json 的 Task：
 
 ```text
-关闭新 admission
-已接纳消息按安全路径 Drain
+read/validate Manifest + Topic Events + Segment facts
+→ form Recovery finding
+→ write temp recovery.json
+→ fsync
+→ atomic rename
+→ directory fsync
+→ then continue next Task
 ```
 
-不能直接丢 Queue 后声称 success。
+单 Task 的 recovery.json 写入使用与 Manifest 相同级别的受控 atomic replace 原则。
 
-USER Pause 保持独立。
+Recovery 中途进程崩溃：
+
+- 已 durable 完成的 recovery.json 保留；
+- 未完成 Task 下次重新扫描；
+- 不因为 recovery.json 缺失就把原始 Manifest/Segment 删除或覆盖。
+
+## 6.6 POSIX durability
+
+生产部署要求文件系统可信支持：
+
+```text
+fsync
+directory fsync
+atomic rename
+write barrier
+```
+
+不通过 filesystem type 名字证明安全。
+
+不增加：
+
+```text
+storage.allow_network_fs
+```
+
+强制开关。
+
+已知 network/fuse filesystem 可以 warning，但正确性依赖部署验证。
+
+---
+
+# 7. 状态观测、任务查询与配置
+
+## 7.1 Resource Monitor 与 Disk protection
+
+周期采样：
+
+```text
+disk usage/free
+CPU
+RSS
+FD
+thread count
+```
+
+采样不得持 Recorder 热路径锁。
+
+### DiskSafetyState
+
+```cpp
+enum class DiskSafetyState {
+    Normal,
+    Warning,
+    Critical,
+    Unknown
+};
+```
+
+它描述最新环境安全判断。
+
+`DiskPauseReason` 描述：
+
+> 为什么 ingress 当前仍暂停。
+
+合法：
+
+```text
+DiskSafetyState::Normal
++
+DiskPauseReason::RecoveryPending
+```
+
+默认策略：
+
+```text
+warning = 80%
+pause = 90%
+resume = 85%
+min_free = 2 GiB
+sample = 2s
+max_age = 10s
+consecutive_failures = 3
+stable = 10s
+auto_resume = false
+```
+
+任一满足 `sample stale` 或 `consecutive sample failure threshold reached` 即可进入 Unknown；两者同时发生时结果相同，不需要优先级。
+
+`DiskSafetyState::Warning` 只用于诊断/提前告警，不触发 Pause，也不设置 DiskPauseReason。
+
+Critical / Unknown：
+
+```text
+Producer hard gate reject
+→ update DiskPauseReason
+→ RecorderState::Paused
+```
 
 安全恢复：
 
 ```text
-auto_resume=true
-→ 系统原因解除后可自动 reopen
-
-auto_resume=false
-→ DISK_RECOVERY_PENDING
-→ 等用户 Resume
+stable period
+→ auto_resume=true  -> clear disk pause
+→ auto_resume=false -> RecoveryPending
 ```
 
-### 首样本
+Warning 仅为诊断：下一次有效 sample 低于 warning threshold 即回到 Normal，不使用 Critical/Unknown 的 stable period。
 
-Start 不自己调用 `statvfs()`。
+## 7.2 Current State
 
-ResourceMonitor Worker 启动后立即采样。
+`state()` 返回按值、generation 自洽的当前 Recorder 快照。
 
-Start 最多等待：
+### 小型观测值对象
+
+```cpp
+struct QueueState {
+    std::size_t used_messages = 0;
+    std::size_t max_messages = 0;
+    std::size_t used_bytes = 0;
+    std::size_t max_bytes = 0;
+};
+
+struct PoolState {
+    std::size_t capacity = 0;
+    std::size_t in_use = 0;
+    std::uint64_t allocation_failures = 0;
+};
+
+enum class TopicRuntimeState {
+    Adding,
+    Armed,
+    Active,
+    Removing,
+    Removed,
+    Failed
+};
+
+struct TopicState {
+    TopicInfo info;
+    TopicRuntimeState state = TopicRuntimeState::Adding;
+
+    std::size_t publisher_count = 0;
+    std::optional<bool> qos_compatible;
+    bool publisher_visibility_fresh = false;
+
+    std::optional<double> actual_hz;
+    std::optional<bool> gap;
+
+    std::uint64_t received_messages = 0;
+    std::uint64_t written_messages = 0;
+    std::uint64_t dropped_messages = 0;
+};
+
+struct SegmentState {
+    std::uint64_t segment_id = 0;
+    SegmentLifecycleState state = SegmentLifecycleState::Writing;
+
+    std::uint64_t written_messages = 0;
+    std::uint64_t written_bytes = 0;
+
+    bool has_live_messages = false;
+    bool has_replayed_messages = false;
+};
+
+struct CleanupState {
+    std::size_t queued_count = 0;
+    std::size_t pending_total = 0;
+
+    std::optional<std::uint64_t> active_segment_id;
+    std::optional<std::chrono::milliseconds> active_for;
+    bool warning_active = false;
+
+    std::uint64_t queue_full_count = 0;
+    std::uint64_t total_removed = 0;
+    std::optional<Error> last_error;
+};
+```
+
+`TopicInfo` 只保存冻结事实；Publisher visibility / compatibility / actual_hz / gap 这些动态观测只在 TopicState 中。
+`CleanupState.active_for` 使用 steady-clock 差值，只表达当前进程中活动 delete 已持续多久；它不持久化，不暴露宿主绝对路径。每次 `state()` 采集时都按 `steady_now - cleanup_active_since` 动态计算，因此 Cleanup Thread 即使阻塞在 native delete 中，连续读取 State 仍会看到 `active_for` 增长；没有 active delete 时为 `nullopt`。
+
+Cleanup 是单线程 worker，所以 `active_segment_id` 同一时刻最多一个；`queued_count` 只统计**尚未开始**的等待项，不包含 active item，`pending_total` 则表达 durable pending 总量。`warning_active` 表示 `active_for >= cleanup.warning_sec`，只做诊断，不改变 Cleanup authority。
+
+### DropCounters / DiskSample / ProcessSample
+
+```cpp
+struct DropCounters {
+    std::uint64_t stale_identity = 0;
+    std::uint64_t not_accepting = 0;
+    std::uint64_t timed_deadline = 0;
+    std::uint64_t disk_unsafe = 0;
+    std::uint64_t disk_snapshot_busy = 0;
+    std::uint64_t queue_full = 0;
+    std::uint64_t pool_exhausted = 0;
+    std::uint64_t enqueue_failure = 0;
+};
+
+struct DiskSample {
+    DiskSafetyState state = DiskSafetyState::Unknown;
+    std::int64_t sampled_at_ns = 0;
+    bool valid = false;
+    std::uint64_t available_bytes = 0;
+    double used_percent = 0.0;
+    std::uint32_t consecutive_failures = 0;
+};
+
+struct ProcessSample {
+    std::int64_t sampled_at_ns = 0;
+    bool valid = false;
+
+    std::optional<double> cpu_percent_single_core;
+    std::optional<std::uint64_t> rss_bytes;
+    std::optional<std::uint32_t> thread_count;
+    std::optional<std::uint32_t> fd_count;
+};
+```
+
+### State
+
+```cpp
+struct State {
+    RecorderState recorder_state = RecorderState::Idle;
+    bool shutting_down = false;
+
+    std::optional<std::string> recording_id;
+    std::optional<std::uint64_t> generation;
+    std::optional<TaskConfig> task_config;
+
+    PauseState pause;
+
+    QueueState queue;
+    PoolState pool;
+    DropCounters dropped;
+
+    std::optional<DiskSample> disk;
+    std::optional<ProcessSample> process;
+    CleanupState cleanup;
+
+    std::vector<TopicState> topics;
+    std::vector<TopicInfo> topics_removed_recent;
+    std::uint64_t topics_removed_total = 0;
+
+    std::optional<SegmentState> current_segment;
+    std::optional<SegmentState> last_completed_segment;
+
+    std::optional<std::chrono::milliseconds> rotation_lag;
+    std::optional<Error> last_error;
+};
+```
+
+`last_completed_segment` 的语义固定为：
+
+- 只针对当前 Task；
+- 指当前 Task 中最近一次成功进入 durable `COMPLETE` 的 Segment；
+- Rolling 模式按 `completed_at_ns` 最大者选择，时间相同时以更大的 segment_id 作为确定性 tie-break；
+- 当前 Task 尚无 COMPLETE Segment 时为 `nullopt`；
+- Non-Rolling Task 在 Segment 完成之前同样为 `nullopt`；
+- 它不是“历史上任意 Task 的最近 Segment”，Task 切换后必须清空。
+
+State 不包含：
 
 ```text
-disk.initial_sample_timeout_ms
+all historical tasks
+all historical segments
+unbounded errors
+sync statvfs
+MCAP scan
+full output_root scan
 ```
 
-NORMAL/WARNING：
+### Snapshot 语义
+
+`state()` 只采集已经存在的内存/atomic snapshot，不在调用路径同步执行外部慢操作。
+
+### Idle / Initializing
+
+Idle：
 
 ```text
-继续
+current task = none
+topics = empty
+PauseState empty
+current segment = none
 ```
 
-CRITICAL：
+Initializing：
 
 ```text
-DISK_FULL
+recording_id/generation/task_config may be present
+RecorderState = Initializing
+PauseState empty
+ingress CLOSED
+Topic list 可能包含 Start 初始化流程已经建立的 `Adding` / `Armed` 内部 Topic 状态，但绝不伪装 ACTIVE；Initializing 期间出现这些条目只表示内部准备进度，不表示用户已经可以录制
 ```
 
-无结果/UNKNOWN：
+### Generation consistency
 
-```text
-DISK_STATE_UNKNOWN
-```
-
-### ResourceMonitor 阻塞
-
-`statvfs()` 可能永久阻塞。
-
-因此：
-
-> Disk freshness hard guarantee 不能依赖 Monitor 自己下一次醒来。
-
-Producer 在 admission 时用：
-
-```text
-valid_until
-```
-
-判定。
-
-coherent safe sample 过期：
-
-```text
-真正 DiskSafety UNKNOWN
-```
-
-关闭 accepting。
-
-这和：
-
-```text
-snapshot publish contention
-```
-
-必须严格区分。
-
-### DiskAdmission publish critical section
-
-ResourceMonitor：
-
-```text
-statvfs
-阈值计算
-字符串/错误处理
-```
-
-全部先在局部完成。
-
-之后只执行：
-
-```text
-sequence odd
-atomic state
-atomic valid_until
-sequence even
-```
-
-不允许在 odd 区内做慢操作。
-
-### Task directory no-replace
-
-Start：
-
-```text
-create_directory(task_directory)
-```
-
-或等价 no-replace。
-
-已有目录：
-
-```text
-RECORDING_EXISTS
-```
-
-不管：
-
-```text
-empty
-FAILED
-INCOMPLETE
-orphan
-```
-
-都不复用。
-
-## 5.2 RecorderStatus：线程安全、语义与成本
-
-`status()` 返回按值 Snapshot。
-
-包括：
-
-```text
-Recorder stable state
-recording_id / generation
-effective_config
-errors
-PauseReasons
-elapsed/active/paused
-Queue/Pool
-disk/process sample
-active Topics
-limited recent removed
-Topic counters
-QoS/publishers
-frequency
-Rolling current/last segment
-rotation_lag
-```
-
-### Status 与 Generation
-
-Status 中：
+同一 State 中：
 
 ```text
 Task identity
 Topic list
 Topic counters
+Segment summary
 ```
 
-必须属于同一可识别 recording_generation。
+必须来自同一 generation。
 
-推荐实现：
+实现策略固定为两级：
 
 ```text
-capture task snapshot
-→ capture Topic snapshot
-→ recheck generation
+1. optimistic capture
+2. generation recheck
+3. if changed -> retry once
+4. if changed again -> acquire short-lived Recorder snapshot lock
+5. copy coherent identity/object-pointer set
+6. release lock
+7. copy high-frequency counters from atomics
 ```
 
-如果 generation 在采样期间变化：
+因此 V1 `State` **不增加 unstable flag**，`state()` 也不改成 `Result<State, Error>`；它始终返回一个内部身份自洽快照。
+
+`shutting_down` 与 RecorderState 正交，并从首次 `shutdown()` 设置 sticky barrier 后立即为 true。
+
+## 7.3 Frequency / gap
+
+使用：
 
 ```text
-retry once
-或
-返回 marked unstable snapshot
-```
-
-不得无标记混用：
-
-```text
-new generation
-+
-old Topic list
-```
-
-Idle：
-
-```text
-mode=null
-effective_config=null
-topics=[]
-```
-
-历史任务不放进当前 Status。
-
-### 成本
-
-status() 不同步：
-
-```text
-statvfs
-MCAP read
-history directory scan
-HTTP JSON
-network
-```
-
-复杂度：
-
-```text
-O(active topics
-  + recent removed
-  + writer counters)
-```
-
-不随完整历史无限增长。
-
-### Segment Status
-
-只返回：
-
-```text
-current_segment
-last_completed_segment
-rotation_lag_ms
-```
-
-不返回完整历史 `segments[]`。
-
-## 5.2.1 actual_hz / gap 的有界计算契约
-
-输入：
-
-```text
-Recorder callback steady arrival time
-```
-
-不使用：
-
-```text
-Header.stamp
-system clock
-MCAP publish_time
+steady arrival time
 ```
 
 默认：
 
 ```text
-W=1s
-bucket=10ms
+window = 1s
+bucket = 10ms
+ring >= 2 * ceil(window / bucket) + 2
 ```
 
-Ring：
+Ring 由消息到达推进，不由 `state()` 推进。
+
+预热不足：
 
 ```text
->= 2 * ceil(W/bucket) + 2
+actual_hz = null
+gap = null
 ```
 
-默认约：
-
-```text
-202 slots
-```
-
-每 slot 带绝对 generation。
-
-### Ring 是由消息到达推进，不由 status() 推进
-
-这是 V1.0 的明确语义。
-
-当 ROS 消息持续到达时：
-
-```text
-Ring 中总是保留最近约 2W 的时间桶
-```
-
-即使 Server：
-
-```text
-5W
-10W
-```
-
-才调用一次 `status()`，最新的两个完整窗口仍可能存在，因为旧 slot 是随着**新消息时间**覆盖，而不是随着 `status()` 读取覆盖。
-
-因此：
-
-> `status()` 周期大于 2W 不等价于 Ring 必然失效。
-
-Server 采样周期主要决定：
-
-```text
-gap 状态多久才能被外部看到
-```
-
-而不是决定 Recorder 是否保存最近窗口。
-
-### Unknown 情况
-
-如果 Topic 长时间没有消息，Ring 中可能没有足够新的完整两个窗口。
-
-此时根据可证明数据：
-
-```text
-actual_hz
-gap
-```
-
-可能变为：
-
-```text
-0
-或
-UNKNOWN
-```
-
-具体取决于：
-
-```text
-Publisher 观察
-有效监测时间
-窗口是否完整
-```
-
-不能把缺少完整前一窗口的情况硬算成两个低频周期。
-
-### actual_hz
-
-完整窗口：
-
-```text
-actual_hz =
-N_bucket(t-W, t] / W
-```
-
-预热不足 W：
-
-```text
-actual_hz=null
-```
-
-可以有内部 provisional：
-
-```text
-N / elapsed
-```
-
-但不能冒充最终 actual_hz。
-
-### gap
-
-条件：
+评估 gap 的前提：
 
 ```text
 expected_hz > 0
-Topic ACTIVE
+Topic active
 Recorder not paused
-valid monitoring
-Publisher visibility sufficient
+monitoring valid
+publisher visibility sufficient
 ```
 
-阈值：
+其中：
+
+- `monitoring valid`：ring 中最早仍有效的 bucket/arrival epoch 已经覆盖到 `steady_now - window` 或更早，即至少能够解释完整 `[steady_now-window, steady_now]` 统计区间；只有“刚收到第一条消息但不足一个完整窗口”时仍为 false；
+- `publisher visibility sufficient`：最近一次成功 Graph discovery / publisher count observation 存在，且 `steady_now - observed_at <= topics.publisher_visibility_max_age_ms`，并至少观察到一个与该 Topic/type 匹配的 Publisher；
+- `topics.publisher_visibility_max_age_ms` 默认 `5000`；
+- 一次很久以前“曾经看见 Publisher”不能永久满足 visibility；
+- Graph evidence 过旧或当前 `publisher_count==0` 时 `gap=null`，避免把 discovery 不确定性误报成数据 gap；
+- `expected_hz == nullopt` 时 V1 明确不做“无期望值的数据流异常推断”：`actual_hz` 可继续展示，但 `gap` 始终为 `nullopt`。
+
+连续两个完整窗口：
 
 ```text
-H = expected_hz * 0.5
+actual_hz < expected_hz * 0.5
+→ gap = true
 ```
 
-连续两个**独立完整窗口**：
+一个完整窗口恢复：
 
 ```text
-actual_hz < H
+gap = false
 ```
-
-→：
-
-```text
-gap=true
-```
-
-恢复一个完整窗口：
-
-```text
-actual_hz >= H
-```
-
-→：
-
-```text
-gap=false
-```
-
-预热：
-
-```text
-gap=null
-```
-
-### Observer-driven
 
 不新增 Frequency Timer。
 
-`status()` 读取时根据 Ring 计算。
+## 7.4 Task 查询
 
-Server 如果要求 gap 最迟约 W 时间被 SSE 观察，应：
+Recorder 不建立 History DB / HistoryQuery / HistoryPage。
 
-```text
-status sample interval <= W
+### get_task
+
+```cpp
+get_task(
+    recording_id,
+    segment_offset,
+    segment_limit)
 ```
 
-这是**外部可见性要求**。
-
-不是：
-
-```text
-Ring correctness requirement
-```
-
-如果 Server 采样更慢，gap 仍可在下一次读取时按当前可证明窗口计算，只是通知更迟。
-
-### Frequency verification
-
-要求记录：
-
-```text
-steady average relative error
-P95 relative error
-max error
-```
-
-目标：
-
-```text
-平均 <2%
-P95 <5%
-```
-
-低频用绝对误差。
-
-FakeSteadyClock 覆盖：
-
-```text
-bucket boundary
-idle
-Epoch reuse
-long status silence
-message silence
-sampling resume
-```
-
-## 5.3 历史录制只读索引
-
-Recorder 对 output_root 提供：
-
-```text
-list_history
-get_history(recording_id)
-filtered history query
-single task summary
-```
-
-Server 不重新解析 Manifest。
-
-### get_history(recording_id)
-
-这是**精确 ID lookup**。
-
-已知 recording_id 时：
-
-```text
-直接定位安全 task directory
-读取对应 Manifest/Recovery
-```
-
-不需要扫描前 4096 个其他任务。
-
-因此：
-
-```text
-history.max_scan_entries
-```
-
-不限制 exact lookup。
-
-路径仍需：
-
-```text
-recording_id validation
-root containment
-symlink safety
-```
-
-### list_history()
-
-是：
-
-```text
-BEST_EFFORT bounded discovery
-```
-
-不是数据库。
-
-没有持久化全局 History Index。
-
-`history.max_scan_entries` 的规范语义是：
-
-> **单次 list/query_history 请求最多解析的候选 Task Manifest 数量。**
-
-它不是：
-
-```text
-最大返回条数
-```
-
-也不是：
-
-```text
-整个 output_root 最多允许的 Task 数
-```
+是 exact lookup。
 
 默认：
 
 ```text
-4096
+segment_offset = 0
+segment_limit = 100
+max segment_limit = 200
 ```
 
-### Candidate scan
-
-目录枚举需要稳定、确定的本地遍历顺序。
-
-实现必须选择一种固定顺序，例如：
+检查：
 
 ```text
-recording_id lexical order
+recording_id
+root containment
+symlink/path safety
+Manifest
+optional recovery evidence
 ```
 
-并在测试中固定。
+不扫描其他 Task。
 
-扫描：
+Server 不能直接读取 Recorder 的 `manifest.json` / `recovery.json` / `topic_events.jsonl`。
+
+
+
+分页边界：
 
 ```text
-最多 max_scan_entries candidate task directories
+segment_offset > available detail records
+→ Success, segments=[], segment_has_more=false
+
+segment_limit == 0 or > 200
+→ InvalidArgument / Effects::None
 ```
 
-形成本次：
+### list_tasks
+
+bounded BEST_EFFORT discovery。
+
+默认：
 
 ```text
-bounded candidate set
+tasks.max_scan_entries = 4096
 ```
 
-然后：
-
-1. 读取 Manifest；
-2. 应用过滤；
-3. 按 History 规则排序；
-4. 再应用 `offset + limit`。
-
-因此：
-
-> `offset` 只对**本次已经扫描出来的 candidate result set**有意义。
-
-当：
+候选目录采用确定性顺序，例如：
 
 ```text
-scan_truncated=false
-```
-
-且本次扫描覆盖所有合法候选任务时，offset 可以视为完整结果分页。
-
-当：
-
-```text
-scan_truncated=true
-```
-
-时：
-
-```text
-offset/limit
-```
-
-**不具备整个 output_root 的“全局第 N 条”数据库语义。**
-
-例如：
-
-```text
-10,000 tasks
-max_scan_entries=4096
-```
-
-本次结果只表示：
-
-```text
-已扫描 candidate subset
-```
-
-内的排序和 offset。
-
-不能让 Client 误以为：
-
-```text
-第 4097 条不存在
-```
-
-### scan_truncated
-
-达到 budget：
-
-```text
-scan_truncated=true
-```
-
-返回 diagnostic：
-
-```text
-scanned_entries
-candidate_limit
-unscanned_entries_unknown
-```
-
-`has_more` 必须和：
-
-```text
-scan_truncated
-```
-
-分开。
-
-`has_more` 只描述当前扫描结果集的分页。
-
-`scan_truncated=true` 表示：
-
-> output_root 中可能还存在本次完全没有检查的 Task。
-
-### 大量历史任务的推荐使用方式
-
-V1.0 不承诺：
-
-```text
-在 100000 个 Task 中
-使用 offset=50000
-获得稳定全局时间排序第 50000 条
-```
-
-因为没有持久化历史索引。
-
-需要：
-
-```text
-精确 recording_id
-```
-
-时用 `get_history(recording_id)`。
-
-需要完整长期审计时：
-
-```text
-离线工具
-或
-提高受验证的 max_scan_entries
-```
-
-执行全量扫描。
-
-时间过滤可以减少结果量，但在没有额外持久化索引的情况下，**不能假装时间过滤天然免除 Manifest 扫描成本**。
-
-如果产品以后明确要求：
-
-```text
-全局稳定时间排序
-任意深度分页
-高数量级历史任务
-```
-
-则需要新增：
-
-```text
-persistent History Index
-```
-
-作为单独设计，而不是继续扩展 BEST_EFFORT offset。
-
-### 排序
-
-有可信 start_time：
-
-```text
-start_time descending
-recording_id lexical tie-break
-```
-
-无可信 start_time：
-
-```text
-排在已知时间之后
 recording_id lexical
 ```
 
-### Segment detail
-
-单任务 Segment detail：
+形成 candidate set 后：
 
 ```text
-segment_offset
-segment_limit
+read/validate Manifest
+→ TaskInfo
+→ sort
+→ offset/limit
 ```
+
+排序：
+
+1. 有可信 start_time：按 start_time descending；
+2. 两个 Task 的可信 start_time 完全相同：recording_id lexical；
+3. 无可信 start_time：排在所有已知时间 Task 后；
+4. 无可信 start_time 组内：recording_id lexical。
+
+返回至少：
+
+```text
+items
+scan_truncated
+scanned_entries
+has_more
+```
+
+`scan_truncated=true`：
+
+> output_root 中可能还有本次完全没检查的 Task。
+
+此时 offset 不是数据库全局 offset。
+
+`has_more` 与 `scan_truncated` 按 §2.7 的四种组合解释。特别地，`offset > 0` 且本页不足 limit 时，即使 `has_more=false`，只要本轮扫描被截断，仍必须保持 `scan_truncated=true`，不能把“本 candidate set 没下一页”伪装成“output_root 已穷尽”。
+
+
+
+如果 `offset` 大于本次 candidate set 排序后的 item 数量：
+
+```text
+items = []
+has_more = false
+scan_truncated = 本次 scan 的真实值
+```
+
+不得因为 offset 越界把 `scan_truncated` 伪装成 false。
+
+### Manifest segment history bound
 
 默认：
 
 ```text
-100
-```
-
-最大：
-
-```text
-200
-```
-
-### Manifest 长期有界
-
-```text
-history.max_segment_records_per_task=4096
+tasks.max_segment_records_per_task = 4096
 ```
 
 只压缩：
@@ -5621,7 +4381,7 @@ durable REMOVED
 continuous oldest prefix
 ```
 
-不能压缩：
+不压缩：
 
 ```text
 WRITING
@@ -5632,914 +4392,601 @@ INCOMPLETE
 FAILED
 ```
 
-summary：
-
-```text
-segments_created_total
-segments_removed_total
-removed_segments_compacted_total
-compacted_through_segment_id
-```
-
-达到 4096 且没有可压缩前缀：
+达到上限且无可压缩 prefix：
 
 ```text
 close ingress
-RESOURCE_EXHAUSTED
-METADATA_CAPACITY
+ResourceExhausted
 ```
 
-不是“最长录制只能 68h”。
+不能让 Manifest 无界增长。
 
-### INCOMPLETE
+## 7.5 RecorderConfig
 
-V1 不提供 destructive control API。
+启动时由 Runtime 一次加载、验证、冻结。
 
-管理员离线处理：
+Recorder 不热加载 YAML。
 
-```text
-Runtime stopped
-output_root not owned
-backup/inspection done
-```
-
-后手工处理。
-
-### History 与 Recovery 并发
-
-V1.0 正常启动顺序要求：
+分组：
 
 ```text
-startup Recovery complete
-→ open Recorder/Server mutation service
-```
-
-因此常规 History 请求不会与启动 Recovery 的 Manifest rewrite 并发。
-
-运行期 Manifest mutation 使用：
-
-```text
-atomic rename
-```
-
-History 一次文件打开只能看到完整旧版本或完整新版本。
-
-不能把两个 Manifest revision 混成一个 Entry。
-
-## 5.4 错误、诊断与配置验证
-
-RecorderErrorCode：
-
-```text
-INVALID_ARGUMENT
-NOT_FOUND
-TOPIC_NOT_FOUND
-TYPE_CONFLICT
-TYPE_SUPPORT_UNAVAILABLE
-SCHEMA_UNAVAILABLE
-UNSUPPORTED_QOS
-INVALID_STATE
-ALREADY_PAUSED
-ALREADY_FINISHED
-RECORDING_EXISTS
-STALE_RECORDING
-STALE_TOPIC_EPOCH
-RESOURCE_EXHAUSTED
-DISK_FULL
-DISK_STATE_UNKNOWN
-WRITER_ERROR
-STORAGE_UNAVAILABLE
-EVENT_COMMIT_FAILED
-DRAIN_TIMEOUT
-EXECUTOR_UNAVAILABLE
-GENERATION_VIOLATION
-```
-
-这是 V1 穷尽集合。
-
-新增需要同步：
-
-```text
-protocol
-server mapper
-client parser
-contract tests
-```
-
-### DRAIN_TIMEOUT
-
-只有原生操作已经：
-
-```text
-returned
-or safely cancelled
-```
-
-Recorder 已经取得可终结证据，但 Drain 领域条件失败，才返回：
-
-```text
-DRAIN_TIMEOUT
-```
-
-STARTED 原生调用仍阻塞：
-
-```text
-不能返回 DRAIN_TIMEOUT
-Handle 未完成
-```
-
-### ConfigError
-
-ConfigError 属于：
-
-```text
-Runtime/Recorder construction
-startup normalization
-```
-
-不属于 RecorderErrorCode。
-
-静态配置无效：
-
-```text
-Recorder 不开放领域 mutation API
-```
-
-动态运行事实：
-
-```text
-Start
-Add
-Resume
-```
-
-继续使用 RecorderErrorCode。
-
-### 配置分组
-
-```text
-recording
-executor
-control
+task
+recorder
 topics
-queue
-pool
+message_queue
+message_pool
 writer
-cleanup
-storage
 snapshot
-history
+cleanup
 resource
 disk
-status
+tasks
+storage
 ```
 
-### 5.4.1 RecorderConfig 默认值
+默认值建议：
 
-| 组 | 配置与默认 |
+| 组 | 默认 |
 |---|---|
-| recording | `output_root=./recordings`, segment=60s, retention=600s |
-| control | `queue_capacity=64`, `native_wait_warning_ms=30000` |
-| executor | `thread_count=1` |
-| topics | discovery=2000ms, active=64, distinct=256, recent_removed=32 |
-| queue | 64MiB, 65536 messages, batch=256, wait=20ms, drop_newest |
-| pool | global_mutex, factor=1.25, max_capacity=1,000,000, fallback=1024 |
+| task | output_root=`./recordings`, rolling segment=60s, retention=600s |
+| recorder | operation_queue_capacity=64, native_wait_warning_ms=30000 |
+| topics | discovery=2000ms, discovery_max_results=4096, discovery_max_endpoint_profiles=64, active=64, distinct=256, recent_removed_instances=32, publisher_visibility_max_age_ms=5000 |
+| message_queue | 64MiB, 65536 messages, batch=256, wait=20ms, drop_newest |
+| message_pool | global_mutex, capacity_factor=1.25, max_capacity=1,000,000 |
 | writer | control_queue=64, max_control_batch=8 |
+| snapshot | max_messages_per_topic=1024, max_bytes_per_topic=8MiB, max_total_bytes=16MiB |
 | cleanup | queue=16, warning=30s, retry=2s |
-| storage | mcap, LZ4, FASTEST, chunk=786432, max_cache_size=0 |
-| snapshot | max_total_bytes=16MiB |
-| history | max_segment_records=4096, detail=100/200, max_scan_entries=4096 |
 | resource | enabled=true, sample=2s |
 | disk | check=2s, initial=2000ms, max_age=10s, failures=3, warning=80, pause=90, resume=85, min_free=2GiB, auto_resume=false, stable=10s |
-| status | frequency_window=1s, bucket=10ms |
+| tasks | max_segment_records=4096, detail=100/200, max_scan_entries=4096 |
+| storage | mcap, LZ4, FASTEST, chunk=786432, max_cache_size=0 |
 
-`native_wait_warning_ms=30000`：
+注意：
 
 ```text
-只表示诊断 warning
-不是 operation deadline
-不是 failure condition
+Pool fallback 配置已删除。
 ```
-
-应在真实 Writer Close/Executor/Cleanup P99 测量后调整。
-
-### 配置关系
 
 必须验证：
 
 ```text
 warning < pause
 resume < pause
-queue positive
-history limits positive
-pool capacity calculation no overflow
-duration chrono range valid
+all capacities > 0
+tasks limits > 0
+snapshot per-topic <= global budget where applicable
+pool capacity arithmetic no overflow
+chrono durations representable
 ```
 
-`history.max_scan_entries` 是：
+### native_wait_warning_ms
+
+初始：
 
 ```text
-per request candidate Manifest parse budget
+30000 ms
 ```
 
-不能被实现成：
+只是诊断阈值。
+
+来源：
+
+> 对 Writer Close、ROS Executor create/remove、Cleanup 等正常 P99 的保守初始估计。
+
+上线前应根据标准负载实测调整。
+
+它：
 
 ```text
-global history task count hard limit
+不是 operation deadline
+不是 failure condition
+不能制造 DrainTimeout
+不能 fake Completion Done
 ```
-
-V1 Pool 始终启用。
-
-不提供：
-
-```text
-pool.enabled=false
-```
-
-### Storage filesystem
-
-V1 不新增：
-
-```text
-storage.allow_network_fs
-```
-
-`statfs` 类型检查最多作为 warning。
-
-真正契约是：
-
-```text
-部署必须满足本文 POSIX durability assumptions
-```
-
-# 6. 可靠性验证与契约追踪
-
-## 6.1 验证范围与通过原则
-
-| 设计域 | 验证重点 |
-|---|---|
-| Topic/QoS/类型 | Graph、无 Publisher、多类型、QoS、Type Support、Epoch |
-| 状态/模式 | Normal/Timed/Rolling、Pause/Resume、Stop race |
-| 数据路径 | QueueBudget、Pool、Generation、Writer failure |
-| MCAP | Schema closure、Humble/Jazzy 2×2、Timestamp |
-| Persistence | Manifest/Event/DELETING/Recovery |
-| Disk | CRITICAL/UNKNOWN/Freshness/Snapshot contention |
-| Status | thread-safe snapshot、bounded cost、Generation |
-| History | bounded scan、truncation、exact lookup |
-| Shutdown | native block、Executor race、UNSAFE_TO_DESTROY |
-| Platform | Humble/Jazzy × AMD64/ARM64 |
-
-### End-to-end loss
-
-内部：
-
-```text
-admission_drop_rate
-```
-
-不能替代产品 loss。
-
-发布验收：
-
-```text
-publisher original sequence ids
-vs
-distinct readable recorded sequences
-```
-
-Snapshot Replay 去重。
-
-### Hot-path Clock + Disk snapshot
-
-标准：
-
-```text
-10 topics
-1000Hz
-1KiB
-```
-
-测量：
-
-```text
-try_enter()
-steady_clock::now()
-deadline
-Disk coherent read
-```
-
-记录：
-
-```text
-P50
-P95
-P99
-CPU
-```
-
-不预先引入 cached clock。
-
-### Disk snapshot contention 专项
-
-测试必须人为把 Producer 与：
-
-```text
-DiskAdmission publish
-```
-
-在：
-
-```text
-sequence odd
-state store
-valid_until store
-final even
-```
-
-处交错。
-
-断言：
-
-1. Producer 不读取 torn state；
-2. snapshot busy 只拒绝当前消息；
-3. `dropped_disk_snapshot_busy` 增长；
-4. Task accepting 不因纯 contention 自动关闭；
-5. 不生成虚假 `DiskSafety(UNKNOWN)`；
-6. coherent CRITICAL/UNKNOWN/freshness expired 才触发真正保护。
-
-### Manifest revision
-
-验证：
-
-```text
-new task revision=1
-```
-
-连续 mutation：
-
-```text
-1,2,3,...
-```
-
-重启：
-
-```text
-27
-→ Recovery
-→ 28
-```
-
-不能：
-
-```text
-27 → 1
-```
-
-模拟 UINT64_MAX：
-
-```text
-下一 mutation 拒绝
-不 wrap
-```
-
-### Manifest single writer
-
-同时挂起：
-
-```text
-Rolling mutation
-CleanupCompletion
-Topic mutation
-```
-
-证明只有 Sequencer 产生下一 revision。
-
-Cleanup claim 的旧 authorized revision 不阻止合法：
-
-```text
-DELETING → REMOVED
-```
-
-只要当前 identity/state 合法。
-
-### Historical Topic Evidence
-
-故障注入：
-
-```text
-TOPIC_ADD_PREPARED
-Writer registered
-Subscription created
-TOPIC_ADDED fsync
-Topic gate open
-```
-
-在每个边界 crash。
-
-验证：
-
-- TOPIC_ADDED durable 前 Topic gate 不开放；
-- durable 后即使没有消息，Recovery 可得到 CONFIRMED_ADDED；
--旧 Task 不会在新 Runtime Status 重新显示 ACTIVE；
-- Task INCOMPLETE 与 Topic CONFIRMED_ADDED 可以同时成立；
-- Event commit failure 后禁止新的外部 Topic mutation。
-
-### Replay-only
-
-验证：
-
-```text
-Snapshot Replay
-无 Live 1000 windows
-```
-
-只能保持一个物理 successor。
-
-不得周期性生成新的 Replay-only Segment。
-
-第一条 Live 到达后才启动 live window。
-
-### History 4096+
-
-构造：
-
-```text
-10000 Task directories
-```
-
-验证：
-
-```text
-max_scan_entries=4096
-```
-
-返回：
-
-```text
-scan_truncated=true
-scanned_entries<=4096
-```
-
-不能报告：
-
-```text
-“只有 4096 个历史任务”
-```
-
-exact：
-
-```text
-get_history(recording_id_of_task_9000)
-```
-
-仍应可直接定位并读取。
-
-`offset` 在 scan_truncated 时不得声称是全局数据库 offset。
-
-## 6.2 故障注入矩阵
-
-| 注入点 | 预期 |
-|---|---|
-| QueueBudget fail | 精确 dropped_capacity，Lease 无泄漏 |
-| Pool fail | dropped_allocation_failure，无 abort |
-| enqueue fail | RAII 回滚 |
-| Disk snapshot odd/inconsistent | 当前消息拒绝；snapshot_busy 计数；Task 不进入 Disk UNKNOWN |
-| coherent Disk CRITICAL | close admission + DiskSafety |
-| safe sample freshness expired | close admission + DiskSafety UNKNOWN |
-| Writer Open/Register/Write/Close fail | 不伪造 success |
-| ADD_PREPARED 后 crash | UNCERTAIN |
-| Subscription created、TOPIC_ADDED 前 crash | gate 从未开放；UNCERTAIN |
-| TOPIC_ADDED durable 后、gate open 前 crash | CONFIRMED_ADDED，可为零消息 |
-| TOPIC_ADDED fsync fail | EVENT_COMMIT_FAILED/POSSIBLE，关闭新 Topic mutation admission |
-| Event uncertainty watermark | 后续在途 Event 不升级 CONFIRMED_SUCCESS |
-| Remove × Callback | 无 UAF |
-| Timed Stop × manual Stop | Finalize exactly once |
-| Rolling × Pause | Rotate 不直接 reopen |
-| Replay-only × 1000 windows | 不新增无限物理 Segment |
-| Cleanup revision advanced | current DELETING 仍可 REMOVED |
-| Cleanup current REMOVED | duplicate no-op |
-| Cleanup current COMPLETE/WRITING | invariant conflict，不继续 |
-| Manifest restart revision | N→N+1 |
-| History > max_scan_entries | scan_truncated 明确 |
-| Recovery 10000 tasks | bounded memory，完整安全 scan 后再 open mutation service |
-| Shutdown × blocked native | Handle 未伪造 DONE，Runtime UNSAFE_TO_DESTROY |
-
-### Pool fault injection
-
-覆盖：
-
-```text
-fallback new fail
-registry insert fail
-handle construction fail
-cross-thread release
-begin_stop with outstanding handle
-```
-
-`begin_stop()` 不阻塞合法 release。
-
-最终：
-
-```text
-in_use=0
-fallback=0
-registry empty
-```
-
-### Executor fault injection
-
-在：
-
-```text
-PENDING
-STARTED
-before DONE
-```
-
-注入 timeout。
-
-只有 PENDING 可 cancel。
-
-STARTED 必须保留 Lease。
-
-## 6.3 细化接口与规范维护
-
-在 `protocol.md` 与 `server.md` 定稿前，Recorder API 必须明确以下契约：
-
-1. Topic discovery；
-2. History BEST_EFFORT bounded scan 与 exact lookup；
-3. Status generation consistency；
-4. Topic operation evidence；
-5. Humble/Jazzy Schema；
-6. Writer/Recovery Shutdown；
-7. DRAIN_TIMEOUT/UNKNOWN；
-8. Historical Topic Evidence 不等于 Runtime ACTIVE；
-9. History scan_truncated 不等于全局列表结束。
-
-### DRAIN_TIMEOUT 网络映射
-
-只有：
-
-```text
-RecorderControlHandle == Done
-且
-Result == DRAIN_TIMEOUT
-```
-
-Server 才能返回领域：
-
-```text
-DRAIN_TIMEOUT
-```
-
-如果：
-
-```text
-Server wait timeout
-且
-Handle still STARTED/WAITING_NATIVE
-```
-
-返回：
-
-```text
-UNKNOWN
-```
-
-Runtime：
-
-```text
-UNSAFE_TO_DESTROY
-```
-
-不是 RecorderErrorCode，也不需要普通 HTTP error code。
-
-### 实现与 Code Review 检查表
-
-| 范围 | 必查 | 禁止 |
-|---|---|---|
-| API | 值对象、Guard、Result bounded | 暴露内部容器引用 |
-| Control | Handle 真终态 | waiter timeout 伪造 DONE |
-| State | Task/Persistent state 分离 | 历史 Task 写 IDLE |
-| Start | INITIALIZING durable 边界 | 参数失败也创建 Task |
-| Topic Add | TOPIC_ADDED durable 后才开 gate | Event 未 durable 就接 Live |
-| Topic Remove | Producer/Executor 屏障 | erase TopicMap 就销毁 DDS |
-| Evidence | Task-level uncertain watermark | Event fsync fail 后继续无限 Topic mutation |
-| Recovery Topic | Historical Evidence | 把旧 Topic 恢复成 ACTIVE |
-| Queue | concurrentqueue 技术选型一致 | 文档说“未冻结”但代码绑定第三方 |
-| Pool | begin_stop 允许 release | Stop 后拒绝合法归还 |
-| Disk | statvfs 在 publish 临界区外 | odd sequence 跨慢 I/O |
-| Disk contention | 只 drop current sample | contention → fake Disk UNKNOWN |
-| Timed | Producer hard deadline | 只靠 Timer |
-| Rolling | first Live starts live window | Replay 启动 segment timer |
-| Ingress reopen | Task Gate + Topic Gate | Rotate 后无条件 accepting=true |
-| Manifest | revision=1 起，同 Task N+1 | Runtime restart reset revision |
-| Cleanup | current state 为权威 | 要求全局 revision 不变 |
-| Cleanup conflict | REMOVED duplicate 与非法 state 区分 | 所有 mismatch 都静默 stale |
-| History | exact ID lookup + bounded list | scan_truncated 伪装 end-of-list |
-| Status | Generation 自洽 | 新 Task + 旧 Topic 列表 |
-| Schema | frozen Topic Epoch definition | 每 Segment 重扫依赖树 |
-| Shutdown | blocked native 保留对象 | timeout detach/destroy |
-
-### 审查输出要求
-
-每个同步点写清：
-
-```text
-class/method
-protected state
-linearization
-happens-before
-```
-
-每个 durable terminal：
-
-```text
-file
-field/event
-fsync boundary
-failure semantics
-```
-
-每个 bounded resource：
-
-```text
-capacity source
-limit behavior
-shutdown release condition
-```
-
-这些是实现规范，不是新的项目阶段。
-
-## 6.4 V1.0 明确非目标
-
-为避免继续把尚未证明必要的复杂度引入 Recorder，V1.0 **不增加**：
-
-```text
-通用 Operation Registry
-Start Idempotency Key
-跨请求稳定 History Cursor
-History 数据库
-Topic 历史完整分页 API
-Manifest 批量提交 Timer
-manifest.min_update_interval_ms
-storage.allow_network_fs 强制开关
-额外 Frequency Timer/线程
-UNSAFE_TO_DESTROY HTTP 错误码
-Topic 级独立 Event receipt registry
-自动删除 INCOMPLETE
-多 Task 并行录制
-自动跨 Schema 类型切 Segment
-```
-
-如果未来产品需求明确要求其中任一能力，应先更新：
-
-```text
-requirements.md
-architecture.md
-```
-
-再扩展 Recorder 契约。
 
 ---
 
-# 7. V1.0 实施前冻结结论
 
-v0.2.10 完成后，Recorder 的实现基线收敛为以下不可破坏的核心契约。
 
-## 7.1 控制面
+### Message Pool capacity
+
+V1 固定计算：
 
 ```text
-一个 RecorderControlSequencer
+pool_capacity = min(
+    ceil(message_queue.max_messages * message_pool.capacity_factor),
+    message_pool.max_capacity)
 ```
 
-是唯一领域 mutation 线性化域。
-
-Server 不能替代它。
-
-等待 timeout 不能替代领域完成。
-
-STARTED 原生调用不能被伪造取消。
-
-## 7.2 消息准入
-
-Producer admission 同时受：
+并验证：
 
 ```text
-Generation
-Topic Epoch
-Task accepting
-Timed deadline
-Disk coherent safety
-QueueBudget
-Pool
+capacity_factor >= 1.0
+pool_capacity > 0
+calculation does not overflow
 ```
 
-保护。
+Pool 不运行期扩容，不 fallback。
 
-Timed deadline 和真正 Disk freshness 是 hard safety gate。
+`message_pool.max_capacity` 是防御性 hard cap：默认 `queue.max_messages=65536`、`capacity_factor=1.25` 时实际 capacity 仅 81920，确实远低于 1,000,000；这个 cap 主要防止未来错误/极端配置把一次性 Pool 预分配推到不可接受规模，而不是默认运行时常用阈值。
 
-Disk snapshot contention 只是瞬时同步竞争：
+### Recent removed Topic
+
+`topics.recent_removed_instances` 默认 32，只控制当前 Task `State.topics_removed_recent` 的有界列表长度。成功 Remove 时追加该 TopicInfo；超过上限淘汰最旧项。淘汰不影响：
 
 ```text
-drop current message
+topics_removed_total
+Topic Events durable history
+historical Task query
 ```
 
-不能污染 Task 安全状态。
+该列表只用于当前状态可观测性，不是持久化证据。
 
-## 7.3 Topic
+### Snapshot 配额关系
 
-同一 Topic Epoch：
+三个预算独立生效：
 
 ```text
-PREPARED
-→ Writer register
-→ Subscription created
-→ TOPIC_ADDED durable
-→ ACTIVE/ARMED
+max_messages_per_topic
+max_bytes_per_topic
+max_total_bytes
 ```
 
-TOPIC_ADDED durable 之前 gate CLOSED。
+任一超限立即按 §5.4 对应规则驱逐。
 
-同名重添加必须保持 StorageSignature。
-
-## 7.4 Writer
-
-所有 rosbag2 Writer API 单线程。
-
-Stop/Rotate 必须 Drain。
-
-Close 成功、Data fsync、Directory fsync 和 Manifest COMPLETE 是不同边界。
-
-## 7.5 Rolling
-
-逻辑时间窗口与物理 Segment 分离。
-
-空窗口不创建物理 Segment。
-
-Snapshot Replay 不启动 live rolling window。
-
-第一条 Live 才开始该 Segment 的有效 `segment_duration`。
-
-## 7.6 Persistence
-
-Manifest 单写者。
-
-`manifest_revision`：
+配置校验不要求：
 
 ```text
-uint64_t
-new task = 1
-same task N→N+1
-restart continues N+1
+max_bytes_per_topic <= max_total_bytes
+```
+
+但若前者大于后者，实际可保留量仍受 global budget 限制，启动时记录配置 warning 即可，不需要拒绝。
+
+### native_wait_warning_ms 触发点
+
+这个阈值针对 Recorder 内部已经 STARTED 的慢 native work，例如：
+
+```text
+Writer Close/Drain
+ROS Executor create/remove
+Cleanup filesystem delete
+```
+
+Recorder 等待同一 native work 超过阈值时记录一次受控 warning/metric；不是每次外部 `Completion::wait_for()` 超时都记 native warning。
+
+
+# 8. 验证与实现基线
+
+## 8.1 核心不变量
+
+### 状态
+
+```text
+RecorderState 与 TaskState 分离
+Paused 不写入 TaskState
+PauseState 可同时表达 USER + one disk reason
+```
+
+### Topic
+
+```text
+TOPIC_ADDED durable 前 gate CLOSED
+Remove 必须经过 producer + executor barrier
+epoch 不复用
+```
+
+### 数据路径
+
+```text
+generation / epoch checked
+Timed deadline hard gate
+Disk coherent snapshot
+Queue budget conserved
+Pool fixed bounded
+```
+
+### Writer
+
+```text
+single Writer Thread
+Stop/Rotate require Drain
+close != durable task completion
+```
+
+### Rolling
+
+```text
+Snapshot replay does not start live window
+first successful Live write starts live_window_started_at
+replay-only Segment with real replay data closes as COMPLETE
+```
+
+### Persistence
+
+```text
+Manifest single writer
+revision starts at 1
+N -> N+1
 no wrap
+one durable transition per commit
+DELETING only durable delete authorization
+Topic Event uncertainty watermark is task-level poison boundary
 ```
 
-DELETING 是唯一 durable delete authorization。
-
-## 7.7 Recovery
-
-Recovery 保守。
-
-旧 Task 不恢复继续录制。
-
-旧 Topic 不重新变 ACTIVE。
-
-历史 Topic 只形成：
+### Recovery
 
 ```text
-CONFIRMED_ADDED
-CONFIRMED_REMOVED
-CONFIRMED_FAILED
-UNCERTAIN
+no resume old Task
+no restore old Topic ACTIVE
+no auto-delete INCOMPLETE
 ```
 
-Evidence。
-
-INCOMPLETE 不自动删除。
-
-## 7.8 History
-
-Exact lookup：
+### Shutdown
 
 ```text
-recording_id
+real native/worker completion before destruction
+blocked native -> UNSAFE_TO_DESTROY
+no fake Done
+no detach
 ```
 
-不受扫描 budget 限制。
+## 8.2 Unit tests
 
-List/query：
+至少：
+
+- ErrorCode / Effects；
+- PauseState 7 个合法组合；
+- Pause/Resume in Idle/Stopping/Failed；
+- Resume ConfirmedPartial；
+- RecorderState / TaskState 分离；
+- Idle→Initializing→Recording 与 Initializing failure；
+- Failed → Idle terminalization；
+- Completion waiter timeout；
+- Start guard；
+- generation / epoch stale rejection；
+- QosOptions Auto/Explicit validation；
+- discover_topics 返回 DiscoveredTopic 而非 TopicInfo；
+- QoS whitelist；
+- Add rollback after Writer register；
+- Topic Event uncertainty in-flight behavior；
+- RecordedMessage replayed；
+- Message Pool exhaustion/drop；
+- Pool stop/release；
+- Queue budget conservation；
+- drop counter 分类；
+- Timed hard deadline；
+- DiskAdmission atomic/seqlock；
+- sequence odd / publisher-reader 交错读取；
+- Disk snapshot contention；
+- Snapshot per-topic-then-global deterministic eviction；
+- Snapshot internal sequence monotonicity；
+- replayed message 永不重新进入 Snapshot、无 replay feedback loop；
+- live_window_started_at WriterResult 回流；
+- Rolling Pause 期间 rotate_pending 与 Resume-before-open；
+- replay-only Segment Stop；
+- Manifest revision；
+- Manifest UINT64_MAX；
+- Manifest revision overflow 后 Recovery 从真实介质 revision 重建；
+- primary/secondary error；
+- Cleanup revision mismatch；
+- Cleanup state conflict；
+- Topic operation Add/Remove query；
+- corrupted event file；
+- Recovery 后 watermark Event chain 重新验证为 ConfirmedSuccess/Failure/Uncertain；
+- Task list unknown start_time sorting；
+- get_task segment paging；
+- State generation contention 两次变化后的 snapshot-lock fallback；
+- publisher visibility freshness / expected_hz=null gap semantics；
+- frequency/gap。
+
+## 8.3 Integration tests
+
+至少：
+
+- ROS discovery；
+- Add/Remove Subscription；
+- QoS normalization；
+- TRANSIENT_LOCAL；
+- Type/Schema；
+- Normal；
+- Timed；
+- Rolling；
+- Snapshot replay；
+- Writer Open/Register/Write/Close；
+- MCAP Schema readback；
+- Manifest durability；
+- Topic Event durability；
+- Event uncertainty；
+- Cleanup；
+- Recovery；
+- Disk Critical/Unknown/RecoveryPending；
+- Shutdown。
+
+## 8.4 Fault injection matrix
+
+| Fault | Expected |
+|---|---|
+| invalid recording_id | InvalidArgument / None；无目录 |
+| durable INITIALIZING before Start ready | RecorderState=Initializing；ingress CLOSED；Pause/Resume/Add/Remove InvalidState |
+| Start recording_id exists | RecordingExists / None |
+| Start after durable INITIALIZING then Writer fail | `StorageError / ConfirmedPartial`；RecorderState→Failed；durable Failed 仅在 Manifest 仍可信时提交 |
+| stale generation | StaleRecording / None |
+| stale topic epoch with current recording | StaleTopicEpoch / None |
+| Pause while Stopping | InvalidState / None |
+| Resume clears USER but disk Critical remains | DiskCritical / ConfirmedPartial |
+| Writer register succeeds, Subscription create fails | no Writer rollback；ADD_FAILED durable |
+| Topic terminal Event fsync uncertain | EventCommitFailed / Possible + watermark |
+| in-flight Topic seq >= watermark | Completion Failure；query Uncertain |
+| Pool exhausted | drop + counter；no fallback |
+| Queue full | bounded drop；budget conserved |
+| Disk snapshot odd/busy | current message drop only；验证 odd/even 交错读取不产生 data race |
+| Disk sample stale | DiskUnknown protection |
+| ROS Executor call blocks | Completion unfinished |
+| Writer close returns but fsync fails | StorageError |
+| Manifest revision UINT64_MAX | no wrap；close ingress |
+| Cleanup authorized revision stale, current state DELETING | allow REMOVED |
+| Cleanup current REMOVED | idempotent no-op |
+| Cleanup current other state | invariant conflict |
+| remove_all blocks | Shutdown may reach UNSAFE_TO_DESTROY |
+| Writer blocks forever | no detach / no fake Done |
+| Topic success then Task crash | Task Incomplete + Topic ConfirmedSuccess valid |
+| replay message write succeeds | replayed message 不进入 Snapshot，不形成循环 replay |
+| watermark task after Runtime restart | Recovery validates whole chain；合法 terminal 可重新成为 ConfirmedSuccess/Failure，旧 HTTP outcome 不改写 |
+| state() races with generation change twice | fallback snapshot lock returns coherent State；no mixed generation |
+| event file corrupt | StorageError, not NotFound |
+| Recovery reads manifest_revision == UINT64_MAX | Manifest 不改写；historical view=Incomplete；finding=manifest_revision_exhausted |
+| Cleanup native delete blocks during Shutdown | CleanupState warning may become active；Shutdown Completion remains unfinished；Runtime grace may enter UNSAFE_TO_DESTROY |
+
+## 8.5 Protocol / Server contract checklist
+
+Recorder ErrorCode 必须在 `protocol.md` / `server.md` 穷尽映射。
+
+整个 C++ 目录布局也属于跨文档契约：`architecture.md` / `cpp_coding_guidelines.md` / `server.md` 必须与 §1.3 的顶层 `include/ros2_bag/...` + `src/...` 镜像结构一致。Server 不允许继续采用 `src/server/include + src/server/src` 这种独立子工程式布局；Recorder 也不回退到 `.hpp/.cpp` 全部平铺 `src/recorder/`。
+
+禁止：
 
 ```text
-BEST_EFFORT
-bounded candidate scan
+parse Error.message
+read current State to guess previous operation result
+read Recorder persistence files directly from Server
+unknown ErrorCode -> default 500 and continue release
 ```
 
-`scan_truncated=true` 时：
+UNKNOWN：
 
 ```text
-offset
+Completion unfinished at HTTP deadline
+or trustworthy response lost
+→ Protocol UNKNOWN
 ```
 
-不是整个 output_root 的全局数据库 offset。
+Recorder Error.effects 与 Protocol UNKNOWN 分离。
 
-如果以后需要深分页，必须设计持久 History Index。
+`Effects::ConfirmedPartial` 不新增第四种 Protocol outcome，也不使用 HTTP 207。
 
-## 7.9 Shutdown
-
-只有真正完成的 Worker/native operation 才能释放对象。
-
-不可中断调用永久阻塞时：
+映射固定为：
 
 ```text
-UNSAFE_TO_DESTROY
+Recorder Result = Error + ConfirmedPartial
+→ Protocol outcome = FAILURE
+→ effects = CONFIRMED_PARTIAL
+→ HTTP code 仍按对应机器 ErrorCode 映射
 ```
 
-比假装成功更正确。
+Server 不得把它静默转成 SUCCESS、UNKNOWN 或普通 `effects:NONE` Failure。
 
----
+`Effects::Possible` 同理仍是已知 Recorder FAILURE 的副作用描述；HTTP code 由 ErrorCode 决定，而不是由 Effects 单独决定。
 
-# 8. v0.2.10 修订说明
+PauseState 的全部合法组合必须穷尽映射成 Protocol `paused_reasons`，Server 不允许自定义缺省分支。
 
-本版在 v0.2.9 基础上继续保持原有完整设计，并完成以下收口：
+`RecorderState::Initializing` 是当前 Recorder V1.0 的真实运行态。`protocol.md` / `server.md` 必须与本契约一致地暴露 `IDLE/INITIALIZING/RECORDING/PAUSED/STOPPING/FAILED`；Server 不得把 Initializing 偷偷映射成 IDLE 或 RECORDING。
 
-1. **Recovery 后 Topic 语义**
-   - 明确旧 Task 不恢复运行；
-   - ACTIVE/ARMED 等仅属于当前 Task；
-   - 新增 Historical Topic Evidence 解释；
-   - Task INCOMPLETE 与 Topic CONFIRMED_ADDED 可以同时成立。
+同时，`architecture.md` / `server.md` / `protocol.md` / `requirements.md` / `verification.md` 中不得继续把旧 `ControlHandle`、`RecordingTargetGuard/TopicTargetGuard`、`RecorderControlSequencer`、Pool fallback 等 v0.2.x 名词作为现行契约；跨文档同步以本 Recorder v0.3.6 的 `Completion<T>`、直接身份参数、唯一串行 mutation 域和固定有界 Pool 为准，不能反向要求 Recorder 恢复旧抽象。
 
-2. **Topic Add 持久化顺序**
-   - Subscription 创建后继续保持 Topic gate CLOSED；
-   - `TOPIC_ADDED` durable 后才允许 ACTIVE ingress；
-   - 减少 Event terminal 与已写数据之间的不确定窗口。
+PauseState 映射：
 
-3. **Replay-only Segment**
-   - 新增 `live_window_started_at` 语义；
-   - Snapshot Replay 不启动 Rolling deadline；
-   - 第一条 Live 才开始物理 Segment 的有效 rolling window；
-   - Replay-only 状态不会按窗口无限创建新 Segment。
+```text
+USER
+DISK_CRITICAL
+DISK_UNKNOWN
+DISK_RECOVERY_PENDING
+```
 
-4. **History bounded scan**
-   - 明确 `max_scan_entries` 是单次 candidate Manifest parse budget；
-   - exact recording_id lookup 不受该限制；
-   - `scan_truncated=true` 时 offset 不是全局数据库位置；
-   - 不用虚假的 BEST_EFFORT offset 替代持久化 History Index。
+Server 不自行增删 pause reason。
 
-5. **Event uncertainty**
-   - `event_log_uncertain_from_seq` 明确为 Task-level poison watermark；
-   - Event durability failure 后禁止新的外部 Topic mutation；
-   - 避免继续扩大不可证明事件链。
+## 8.6 V1.0 非目标
 
-6. **Concurrent Queue 技术选型**
-   - 明确 `moodycamel concurrentqueue` 已由技术选型文档冻结；
-   - 本文只不冻结 Recorder wrapper 的具体 API，而不是否认底层技术选型。
+不增加：
 
-7. **Manifest revision**
-   - 固定为 `uint64_t`；
-   - 新 Task 首个 durable revision=1；
-   - 同一 Task 每次 durable mutation `N→N+1`；
-   - Runtime restart/Recovery 延续当前 revision；
-   - `UINT64_MAX` 禁止 wrap。
+```text
+generic Operation Registry
+Start idempotency key
+Recorder Request/Response API
+Target/Guard API
+History database
+persistent global Task index
+stable deep cursor
+multi-Task concurrent recording
+generic EventBus
+plugin framework
+Pool fallback allocation
+automatic destructive repair
+automatic delete INCOMPLETE
+Manifest batch timer
+extra frequency thread
+storage.allow_network_fs enforcement switch
+```
 
-8. **PersistentTaskState INITIALIZING**
-   - 明确参数校验失败、目录创建失败不产生 durable Task；
-   - 首个 INITIALIZING Manifest durable 后才形成可信 durable Task；
-   - orphan directory 由 Recovery 保守报告。
+## 8.7 Code Review checklist
 
-9. **Startup Recovery**
-   - 明确 streaming bounded-memory full scan；
-   - 扫描阶段提供进度诊断；
-   - V1 不在 Recovery 未完成时提前开放普通 mutation service。
+| 范围 | 必须确认 | 禁止 |
+|---|---|---|
+| API | direct domain methods + Completion | Request/Response/Target/Guard |
+| Error | structured ErrorCode + Effects | parse message |
+| State | RecorderState / TaskState 分离；Initializing 完整映射；Stopping failure→Failed | persist Paused / Initializing 假装 Idle/Recording / Stop failure→Idle |
+| Pause | USER + one disk reason | multiple disk reasons |
+| Start | serial-domain guard | validation after directory side effect |
+| Topic Add | Event durable before gate open | live before TOPIC_ADDED |
+| Topic Remove | producer/executor barrier | erase map == removed |
+| Pool | fixed bounded | fallback registry |
+| Queue | message + byte budget conserved | leak budget |
+| Timed | producer hard deadline | timer only |
+| Disk | atomic coherent snapshot | non-atomic payload seqlock |
+| Writer | single thread | concurrent rosbag2 access |
+| Rolling | first Live starts timer | replay starts timer |
+| Snapshot | only successful Live message；per-topic then global deterministic FIFO | replay message re-enters Snapshot / traversal-order-dependent eviction / unbounded cache |
+| Manifest | independent durable commit | batch timer |
+| Revision | no wrap | uint64 overflow |
+| Topic Events | watermark poisons later evidence | later fsync clears watermark |
+| Cleanup | current state authoritative | revision equality as CAS |
+| Recovery | conservative | resume old Task |
+| Task query | exact vs bounded list | pretend DB pagination |
+| Shutdown | sticky shutdown_requested；Done only when safely quiescent | post-shutdown new mutation / Done(Error) as routine third path / fake Done / detach |
 
-10. **DiskAdmission coherent snapshot**
-    - `statvfs()` 与慢计算移出 seqlock publish critical section；
-    - bounded read 失败仅拒绝当前消息；
-    - 新增 `dropped_disk_snapshot_busy` / `disk_admission_snapshot_busy`；
-    - snapshot contention 不得伪造 Disk UNKNOWN；
-    - 只有 coherent UNKNOWN/CRITICAL 或 freshness expired 才触发真正 DiskSafety。
+## 8.8 V1.0 实施基线
 
-11. **maybe_open_ingress**
-    - 冻结为 Task Gate + per-Topic Gate 两层；
-    - ACTIVE/ARMED/ADDING/REMOVING/FAILED 的行为明确；
-    - Topic-local failure 不影响其他健康 Topic；
-    - Task-wide failure 才关闭全任务。
+V1.0 必须同时满足：
 
-12. **许可证**
-    - 明确项目本身 Apache-2.0；
-    - 与 Apache-2.0 rosbag2 Resolver 复用兼容；
-    - 固定 license header、NOTICE、来源 tag/commit 与修改声明要求。
+1. 整个 C++ 工程统一采用顶层 `include/ros2_bag/...` 与 `src/...` 镜像结构；Recorder header 位于 `include/ros2_bag/recorder/`，实现位于 `src/recorder/`，Server 使用同一目录哲学，Runtime 保持顶层 composition root。
+2. API 使用直接 C++ 领域方法，不恢复 Request/Response、Target/Guard、Coordinator 等旧抽象。
+3. Completion 不暴露内部状态机，不提供网络驱动取消；`Completion<void>::result()` 为 `optional<Result<void, Error>>`。
+4. RecorderState 与 TaskState 分离，并完整包含 `RecorderState::Initializing`；Shutdown during init 允许 `Initializing -> Stopping -> Failed/terminal`，状态图与实现一致。
+5. 第一份 durable INITIALIZING Manifest 成功后才进入 RecorderState::Initializing；Start Completion 必须晚于 durable TaskState::Recording。
+6. Initializing 期间 ingress CLOSED，Pause/Resume/Add/Remove 均 InvalidState。
+7. PauseState 同时支持 User 与一个 Disk reason；Pause 不写入 TaskState；Resume Success 必须原子提交 PauseState empty + RecorderState Recording + gate OPEN，不暴露 Paused+empty 中间状态。
+8. ErrorCode 足够机器映射，Server 不解析 message；Effects 与 Protocol UNKNOWN 分离。
+9. Shutdown 的 sticky `shutdown_requested` 在第一次 `shutdown()` API 调用时立即设置，阻止后续外部 mutation。
+10. Shutdown V1 只有“安全 quiescent → Done(Success)”或“未安全完成 → unfinished/UNSAFE_TO_DESTROY”，不把 Task failure 包装成 Shutdown Done(Error)。
+11. TaskMode 统一表示 Normal/Timed/Rolling；V1 TimestampPolicy 只有 Receive，CompressionMode 明确定义。
+12. Add 输入 TopicOptions，输出 TopicInfo；QosOptions Auto/Explicit 字段组合固定。
+13. `discover_topics()` 返回 DiscoveredTopic，不复用 TopicInfo；动态 compatibility/visibility 放 TopicState。
+14. `type_hash` 使用 ROS 标准 `RIHS{version}_{value}` textual representation（不可用则 nullopt），`schema_sha256` 固定 64 字符 lowercase hex，二者不得互相冒充。
+15. recording_id 非法不得产生 durable side effect。
+16. 唯一串行 mutation 域负责所有领域状态裁决；Worker 结果必须回到该域并重新验证身份。
+17. 安全/结果事件不可丢失，但不冻结 reserved slot/独立队列等无领域语义的具体布局。
+18. Topic Add/Remove 的 PREPARED 是 durable hard barrier；失败/不确定后不能进入下一阶段。
+19. Topic Event watermark 设置后当前 Task 禁止新的外部 Add/Remove；用户只能 Stop/Shutdown 后在新 Task 重试。
+20. Topic Add 在 TOPIC_ADDED durable 前 gate CLOSED；Writer register 后 Subscription 失败不回滚 Channel。
+21. Remove 必须经过 producer + Executor barrier。
+22. RecordedMessage 携带 generation/topic identity/payload/timestamp/replayed。
+23. Message Pool 固定有界、不使用 fallback；Stopping→Stopped 由 quiescence 自动触发，owner 泄漏导致 Shutdown 未完成而不是假 Stopped。
+24. Queue 按 messages + bytes 双预算；enqueue failure 同时 rollback BudgetLease 与 MessageHandle。
+25. Producer admission 使用固定 8 步顺序；真实 Disk unsafe 由 fast gate 立即拒绝并把状态修改事件交给串行域。
+26. drop counter 分类固定可观察。
+27. Timed deadline 在 producer fast path 直接检查。
+28. DiskAdmission payload 无 C++ data race；snapshot contention 只影响当前 message。
+29. Writer 单线程独占 rosbag2 Writer；普通 control queue 满在提交点立即失败，安全终结动作不可丢失。
+30. first-live 通知只来自成功 Live write；stale generation/segment 通知被忽略。
+31. Rolling timer 使用 Recorder mutation loop 的 steady `condition_variable::wait_until` 或等价单线程 timed wait，不新增 Timer Thread。
+32. Pause 期间 deadline 到达只设置 rotate_pending，Resume reopen ingress 前完成必要 Rotate。
+33. replay-only Segment 含真实 replay 数据时 Stop 后 COMPLETE。
+34. Snapshot 只保存成功 Live write；replayed message 永不重新进入 Snapshot。
+35. Snapshot 插入固定“per-topic 配额先、global 配额后”，使用 Snapshot 私有全局 `snapshot_sequence` 决定跨 Topic 最旧项。
+36. Schema 每 Topic Epoch 解析冻结一次；Humble 每 Segment 做有界 Schema/Channel readback。
+37. Manifest root error 不被 secondary error 覆盖；secondary_errors 最大 8；message 按 UTF-8 边界安全截断。
+38. manifest_revision 从 1 开始、每次 durable transition +1，不允许 wrap。
+39. directory fsync 无法确认时 `manifest_durability_uncertain` 只存在于当前进程内存；停止后续 Manifest mutation、新 Start，Recovery 以介质事实重建。
+40. manifest_revision==UINT64_MAX 时 RecorderState=Failed、ingress CLOSED，本 Runtime 不再接受新 Start，必须 restart + Recovery。
+41. 每个 Manifest durable transition 独立 commit，不 batching。
+42. DELETING 是唯一 durable Segment 删除授权；Cleanup authorized revision 仅诊断，current Segment state 才是权威。
+43. Cleanup 不使用 heartbeat；active_since + warning 只做诊断，native delete 未返回时 Shutdown 不得析构其依赖。
+44. Topic Event watermark 当前进程后续 operation 不得返回 Success；Restart Recovery 只有在完整 Event chain 验证通过后才能重新得出 ConfirmedSuccess/Failure。
+45. V1 不提供在线 rerun Recovery/repair API。
+46. Task Incomplete 与 Topic ConfirmedSuccess 可以同时成立；corrupt Event file 返回 StorageError，不伪装 NotFound。
+47. Recovery 不续录旧 Task、不恢复旧 Topic ACTIVE、不自动删 INCOMPLETE。
+48. `State` 明确定义 QueueState/PoolState/TopicState/SegmentState，并在 generation 连续竞争时退化到短 snapshot lock 保证自洽，不暴露 unstable flag。
+49. `State` 还暴露有界 CleanupState；Cleanup 阻塞可观察但不引入 heartbeat/watchdog，`last_completed_segment` 永远只表示当前 Task 最近 durable COMPLETE Segment。
+50. `topics_removed_recent` 由 `topics.recent_removed_instances` 有界控制，不影响 durable Topic Events 和累计值。
+51. publisher visibility freshness 默认 5000ms；expected_hz 缺失时 gap 永远为 nullopt。
+52. `get_task()` exact lookup 支持 bounded Segment paging；TaskDetail 显式返回 detail_segment_count；SegmentInfo 使用相对 Task path，不暴露绝对路径。
+53. `TaskList.has_more` 与 `scan_truncated` 按四组合语义解释；`list_tasks()` 仍是 bounded BEST_EFFORT，不冒充数据库。
+54. Server admission 只依据 Server-owned FIFO/backlog/deadline，不基于 Recorder state() 做权威准入；Server 不直接读取 Recorder persistence files。
+55. `RecorderState::Initializing` 必须在 protocol/server 冻结前同步为外部稳定状态；不得伪装成 IDLE/RECORDING。
+56. Recovery 读取 revision exhaustion 时只在恢复视图中分类 Incomplete 并记录 finding，不伪造新的 Manifest revision。
+57. Shutdown 只在真实 native/worker completion 后 Done；非阻塞诊断只记录日志/State；永久阻塞时 Runtime 进入 `UNSAFE_TO_DESTROY`，不 fake Done、不 detach、不提前析构。
+58. Recorder ErrorCode 必须机器可区分 `RecordingExists / StaleRecording / StaleTopicEpoch / TopicTypeConflict / AlreadyPaused`；Server 不得解析 `Error.message` 猜冲突原因。
+59. Resume 与 Timed/Disk/Shutdown 竞态按唯一串行线性化顺序返回；`ConfirmedPartial` 的 Resume 必须保持 RecorderState::Paused。
+60. DiscoveredTopic 明确暴露 `publisher_qos_profiles_truncated`；`publisher_count` 是真实观测数，不等于 profile vector 大小。
+61. INITIALIZING 首次 Manifest durable outcome uncertain 时保留受控 Task directory 供 Recovery 判断，不在当前进程删除后重试。
+62. Cleanup `active_for` 在每次 State 采样时由 steady clock 动态计算；`queued_count` 不包含最多一个 active item。
+63. Manifest Error message 的持久化最终总长严格 `<=512 bytes`；截断标记计入预算。
+64. Auto QoS 最终 tie-break 顺序必须稳定；相同 Graph snapshot 与 Runtime default 必须产生确定性相同结果。
 
-13. **不采纳的复审建议**
-    - 不新增 “Server status 周期必须 ≤2W，否则 Ring 失效” 的错误约束；
-    - 不强制 Normal 零消息只能 `segments=[]`；
-    - 不把所有 Cleanup claim/state mismatch 都静默当 stale；
-    - 不新增 manifest batching Timer；
-    - 不新增 network filesystem 强制开关；
-    - 不增加 `UNSAFE_TO_DESTROY` HTTP 错误码。
+## 8.9 v0.3.5 修订摘要
 
----
+v0.3.5 保持 v0.3.4 的 8 大章节、状态机、数据路径、持久化与验证内容，不通过删减篇幅来“收敛”设计。本版重点完成两组工作：**统一整个 C++ 工程物理布局**，以及关闭 v0.3.4 全文审查中仍值得在编码前明确的状态/值对象/边界问题。
 
-**文档状态：DRAFT。**
+### C++ 工程结构修订
 
-从 v0.2.10 开始，Recorder 的核心正确性契约已经足够进入 C++ 实现。后续实现过程中发现的问题应优先通过代码 Review、故障注入、ASan/TSan、Humble/Jazzy 实际 MCAP 验证和性能基准解决；除非出现新的领域契约冲突，不应继续为了预设实现细节无限扩展设计文档。
+1. 不再把 Recorder 的 `.hpp/.cpp` 全部平铺在 `src/recorder/`；
+2. 也不采用 `src/recorder/include + src/recorder/src`、`src/server/include + src/server/src` 的独立子工程式布局；
+3. 整个项目统一使用顶层 `include/ros2_bag/...` 与 `src/...`；
+4. `include/ros2_bag/recorder/` 与 `src/recorder/` 镜像表达 Recorder header/source；Server 使用完全相同的工程级规则；
+5. Runtime 的 `main.cpp / recorder_runtime / runtime_config / output_root_lock` 继续位于项目顶层 C++ 层，表达 composition root，而不是建立第三个 runtime 子工程；
+6. `include/` 只是项目统一 header 根，不自动构成第三方 SDK/ABI 承诺；安装策略另行决定；
+7. 构建可以使用内部 Recorder/Server target 表达依赖，但默认仍由根 `CMakeLists.txt` 统一组织，不要求每个模块拥有独立 CMake 子项目；
+8. `architecture.md`、`cpp_coding_guidelines.md`、`server.md` 在冻结前必须同步同一布局。
+
+### v0.3.4 审查修订
+
+9. Resume 的 PauseState 清空、RecorderState Paused→Recording 和 gate OPEN 改为同一串行 mutation 原子提交，消除可观察的 `Paused + empty PauseState` 中间窗口；
+10. 状态图补充 `Initializing -> Stopping` 的 Shutdown 路径，并明确 Initializing 期间不能预置 Pause；
+11. Timed duration 补齐 `steady_clock::time_point` 可表示性检查；
+12. RecoveryPending 重新确认失败时的 DiskError/Effects 规则明确；
+13. Stop/Finalize 补充规范 Effects 示例，进一步区分 Possible 与 ConfirmedPartial；
+14. 明确 Protocol `POSSIBLE` 与 C++ `Effects::Possible` 是不同层的同名概念；
+15. Server admission 明确只依据 Server-owned FIFO/backlog/deadline，不能使用 Recorder `state()` 做权威准入；
+16. `type_hash` 固定使用 ROS 标准 `RIHS{version}_{value}` 字符串化格式，可用性不足时保持 nullopt，不用 schema hash 冒充；
+17. Discovery 增加每 Topic endpoint QoS profile 上限，并明确 `QosIncompatible` 的诊断语义及 Auto 的确定性选择策略；
+18. `TaskDetail` 新增 `detail_segment_count`，补齐 recovered/findings 组合不变量；
+19. `SegmentInfo` 明确 message_count/size_bytes 的 nullopt 条件；
+20. Start 在 shutdown sticky flag 已经设置时立即返回 Done(InvalidState/None)，串行域仍做第二次最终检查；
+21. Shutdown 期间不阻止 quiescence 的 warning/diagnostic 只记录日志/State，不改变 Shutdown Success；
+22. Topic Event uncertainty watermark 明确从 `current_seq` 包含式生效；
+23. Manifest Error message 的 512-byte 上限明确包含 ASCII `...` 截断标记；
+24. Recovery 遇 `manifest_revision == UINT64_MAX` 时不伪造 N+1 Manifest，而是在恢复视图分类 Incomplete 并记录 `manifest_revision_exhausted` finding；
+25. Cleanup 为什么必须在 Shutdown 中安全退出的资源 ownership 原因进一步明确；
+26. Disk Warning→Normal 采用下一次有效安全 sample 立即恢复，不使用 Critical/Unknown 的 stable period；
+27. State 新增 `CleanupState`，使 Cleanup queue/active duration/warning/last_error 可观察但仍不引入 heartbeat；
+28. `last_completed_segment` 固定为当前 Task 最近 durable COMPLETE Segment，Task 切换后清空；
+29. Initializing 期间 `State.topics` 可以显示 Adding/Armed 准备状态，但不能被解释为 ACTIVE/可录制；
+30. Fault injection 增加 revision exhaustion Recovery 与 Cleanup 阻塞 Shutdown 两个场景；
+31. V1.0 实施基线从 55 条扩展为 57 条，并把工程布局、Resume 原子性、Cleanup State、Recovery revision exhaustion 等纳入冻结检查。
+
+### 对审查建议的有意取舍
+
+本版仍**不**增加以下机制：
+
+```text
+Cleanup heartbeat/watchdog thread
+公开 ExecutorCallState
+强制某一种 reserved-slot/内部队列物理实现
+HTTP 207 / 第四种 PARTIAL outcome
+在线 rerun Recovery / repair API
+独立 Recorder/Server 子工程目录
+```
+
+这些建议要么属于实现细节、要么会重新引入不必要的运行机制。V1 冻结的是不可丢失事件、owner 生命周期、durable barrier、串行线性化等正确性契约，而不是为了消除审查中的每个“可选实现”问题建立新抽象。
+
+
+
+## 8.10 v0.3.6 修订摘要
+
+v0.3.6 基于 v0.3.5 全文审查、实际仓库跨文档检查以及 Server/Protocol 契约对齐继续修订，不删除或压缩 v0.3.5 已有的正确性说明。主要变化：
+
+1. 保持项目级 `include/ros2_bag/... + src/...` 镜像布局，并明确未来拆分多个 CMake 文件只属于构建组织，不改变统一工程架构。
+2. `topic.*` 职责补充 `DiscoveredTopic`；Discovery 使用 `types[]` 表达同名多类型 observation，不再让单值 `type` 与 TypeConflict 语义冲突。
+3. Resume 与 Timed deadline、Disk 恶化、Shutdown 的竞态返回值冻结；Success 原子提交 PauseState empty + Recording + gate OPEN，ConfirmedPartial 时 RecorderState 必须保持 Paused。
+4. Completed Task 后 runtime resource teardown 失败的恢复路径明确：可证明安全释放后允许 Failed→Idle；永久不安全则 Shutdown/UNSAFE_TO_DESTROY/重启 Recovery。
+5. 将通用 `Conflict` 拆成 `RecordingExists / StaleRecording / StaleTopicEpoch / TopicTypeConflict`，增加 `AlreadyPaused`，并将领域超时精确命名为 `DrainTimeout`，使 Server 可以穷尽机器映射而不解析 message。
+6. `DiscoveredTopic` 增加 `publisher_qos_profiles_truncated`；`publisher_count` 表示真实 observation 数，可大于有界 profile vector。
+7. `TopicRecordability` 明确为 discovery 的最严重问题汇总，优先级固定为 `TypeConflict > TypeUnavailable > QosIncompatible > Recordable`。
+8. INITIALIZING 第一份 Manifest durability uncertain 时明确保留受控 Task directory，交给下次 Recovery 判断 interrupted-start/orphan 事实，不在当前进程删除后重试。
+9. Auto QoS 最终 tie-break 顺序固定，确保相同 Graph snapshot + Runtime default 得到相同 candidate。
+10. ADD_PREPARED durability uncertain 时当前 Add Completion 自身即为 `EventCommitFailed / Possible`；watermark 从当前 seq 包含式生效。
+11. Manifest Error message 的 512-byte 上限改为严格最终总预算，截断标记计入该预算。
+12. Cleanup `active_for` 每次 State 采样按 steady clock 动态计算；单线程 worker 的 active item 与 queued_count 关系明确。
+13. Frequency monitoring-valid 明确要求 ring 已覆盖完整 `[now-window, now]` 区间。
+14. Discovery endpoint profile 总量由 `discovery_max_results × discovery_max_endpoint_profiles` 严格有界，并要求 checked arithmetic。
+15. 同步 `architecture.md / cpp_coding_guidelines.md / server.md / protocol.md / requirements.md / verification.md / client.md`：统一 C++ 目录、`INITIALIZING`、`Completion<T>`、直接 identity、固定有界 Pool、TaskState 历史视图和新 ErrorCode 映射。
+16. 旧 `ControlHandle / Guard / RecorderControlSequencer / RecordingCoordinator / TopicManager / Pool fallback` 只允许在“明确废弃/禁止恢复”的历史说明中出现，不再作为现行接口或验收契约。

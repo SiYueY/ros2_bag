@@ -2,7 +2,7 @@
 
 | 属性 | 内容 |
 |---|---|
-| 文档版本 | v0.1.3 |
+| 文档版本 | v0.1.4 |
 | 文档状态 | **DRAFT — V1.0 开发阶段，随时修订；规范尚未批准用于完整实施** |
 | 设计范围 | Python Client SDK：同步/异步 HTTP API、类型模型、控制结果、SSE 消费与重同步、异常/资源关闭、测试 |
 | 架构依据 | docs/architecture.md（开发稿，可直接联动修改） |
@@ -285,11 +285,13 @@ Close、Context Manager、Stream Cancel、Client 应用退出均关闭自己的 
 | Topic | ID/Epoch、QoS、写入/接纳/丢弃、Publisher 观察及 nullable `actual_hz/frequency_validity/gap` | 把同名不同 Epoch 统计合并，或把 gap=null 当成 false |
 | Writer | `written_live` 与 `replayed_to_new_segment` | 把重放视为新接收消息 |
 | Removed Topics | `topics_removed_recent`、`topics_removed_total` | 用最近列表长度充当全任务总数 |
-| Cleanup | `cleanup_queue_depth`、`cleanup_pending_total`、`cleanup_queue_full_count` | 将 Queue 满视为文件删除失败 |
+| Cleanup | `cleanup_queue_depth`、`cleanup_pending_total`、`active_segment_id`、`active_for_seconds`、`warning_active`、`cleanup_queue_full_count`、`total_removed` | 将 Queue 满/长时间 active 直接解释为文件删除失败 |
 | Disk/Process | valid、sampled_at、nullable values | 将不可用 CPU/RSS 值填零 |
 | Errors | ErrorCode/phase/secondary errors | 混淆当前 Failed 与历史 INCOMPLETE |
 
 Server 发布对象是单一版本，但 Recorder 的子系统样本未必来自同一纳秒；Client 必须保留各子系统的有效性与来源。只有 Publisher 观测有效时才能将 0 Publishers 作为事实；否则应显示 Unknown。
+
+当前 Recorder state 值域必须完整支持 `IDLE / INITIALIZING / RECORDING / PAUSED / STOPPING / FAILED`。Client 不得把 `INITIALIZING` 归并为 IDLE 或 RECORDING；它表示 Task 已存在但 Start completion boundary 尚未完成。
 
 HTTP Status 与 SSE 的完整 StateEnvelope 属于同一种 Protocol State，不应被不同 Application 分别映射为互相覆盖的“独立权威来源”。Client 的 StateView 必须统一校验 Runtime + Revision 与新鲜度，且任何 Status Snapshot 均不证明一个 UNKNOWN 控制请求的终态。
 
@@ -297,7 +299,7 @@ HTTP Status 与 SSE 的完整 StateEnvelope 属于同一种 Protocol State，不
 
 `list_available_topics(query)` 映射 `GET /api/v1/topics/available`，支持 limit 1–200（默认 100）、非负 offset、`name_prefix` 或 `name`（互斥）。返回 items、observed_at、has_more、`snapshot_consistency:BEST_EFFORT`。
 
-每个 Topic 观察包括 name、types、publisher_count、observation（VISIBLE/VISIBLE_NO_PUBLISHER/NOT_FOUND/UNAVAILABLE）、recordability（CANDIDATE/TYPE_CONFLICT/TYPE_SUPPORT_UNAVAILABLE/QOS_INCOMPATIBLE）、actual_hz 与 frequency_validity。SDK 不基于 PublisherCount 或空 items 自行证明“永远不存在”或“必然可录”；Graph 在两次分页间可以变化，出现重复/漏项，应允许显式重新扫描。
+每个 Topic 观察包括 name、types、publisher_count、observation（VISIBLE/VISIBLE_NO_PUBLISHER/NOT_FOUND/UNAVAILABLE）、recordability（RECORDABLE/TYPE_CONFLICT/TYPE_SUPPORT_UNAVAILABLE/QOS_INCOMPATIBLE）、有界 publisher_qos_profiles、publisher_qos_profiles_truncated、actual_hz 与 frequency_validity。publisher_count 是真实观测数，可大于 profile 列表长度。SDK 不基于 PublisherCount 或空 items 自行证明“永远不存在”或“必然可录”；Graph 在两次分页间可以变化，出现重复/漏项，应允许显式重新扫描。
 
 精确 name 查询中的 NOT_FOUND 是**本次观测**，不是永久不存在的事实。**同一 name 当前观察到多个类型时必须视为 TYPE_CONFLICT，即使用户已经传入 `type` 也不能选择其中一个继续 Add**；显式 type 只用于要求唯一可见类型与调用者预期一致。QoS AUTO/EXPLICIT 的决策在 Recorder，Client 不调用 rclpy 获取另一套 Graph 信息。
 
@@ -305,7 +307,7 @@ HTTP Status 与 SSE 的完整 StateEnvelope 属于同一种 Protocol State，不
 
 `list_recordings(query)` 允许 limit/offset/name_prefix/started_after/started_before；`get_recording(recording_id, segment_limit, segment_offset)` 分页返回未压缩 Segment 明细，同时保留 `segment_page` 与 `segment_history_summary`。必须保持：
 
-- 历史 `RECORDING/PAUSED/STOPPING/COMPLETE/INCOMPLETE/FAILED/UNKNOWN` 与当前 Recorder.state **分开**，不可因为 Runtime READY 就将旧任务当 COMPLETE。
+- 历史 `INITIALIZING/RECORDING/FINALIZING/COMPLETE/INCOMPLETE/FAILED/UNKNOWN` 与当前 Recorder.state **分开**；历史 TaskState 不包含 PAUSED，不可因为 Runtime READY 就将旧任务当 COMPLETE。
 - start_time/end_time、message_counts、segment_count、last_error 缺失时为 None/Unknown，绝不补造纪元时间或零。
 - Segment 状态 `WRITING/FINALIZING/COMPLETE/DELETING/REMOVED/INCOMPLETE`；删除掉的 Rolling Segment 仍可能有受控历史条目。最老的 durable REMOVED 前缀若已由 Recorder 压缩，不会逐项返回，但 `segment_history_summary` 的累计计数与 `compacted_through_segment_id` 必须保留这一事实；Client 不补造虚构 Segment。
 - `path:null` 不允许 Client 在本地拼 output_root 或探测宿主机绝对目录；读取受 Server 权限控制。

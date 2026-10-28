@@ -2,7 +2,7 @@
 
 | 属性 | 内容 |
 |---|---|
-| 文档版本 | v0.1.5 |
+| 文档版本 | v0.1.6 |
 | 文档状态 | **DRAFT — V1.0 开发阶段，随时修订；规范尚未批准用于完整实施** |
 | 设计范围 | 同进程 Recorder Runtime、Drogon HTTP/JSON、控制调用调度、PublishedState、SSE、安全及生命周期 |
 | 架构依据 | docs/architecture.md（开发稿，可直接联动修改） |
@@ -38,13 +38,14 @@ Server 在**同一 C++17 Recorder Runtime 进程**内实现 `protocol.md` 的 HT
                                   │
                    ┌──────────────┴──────────────┐
                    │                             │
-             ControlDispatcher              QueryDispatcher
-            (单一有界执行域)              (有界只读工作域)
+             ControlDispatcher              ReadDispatcher
+            (单一有界外部槽)              (有界只读工作域)
                    │                             │
-                   ├─────── RecorderFacade ──────┤
-                   │                │            │
-                   │         RecordingCoordinator │
-                   │          / Recorder domain   │
+                   │                             ├── discover/history/evidence
+                   │                             │
+                   ├──────── Recorder public API ┤
+                   │        Completion / State   │
+                   │        direct identity      │
                    │                             │
                    │                   SnapshotSampler
                    │                             │
@@ -52,23 +53,40 @@ Server 在**同一 C++17 Recorder Runtime 进程**内实现 `protocol.md` 的 HT
                    │                       │     │
                    │                  GET Status SSEHub
                    │                             │
-                   └────────── Runtime ──────────┘
+                   └─────── RecorderRuntime ─────┘
                         所有权 / 生命周期屏障
 ```
 
+### C++ 物理目录
+
+Server 与 Recorder 使用同一项目级目录哲学，不建立独立小工程：
+
+```text
+include/ros2_bag/server/
+├── server.hpp
+├── config.hpp
+└── ...
+
+src/server/
+├── server.cpp
+└── ...
+```
+
+顶层 Runtime 仍位于 `include/ros2_bag/*.hpp` 与 `src/*.cpp`；Server 不建立 `src/server/include`、`src/server/src` 或第二个 package/CMake project。内部 CMake target 可以用于依赖和测试隔离，但不改变单一顶层工程事实。
+
 | 组件/概念 | 唯一职责 | 不允许做的事 |
 |---|---|---|
-| `RuntimeHost` | 配置、输出根目录锁、Recovery、ROS Context/Executor、Recorder 和 Server 的启动关闭顺序 | 在 Recorder 未终结时提前停掉依赖 Executor 或释放锁 |
+| `RecorderRuntime` | 配置、输出根目录锁、Recovery、ROS Context/Executor、Recorder 和 Server 的启动关闭顺序 | 在 Recorder 未终结时提前停掉依赖 Executor 或释放锁 |
 | `HttpApi` | Drogon 路由、参数及 Content-Type、Version、JSON 编/解码 | 等待同步 Writer/Executor 操作；读取 MCAP/Manifest |
 | `AccessGuard` | 请求身份、read/control 权限、远程 TLS/受信代理边界、基础限流 | 通过 Origin/Cookie/未验证 Header 隐式提权 |
 | `ControlDispatcher` | 唯一外部变更执行域、有界 admission、结果/timeout/关闭状态管理 | 按不同 HTTP 路由同时调用 Recorder 变更方法 |
 | `ReadDispatcher` | Recorder status 以外的 Graph/History/Topic Evidence 等有界读取 | 在 Drogon 网络循环执行可阻塞扫描；重写 JSONL 事件语义 |
-| `SnapshotSampler` | 有界周期读取 RecorderStatus，向发布域提交经过验证的值对象 | 为每位 SSE 订阅者分别轮询 Recorder |
+| `SnapshotSampler` | 有界周期读取 recorder::State，向发布域提交经过验证的值对象 | 为每位 SSE 订阅者分别轮询 Recorder |
 | `StatePublisher` | 构造 immutable PublishedState、分配 state_revision、GET/SSE 共享 | 以 recording_generation 或 SSE ID 代替状态版本 |
 | `SseHub` | 订阅注册、全量基线、发送调度、心跳与慢客户端处置 | 每连接分配独立线程；向 Recorder 高频线程回传网络背压 |
 | `ProtocolMapper` | C++ 领域值到固定 HTTP JSON 与错误语义转换 | 直接导出 C++ 指针/原生 ROS Message 或伪造领域状态 |
 
-上述是**职责划分**，不要求每个名词变成独立子系统/动态插件。可将 HttpApi/ProtocolMapper、StatePublisher/SseHub 的轻量类型就近组合。允许在单个 RuntimeHost 内集中配置与生命周期协调，但 Controller 不应成为录制业务逻辑的拥有者。
+上述是**职责划分**，不要求每个名词变成独立子系统/动态插件。可将 HttpApi/ProtocolMapper、StatePublisher/SseHub 的轻量类型就近组合。允许在单个 RecorderRuntime 内集中配置与生命周期协调，但 Controller 不应成为录制业务逻辑的拥有者。
 
 Server 只依赖 Recorder 的**稳定原生 API / 值对象快照**。Protocol 是独立文档而非运行时进程或模板库；Client/Python、CLI、TUI、Web 与 Server 的 C++ 链接无关。
 
@@ -77,22 +95,22 @@ Server 只依赖 Recorder 的**稳定原生 API / 值对象快照**。Protocol �
 | 执行域 | V1.0 推荐配置 | 可阻塞行为 | 所有权与退出屏障 |
 |---|---|---|---|
 | Drogon / Trantor I/O | 框架事件循环线程，初始值遵循 Drogon 受控配置 | **不允许**长时间等待 Recorder、fsync、History 扫描或 condition_variable | 框架管理；关闭前禁止回调访问已销毁 Dispatcher |
-| Server Control Worker | **恰好 1 个**独立 Worker | 同时最多提交一个外部 Recorder mutation，并同步等待其 `ControlHandle` 到领域 DONE；Writer/Executor 协作在线性化后的 Recorder 域完成 | RuntimeHost 管理；Handle 未 DONE 时不得 detach 或提交下一项外部 mutation |
+| Server Control Worker | **恰好 1 个**独立 Worker | 同时最多提交一个外部 Recorder mutation，并等待其 `Completion<T>` 到领域 DONE；Writer/Executor 协作在线性化后的 Recorder 域完成 | RecorderRuntime 管理；Completion 未 DONE 时不得 detach 或提交下一项外部 mutation |
 | Server Read Workers | 默认 2 个、容量有界；与 Control 分离 | 可以执行有界 Graph/History/Evidence/Status 复杂映射；不得进入 Recorder 数据热路径 | 必须在 Recorder 析构前停止新任务并释放所有引用 |
-| Server Snapshot Worker | 1 个由 Server 管理的定时采样执行域，可与 Read Worker 复用但**保留采样资源配额** | 允许 `status()` 短时读取，不能长时间阻塞网络回调 | Shutdown 时停止调度并清算在途 snapshot |
+| Server Snapshot Worker | 1 个由 Server 管理的定时采样执行域，可与 Read Worker 复用但**保留采样资源配额** | 允许 `state()` 短时读取，不能长时间阻塞网络回调 | Shutdown 时停止调度并清算在途 snapshot |
 | Server State/SSE 协调 | 每一 Runtime 的**单一串行发布序列**；可用现有 Server 调度循环实现，无需独立线程 | 仅对不可变快照进行短临界区复制、发布、排队 | 所有 Subscription 关闭/引用归还后才能销毁 |
 | ROS 2 Executor | Recorder 规范默认 1 个 Worker（配置可验证调整） | ROS Callback 与 Executor 协作 | **不能**被 Server Control 自等待关系提前停止 |
 | Writer / Cleanup / Recorder Monitor | Recorder 自有，参照 `recorder.md` | 各自限定的存储与资源 I/O | Server 不负责它们的内部停止次序 |
 
-**严格排除**：Drogon I/O Handler 直接执行 Recorder mutation，ROS Callback 同步请求 HttpApi，或者 SSE 发送时持 Recorder 领域锁。Server Control Worker 只串行**外部**请求并同步等待 Recorder 公共调用；真正的领域变更由 RecorderControlSequencer 与内部 Timed Stop/Disk/Writer 事件统一排序。两者不是重复的状态机：Server 不处理内部安全事件，Recorder 不处理 HTTP Admission/Deadline。
+**严格排除**：Drogon I/O Handler 直接执行 Recorder mutation，ROS Callback 同步请求 HttpApi，或者 SSE 发送时持 Recorder 领域锁。Server Control Worker 只串行**外部**请求并等待 Recorder `Completion<T>`；真正的领域变更由 Recorder 唯一串行 mutation 域与内部 Timed Stop/Rolling/Disk/Writer/Cleanup/Executor/Shutdown 事件统一排序。两者不是重复状态机：Server 不处理 Recorder 内部安全事件，Recorder 不处理 HTTP Admission/Deadline。
 
-所有对象销毁依赖按下面顺序：HTTP Handler / SSE Callback 只能通过 `weak_ptr/lease` 获取 Server 生命周期；Control/Read/Snapshot 任务通过受管理的 `RecorderLease`（可用 shared owner 或 RuntimeHost 在途引用计数）确保引用期间 Recorder 生存；Recorder 最终销毁必须在所有 lease 清零、Worker 真实退出并满足自身关闭屏障后。C++ 示例中的 `shared_ptr` **不允许制造 Runtime–Server–Recorder 的拥有环**。
+所有对象销毁依赖按下面顺序：HTTP Handler / SSE Callback 只能通过 `weak_ptr/lease` 获取 Server 生命周期；Control/Read/Snapshot 任务通过受管理的 `RecorderLease`（可用 shared owner 或 RecorderRuntime 在途引用计数）确保引用期间 Recorder 生存；Recorder 最终销毁必须在所有 lease 清零、Worker 真实退出并满足自身关闭屏障后。C++ 示例中的 `shared_ptr` **不允许制造 Runtime–Server–Recorder 的拥有环**。
 
-**锁顺序建议**：尽量没有跨组件嵌套锁。HttpApi 不持有任何锁进入 Dispatcher；Dispatcher 只持短暂自身队列锁执行 admission，锁外调用 Recorder；StatePublisher 的串行发布锁不包裹 `status()`、JSON 序列化、网络 `send()` 或认证逻辑；SseHub 的订阅映射锁不包裹发送。若实现中必须嵌套，需列出严格先后顺序并做 TSan/竞态注入证明。锁保护的是状态与指针交接，不代替 native 完成屏障。
+**锁顺序建议**：尽量没有跨组件嵌套锁。HttpApi 不持有任何锁进入 Dispatcher；Dispatcher 只持短暂自身队列锁执行 admission，锁外调用 Recorder；StatePublisher 的串行发布锁不包裹 `state()`、JSON 序列化、网络 `send()` 或认证逻辑；SseHub 的订阅映射锁不包裹发送。若实现中必须嵌套，需列出严格先后顺序并做 TSan/竞态注入证明。锁保护的是状态与指针交接，不代替 native 完成屏障。
 
 ## 1.4 关键数据对象与交接接口
 
-下列类型提供**语义草案**，不是强制的 C++ ABI；新 C++ 可恢复错误统一遵循 `docs/result.md`，并遵守 `docs/cpp_coding_guidelines.md` 与 `ros2_bag::recorder`、`ros2_bag::server`、`ros2_bag::runtime` 的职责边界，不能因模板细节改变协议完成语义。
+下列类型提供**语义草案**，不是强制的 C++ ABI；新 C++ 可恢复错误统一遵循 `docs/result.md`，并遵守 `docs/cpp_coding_guidelines.md` 与 `ros2_bag::recorder`、`ros2_bag::server`、顶层 `ros2_bag::RecorderRuntime` composition-root 的职责边界，不能因模板细节改变协议完成语义。
 
 ```cpp
 struct RequestContext {
@@ -107,7 +125,14 @@ struct ControlAttempt {
     RequestContext context;
     ControlCommand command;         // Validated owned value; no Drogon pointers.
     std::string expected_runtime_id;
-    RecordingTarget target;         // Optional for Start; task + generation otherwise.
+
+    // Start uses recording_id inside StartOptions. Other mutations carry the
+    // exact domain identity needed by recorder.md; no Target/Guard wrapper.
+    std::optional<std::string> recording_id;
+    std::optional<std::uint64_t> recording_generation;
+    std::optional<TopicId> topic_id;
+    std::optional<std::uint64_t> topic_epoch;
+
     CompletionSink completion;      // Lifetime-safe, at most once HTTP reply.
 };
 
@@ -129,7 +154,7 @@ Recorder 标识（recording_id、recording_generation、Topic ID/Epoch、operati
 
 ## 2.1 启动顺序、Readiness 与部分失败
 
-RuntimeHost 统一拥有进程启动流程，并显式维护 output_root advisory lock、Recovery、ROS Context/Executor、Recorder 与 Drogon Server 的依赖顺序；任何简化启动入口都不能替代 `architecture.md` §4.1 的完整生命周期契约。
+RecorderRuntime 统一拥有进程启动流程，并显式维护 output_root advisory lock、Recovery、ROS Context/Executor、Recorder 与 Drogon Server 的依赖顺序；任何简化启动入口都不能替代 `architecture.md` §4.1 的完整生命周期契约。
 
 ```text
 Load & Validate RecorderConfig + ServerConfig
@@ -170,11 +195,11 @@ Server 自有服务状态建议为：
 | `READY` | Listener、控制工作域、状态发布域、Recorder 入口均有效 | 依据 Auth/Config/Recorder 状态决定受理 |
 | `DEGRADED` | 只读查询或采样/历史局部异常，但未破坏核心运行安全 | 仅允许**能够证明安全**的操作；不可借 DEGRADED 放宽 Recorder 磁盘保护 |
 | `QUIESCING` | Runtime Shutdown 已发起，控制 admission 关闭 | 拒绝新控制、新 SSE；已有连接仅用于可控收尾 |
-| `DRAINING` | 正等待已有 ControlHandle、Recorder 工作与订阅退出 | 不能让新请求复活旧工作域 |
+| `DRAINING` | 正等待已有 Completion、Recorder 工作与订阅退出 | 不能让新请求复活旧工作域 |
 | `STOPPED` | 所有依赖都达到真实终结屏障并析构完成 | 不再有 Listener/Recorder 活动引用 |
 | `UNSAFE_TO_DESTROY` | 等待耗尽、某 Writer/Executor/Native 调用仍不能安全释放 | **不是 STOPPED**，只能保留依赖或走明确的进程级失败终止策略 |
 
-这是 **Runtime/Server 的生命周期阶段**，不等于 Recorder 的 `IDLE/RECORDING/PAUSED/STOPPING/FAILED`。GET Runtime 可将其映射到 Protocol 的 STARTING/READY/STOPPING/DEGRADED 等枚举，不泄漏内部阶段名；STOPPED 后根本不会再收到正常 HTTP 响应。
+这是 **Runtime/Server 的生命周期阶段**，不等于 Recorder 的 `IDLE/INITIALIZING/RECORDING/PAUSED/STOPPING/FAILED`。GET Runtime 可将其映射到 Protocol 的 STARTING/READY/STOPPING/DEGRADED 等枚举，不泄漏内部阶段名；STOPPED 后根本不会再收到正常 HTTP 响应。
 
 **状态切换线性化点：** 关闭 control admission 的原子状态/队列锁同步点。所有在此点之后进入的 POST 一律 `RUNTIME_NOT_READY`；之前成功 admission 的请求仍按同一 Worker 串行执行或被**证明尚未启动**后拒绝，不能被 Server 简单丢弃并当成自然失败。
 
@@ -205,10 +230,10 @@ shutdown requested (control plane / signal / fatal Runtime error)
   → CAS Runtime READY/DEGRADED → QUIESCING
   → 关闭新控制 POST / 新 Recorder 领域只读查询 / 新 SSE admission
   → 对队列中还未 started 的 Request 完成带 effects:NONE 的拒绝
-  → 在途 Recorder ControlHandle 不被网络取消；等待真实领域完成屏障
-  → Runtime 直接调用 Recorder.request_shutdown()，取得共享 ShutdownHandle（不经过 Server Control FIFO）
-  → Recorder Sequencer 合并 Stop/Shutdown，并保持 Executor/Context 有效
-  → 独立 Runtime deadline 等待 ShutdownHandle；确认 Writer/Topic/Pool/Cleanup/Monitor/Task 全部退出
+  → 在途 Completion 不被网络取消；等待真实领域完成屏障
+  → Runtime 直接调用 Recorder.shutdown()，取得共享 Completion<void>（不经过 Server Control FIFO）
+  → Recorder 串行 mutation 域 合并 Stop/Shutdown，并保持 Executor/Context 有效
+  → 独立 Runtime deadline 等待 Completion<void>；确认 Writer/Topic/Pool/Cleanup/Monitor/Task 全部退出
   → 停止采样与只读工作域，结束 SSE/HTTP 连接
   → 关闭 Drogon Listener / loop 并 join Server Workers
   → 验证所有 RecorderLease/Handler 资源归还
@@ -216,7 +241,7 @@ shutdown requested (control plane / signal / fatal Runtime error)
   → 释放 output_root lock，标记 STOPPED
 ```
 
-**Recorder Shutdown 的调用域。** RuntimeHost 不在自己的析构线程、Drogon I/O 或 Server ControlWorker 中同步执行可能永久阻塞的 Recorder Shutdown。它调用 Recorder 的 O(1) `request_shutdown()`，由 RecorderControlSequencer 使用保留系统事件推进；Runtime 自己只等待共享 `ShutdownHandle`。这样即使外部 ControlWorker 正等待一个长期未 DONE 的 Stop ControlHandle，或者 CleanupWorker/ResourceMonitor/Writer 被内核 I/O 卡住，Runtime 的 `recorder_grace` Timer 仍能独立运行并把进程标记 `UNSAFE_TO_DESTROY`。只有 Handle 表明 Recorder 全部受管线程实际退出后，Runtime 才允许进入 Recorder destructor/Node/Context/output_root lock 释放。
+**Recorder Shutdown 的调用域。** RecorderRuntime 不在自己的析构线程、Drogon I/O 或 Server ControlWorker 中同步执行可能永久阻塞的 Recorder Shutdown。它调用 Recorder 的 O(1) `shutdown()` 并取得共享 `Completion<void>`；Recorder 自己的唯一串行 mutation 域推进 shutdown 领域流程。这样即使外部 ControlWorker 正等待一个长期未 DONE 的 Stop Completion，或者 Cleanup worker/ResourceMonitor/Writer 被内核 I/O 卡住，Runtime 的 `recorder_grace` deadline 仍能独立运行并把进程标记 `UNSAFE_TO_DESTROY`。只有 `Completion<void>` DONE(Success) 且所有 Recorder-owned worker/native ownership 已真正结束后，Runtime 才允许进入 Recorder destructor/Node/Context/output_root lock 释放。
 
 **这份依赖顺序不是阻塞调用顺序的字面实现。** 进入 QUIESCING 后可以立即停止新 SSE/清理不持 Recorder 引用的网络资源；但是必须维持足够的 Server 响应能力，向尚有接收端的在途控制传达**真实结论**或 UNKNOWN。不能从 Drogon I/O EventLoop 自等待 join；不能停止 Listener 的同时假设所有 Handler 已自动析构。
 
@@ -225,7 +250,7 @@ shutdown requested (control plane / signal / fatal Runtime error)
 | 预算 | 候选默认 | 过期后的安全行为 |
 |---|---:|---|
 | `shutdown.request_grace_ms` | 2000 ms | 拒绝队列中的尚未进入 Recorder 的控制；回复 FAILURE/effects:NONE 或已断线就清理 Sink |
-| `shutdown.recorder_grace_ms` | 30000 ms | 若 Recorder ShutdownHandle 尚未完成（含未 DONE 的领域 Stop、Writer/Cleanup/ResourceMonitor/Executor Lease），记录超时原因并报告 UNSAFE_TO_DESTROY；**不得进入 Recorder destructor 或释放其依赖** |
+| `shutdown.recorder_grace_ms` | 30000 ms | 若 Completion<void> 尚未完成（含未 DONE 的领域 Stop、Writer/Cleanup/ResourceMonitor/Executor Lease），记录超时原因并报告 UNSAFE_TO_DESTROY；**不得进入 Recorder destructor 或释放其依赖** |
 | `shutdown.stream_grace_ms` | 2000 ms | 停止重试发最后一帧，直接关闭/终止仍待发送 SSE |
 | `shutdown.read_grace_ms` | 5000 ms | 取消尚未开始的只读任务并回收其租约；已在领域 API 中执行的只读任务若未退出，保留 RecorderLease，过期后转入 UNSAFE_TO_DESTROY，不因超时释放引用 |
 
@@ -244,16 +269,16 @@ Shutdown 并发情形的线性化：
 | 竞争双方 | 预期行为 |
 |---|---|
 | 新 Start vs QUIESCING | admission 顺序决定先受理还是明确拒绝；已进入 Recorder 者不可被默默忽略 |
-| Stop 已由 Control Worker 提交 vs Shutdown | Runtime 通过 Recorder `request_shutdown()` 提交系统意图，Recorder Sequencer 与已运行 Stop 合并为同一任务终结；Server 不创建第二个领域执行器或第二个 Writer Close 所有者 |
+| Stop 已由 Control Worker 提交 vs Shutdown | Runtime 通过 Recorder `shutdown()` 提交系统意图，Recorder 唯一串行 mutation 域与已运行 Stop 合并为同一 Task finalization；Stop Completion 与 Shutdown Completion 独立观察，但不创建第二个领域执行器或第二个 Writer Close 所有者 |
 | Topic Add/Remove 等待 Executor vs 停 Executor | 必须先完成/隔离 Topic 调用，确保依赖 Executor 未被抢先停止 |
 | GET History 正在扫描 vs 释放 output_root lock | Read Worker 必须实际退出并归还 RecorderLease 才允许正常析构/解锁；超时未退出进入 UNSAFE_TO_DESTROY，不能假装读取完成或放弃 Lease |
 | SSE 推送 vs Listener/Handler 关闭 | 标记订阅 Closing，停止生成新发送；在发送执行域进行在途发送终结，然后归还 Stream/Subscription |
 | 再次 SIGINT/SIGTERM / shutdown() | 所有请求协作同一共享 `ShutdownState`；同一 cleanup/领域终结不执行两次 |
 | 部分初始化失败与 Shutdown | 仅销毁确已构造且未被引用的对象；不要凭布尔开关假设 Writer/Executor 创建成功 |
 
-**对外结果：** 请求 HTTP 连接超时/中断，Client 操作 UNKNOWN；Server 若在 ResponseSink 仍可用时已经取得 `ControlHandle` 的 DONE Result，则按该领域 Result 回应。Sink 先超时后，Handle 最终 Result 只用于日志、状态刷新和受限 Topic Evidence，不维护可供查询的通用操作终态注册表。Recorder 最终明确返回 `DRAIN_TIMEOUT` 时是已知 `FAILURE + effects:POSSIBLE`；只有 Server 在 HTTP 回复预算内尚未取得 Handle DONE，或传输使可信回执丢失，才使用 Protocol `504/UNKNOWN`。SSE 连接断开或 Client 退出不触发 Recorder Stop；只有显式控制、Recorder 内部策略或 Runtime Shutdown 可以启动终结流程。
+**对外结果：** 请求 HTTP 连接超时/中断，Client 操作 UNKNOWN；Server 若在 ResponseSink 仍可用时已经取得 Recorder `Completion<T>` 的 DONE Result，则按该领域 Result 回应。Sink 先超时后，Completion 最终 Result 只用于日志、状态刷新和受限 Topic Evidence，不维护可供查询的通用操作终态注册表。Recorder 最终明确返回 `DrainTimeout` 时是已知 `FAILURE`（effects 按 Recorder 原样映射）；只有 Server 在 HTTP 回复预算内尚未取得 Completion DONE，或传输使可信回执丢失，才使用 Protocol `504/UNKNOWN`。SSE 连接断开或 Client 退出不触发 Recorder Stop；只有显式控制、Recorder 内部策略或 Runtime Shutdown 可以启动终结流程。
 
-状态诊断需区分 `active_domain_calls`、`queued_control_calls`、`read_jobs_pending`、`sse_clients` 与 `shutdown_stage`，可在 Server 运维日志/指标中观测；不把这些内部调度细节冒充 RecorderStatus 的权威字段。网络关闭后仍应可通过进程 Supervisor/日志区分成功退出与 UNSAFE_TO_DESTROY。
+状态诊断需区分 `active_domain_calls`、`queued_control_calls`、`read_jobs_pending`、`sse_clients` 与 `shutdown_stage`，可在 Server 运维日志/指标中观测；不把这些内部调度细节冒充 recorder::State 的权威字段。网络关闭后仍应可通过进程 Supervisor/日志区分成功退出与 UNSAFE_TO_DESTROY。
 
 # 3. HTTP 控制、只读查询与错误映射
 
@@ -290,11 +315,11 @@ Drogon Request
 
 GET Status 必须与 SSE 取**同一** immutable PublishedState，而不是在两个 Drogon Handler 各自读取 Recorder 再发布两个同 revision 不同数据的版本。最初状态不存在时，GET 返回 STATE_UNAVAILABLE，SSE 握手不得伪造空 Recorder 当前状态。
 
-不得在 Handler 中持有 `HttpRequestPtr` 的裸指针或引用跨异步边界；请求 Context 在 admission 前已复制验证。Framework Callback 可移动到受控 CompletionSink；如果 Client 先断开，Sink 释放网络资源但不取消已提交的 Recorder 领域请求/ControlHandle。
+不得在 Handler 中持有 `HttpRequestPtr` 的裸指针或引用跨异步边界；请求 Context 在 admission 前已复制验证。Framework Callback 可移动到受控 CompletionSink；如果 Client 先断开，Sink 释放网络资源但不取消已提交的 Recorder 领域请求/Completion。
 
 ## 3.2 控制队列、Admission 与唯一外部提交槽
 
-**唯一外部控制提交槽**：同一个 Recorder 实例对应一个 ControlDispatcher；其单一 Worker 同时最多向 Recorder 提交一个外部 mutation，并在该 `ControlHandle` 领域 DONE 前保持占用。真正的副作用与内部 Timed/Rotate/Disk/Shutdown 事件都由 RecorderControlSequencer 统一线性化，因此 Server Worker **不是第二个领域状态机或 Writer Close 所有者**。Dispatcher 状态为 `ACCEPTING → CLOSING → CLOSED`，独立于 Recorder 的 IDLE/STOPPING；使用有界 FIFO + 一个正在等待领域完成的项。不得用每条路由各自 mutex、线程池顺序概率或只在 POST 验证阶段锁保护来冒充跨路由串行化。
+**唯一外部控制提交槽**：同一个 Recorder 实例对应一个 ControlDispatcher；其单一 Worker 同时最多向 Recorder 提交一个外部 mutation，并在该 `Completion` 领域 DONE 前保持占用。真正的副作用与内部 Timed/Rotate/Disk/Shutdown 事件都由 Recorder 串行 mutation 域 统一线性化，因此 Server Worker **不是第二个领域状态机或 Writer Close 所有者**。Dispatcher 状态为 `ACCEPTING → CLOSING → CLOSED`，独立于 Recorder 的 IDLE/STOPPING；使用有界 FIFO + 一个正在等待领域完成的项。不得用每条路由各自 mutex、线程池顺序概率或只在 POST 验证阶段锁保护来冒充跨路由串行化。
 
 V1.0 初始执行预算建议：
 
@@ -303,10 +328,10 @@ V1.0 初始执行预算建议：
 | `control.queue_capacity` | 32 个等待中的请求，不包括唯一运行项 | 受理前返回 HTTP 429、`CONTROL_QUEUE_FULL`、`FAILURE + effects:NONE` |
 | `control.admission_timeout_ms` | 0（非阻塞尝试） | 立即拒绝；不阻塞 Drogon I/O |
 | `control.max_queue_wait_ms` | 5000 ms | 若**能证明**仍未进入 Recorder，移出 FIFO 并返回 `HTTP 503 / QUEUE_TIMEOUT / FAILURE / effects:NONE` |
-| `control.domain_response_timeout_ms` | 30000 ms | 仅网络回复预算：等待 Recorder `ControlHandle` DONE。到期时返回 `UNKNOWN`（若连接可用），Worker 继续等待领域真实终态，不启动下一个冲突操作 |
+| `control.domain_response_timeout_ms` | 30000 ms | 仅网络回复预算：等待 Recorder `Completion<T>` DONE。到期时返回 `UNKNOWN`（若连接可用），Worker 继续等待领域真实终态，不启动下一个冲突操作 |
 | `control.max_outstanding_responses` | 64（含排队与正在等待回应） | 429/503 拒绝新 admission；防止失联连接持有无限 sink |
 
-**值的定位**：上表是可调整、可测量的初始内存/时间预算；不代表已实现或 OPEN-02 性能验收通过。慢 Writer 时 ControlHandle 可能长期未 DONE，后续请求必须有界排队和退避/拒绝，不允许开第二个 Worker 绕开前一个未完成领域操作。
+**值的定位**：上表是可调整、可测量的初始内存/时间预算；不代表已实现或 OPEN-02 性能验收通过。慢 Writer 时 Completion 可能长期未 DONE，后续请求必须有界排队和退避/拒绝，不允许开第二个 Worker 绕开前一个未完成领域操作。
 
 **响应槽层次与公平性：** `http.max_outstanding_responses=128` 是**尚未完成的普通 HTTP 请求及 SSE 握手响应**的全局上限；已建立 SSE Stream 的长期连接不继续占用这一短响应槽，而计入单独 `sse.max_clients` 及 Stream 字节/连接预算。`control.max_outstanding_responses=64` 是上述全局预算中允许由控制 POST 占用的上限（含等待领域结果的响应和网络尚未完成的应答），不是额外可叠加的 64 个 HTTP 槽；Read Query 和握手共享剩余全局槽，必须有受控的读/控制公平性与必要保留配额。一个请求占用一个全局槽；Control POST 再占用一个控制配额，在 ResponseSink 终结、断连被确认或按生命周期完成释放时一次性归还。**Recorder 领域请求可能在应答超时后继续占据唯一 Control Worker，但不继续占据已终结的网络响应槽；其运行责任由单独 domain-running 计数/RecorderLease 管理。** 同一 gate 同步点先验证全局槽及所需类别配额，再按 control FIFO 容量 admission；取得多个配额时必须原子预留或失败回滚，不能让一半成功的 Reserve 泄漏。全局容量不足须明确拒绝未提交的请求，且不能挤占已经获得的 HTTP/SSE 资源。
 
@@ -316,8 +341,8 @@ V1.0 初始执行预算建议：
 2. **先获得全局 HTTP 响应槽，再获得控制类别配额，最后取得 FIFO 等待槽**；操作必须可原子提交或回滚，避免两个不同预算分别占满造成漏计。额外保留 read/SSE 握手响应能力；任一 Admission 限额拒绝时均明确未执行（effects:NONE）。
 3. 操作进入 owned FIFO 时标记 QUEUED，原子取得唯一入队序号；HTTP 接收顺序本身不是执行顺序。
 4. Control Worker 从队列取出时，先原子标记 STARTED，再在**实际进入 Recorder 之前**复核 Runtime ID、recording_id + generation、Topic epoch 与 Shutdown gate。Recorder 领域仍进行最终状态裁定。
-5. 从此处调用 Recorder mutation 只取得共享 `RecorderControlHandle<T>`；**Handle 返回不等于领域完成**。Control Worker 保持唯一外部 mutation 执行槽并等待该 Handle 的 `Done`，直到最终 `Result<T, RecorderError>` 已捕获前不得提交下一项外部状态变更。
-6. HTTP ResponseSink 的 deadline/断线与 Recorder Handle 生命周期独立：Sink 可以先结束并形成 Protocol UNKNOWN，但 Worker 仍等待 Handle Done。Result Value 是领域成功，Result Error 是领域失败；observer deadline/disconnect 且 Handle 尚未产生 Result 才是 UNKNOWN。不得给 Result 增加 UNKNOWN 第三态、将 HTTP timeout 写入 RecorderErrorCode，或混合 transport lifecycle 与 domain Result。
+5. 从此处调用 Recorder mutation 只取得共享 `recorder::Completion<T>`；**Completion 对象返回不等于领域完成**。Control Worker 保持唯一外部 mutation 执行槽并等待 `completion.done()`/`wait_for()`，直到最终 `Result<T, recorder::Error>` 已取得前不得提交下一项外部状态变更。
+6. HTTP ResponseSink 的 deadline/断线与 Completion 生命周期独立：Sink 可以先结束并形成 Protocol UNKNOWN，但 Worker 仍等待 Completion DONE。Result Value 是领域成功，Result Error 是领域失败；observer deadline/disconnect 且 Completion 尚未产生 Result 才是 UNKNOWN。不得给 Result 增加 UNKNOWN 第三态、将 HTTP timeout 写入 recorder::ErrorCode，或混合 transport lifecycle 与 domain Result。
 7. 如果某请求的网络 deadline 已过，它的最终领域 Result 可用于日志和状态重新采样，但不能在未经可信关联的其他连接中“补回”一个成功的操作回执。
 
 推荐状态图（只有 Server 队列内存，**不是持久 Operation Registry**）：
@@ -327,7 +352,7 @@ VALIDATED
  → QUEUED ────────→ REJECTED_NOT_STARTED
      │                (queue timeout / shutdown; effects NONE)
      ↓
-   STARTED → HANDLE_ACQUIRED → DOMAIN_RUNNING → DOMAIN_DONE
+   STARTED → COMPLETION_ACQUIRED → DOMAIN_RUNNING → DOMAIN_DONE
                      │                   │
                      │                   ├─ SUCCESS → ResponseSink (if active)
                      │                   └─ FAILURE → ResponseSink (if active)
@@ -335,9 +360,9 @@ VALIDATED
                                         Domain request continues to real DONE
 ```
 
-Server 保留当前队列节点直至对应 ControlHandle 真正 DONE，**不**为了满足 HTTP timeout 把仍在 Recorder 中执行的领域请求解离成没有生命周期管理的后台任务。存活的请求对象数量仍受 queue + running 控制，单次领域操作永久不完成是进程故障/关闭屏障问题，不靠无限堆积请求解决。
+Server 保留当前队列节点直至对应 Completion 真正 DONE，**不**为了满足 HTTP timeout 把仍在 Recorder 中执行的领域请求解离成没有生命周期管理的后台任务。存活的请求对象数量仍受 queue + running 控制，单次领域操作永久不完成是进程故障/关闭屏障问题，不靠无限堆积请求解决。
 
-**Recorder 内部控制顺序器的隔离：** Server 的唯一 ControlWorker **只串行外部 POST 的网络受理与等待**，不执行或替代 Recorder 内部 Timed Stop/Rotate/Disk 状态机。外部请求取得 `RecorderControlHandle` 后，真正的 mutation 与内部安全事件都由 RecorderControlSequencer 统一线性化；Server ControlWorker **不与 Sequencer 形成第二个并发领域执行域，也不竞争 Writer Close/Rotate 所有权**。Producer deadline/disk gate 可以在无阻塞准入点原子拒绝新消息，但只提交/合并 Sequencer 事件，不直接推进 Writer/Manifest 状态。Server 不能把 Recorder 内部事件排进可能长期堵塞的外部 HTTP FIFO，也不能把外部控制请求交给 ROS Executor Timer 阻塞执行。关闭 Runtime 时 Server Worker、Recorder Sequencer 与所有 Handle/Lease 均须真实结束，不能在任一执行线程中 join 自身。
+**Recorder 串行域与 Server ControlWorker 的隔离：** Server 的唯一 ControlWorker 只串行外部 POST 的网络 admission、FIFO 与 Completion 等待，不执行或替代 Recorder 内部 Timed Stop/Rotate/Disk 状态机。外部请求取得 `Completion<T>` 后，真正 mutation 与内部安全事件都由 Recorder 唯一串行 mutation 域统一线性化；Server ControlWorker 不形成第二个领域执行域，也不竞争 Writer Close/Rotate 所有权。Producer deadline/disk gate 可以在无阻塞准入点原子拒绝新消息，但只向 Recorder 串行域提交/合并事件，不直接推进 Writer/Manifest 状态。Server 不能把 Recorder 内部事件排进可能长期堵塞的外部 HTTP FIFO，也不能把外部控制请求交给 ROS Executor Timer 阻塞执行。关闭 Runtime 时 Server Worker、Recorder mutation work、所有 Completion observer 与 Lease 均须真实结束，不能在任一执行线程中 join 自身。
 
 ## 3.3 超时竞态、请求目标再验证与结果语义
 
@@ -346,31 +371,33 @@ Server 保留当前队列节点直至对应 ControlHandle 真正 DONE，**不**�
 | Full Queue 前 Server 可证明未调用 Recorder | Control admission 失败 | 429 FAILURE, effects:NONE |
 | QUEUED 和排队 deadline 同时发生 | 队列锁下比较“仍为 QUEUED”与 Worker STARTED；先赢者确定 | 未开始 → HTTP 503/QUEUE_TIMEOUT/FAILURE/effects:NONE；已可能执行且终态未知 → HTTP 504/UNKNOWN |
 | QUIESCING 同时收到新 POST | 与 admission 同一互斥/CAS 门 | gate 先关闭 → 拒绝；先入队 → 只允许完成/有证据的未开始拒绝 |
-| Stop 的 ControlHandle 超过 HTTP deadline 仍未 DONE | ResponseSink 最多一次 UNKNOWN，Control Worker **继续持有唯一外部提交槽** | 504 UNKNOWN；之后任务进入 IDLE 也不能更改旧回执 |
+| Stop 的 Completion 超过 HTTP deadline 仍未 DONE | ResponseSink 最多一次 UNKNOWN，Control Worker **继续持有唯一外部提交槽** | 504 UNKNOWN；之后任务进入 IDLE 也不能更改旧回执 |
 | Stop 超时 + 内部 Timed Stop 到 IDLE | Recorder 内部与外部交错；外部实际终态未知 | 不能将 IDLE 当该 Stop SUCCESS |
 | Stop 超时 + Disk Pause 到 PAUSED | 领域内部安全策略可先发生 | 不能仅凭 PAUSED 判 Stop FAILURE |
 | Add Topic 已 durable PREPARED、终态 fsync 失败 | Recorder 只读证据 = UNCERTAIN | 能同步拿到 `EVENT_COMMIT_FAILED` 就 FAILURE/effects:POSSIBLE；HTTP 结果丢失仍 UNKNOWN |
-| Old recording_generation 排队时已切换 Task | Recorder Sequencer 在线性化点最终验证发现 STALE_RECORDING | 409 FAILURE/effects:NONE，不作用于新的 Task |
+| Old recording_generation 排队时已切换 Task | Recorder 串行 mutation 域在线性化点返回 `StaleRecording / None` | 409 `STALE_RECORDING`，不作用于新的 Task |
 | Old topic_epoch 仍同名 Topic | Recorder 域校验 Epoch | STALE_TOPIC_EPOCH，绝不删除同名新 Epoch |
-| Recorder ControlHandle 已 DONE/SUCCESS，但网络发送失败 | 可信成功仅在 Server 内存日志；Client 未见回执 | Client UNKNOWN，Server 不推定 Client 收到了成功 |
+| Completion 已 DONE/SUCCESS，但网络发送失败 | 可信成功仅在 Server 内存日志；Client 未见回执 | Client UNKNOWN，Server 不推定 Client 收到了成功 |
 
 **QUEUE_TIMEOUT Protocol 映射：** 当请求曾成功排队但**确定尚未进入 Recorder**，且在队列状态锁下原子移除成功，响应 `HTTP 503 / QUEUE_TIMEOUT / FAILURE / effects:NONE / retryable:false`；满队列且未受理仍为 `HTTP 429 / CONTROL_QUEUE_FULL`；已经可能进入 Recorder、但无可信终态，仍为 `HTTP 504 / OPERATION_RESULT_UNKNOWN / UNKNOWN`。任何队列超时都不构成控制 POST 自动重试许可。
 
-**Recorder 目标守卫是强制接口，而非可选优化：** §3.3 的外部 Worker 二次验证不能解决 TOCTOU。Recorder 对 Server 暴露的 Stop/Pause/Resume/Add/Remove 领域入口必须携带 §1.3.1 定义的 Recording/Topic Guard，并由 RecorderControlSequencer 在领域状态转移线性化点联合校验目标身份；不带 Guard 的旧式入口不得作为 Server 调用路径。Server 已取得 ControlHandle 后也不能依赖先前 `status()` 的身份验证。Stale target 必须在任何本次副作用前确定拒绝且 `effects:NONE`，内部安全事件另走明确受控 Task Lease。交叉测试需在“Server 最后一次验证后/Recorder 线性化前”触发 Generation 变化，证明旧请求绝不作用于新 Task。
+**Recorder 目标身份必须在领域线性化点最终验证。** Server 的外部 Worker 二次预检只能减少明显无效调用，不能解决 TOCTOU。Recorder 对 Server 暴露的 Stop/Pause/Resume 使用直接 `recording_id + generation` 参数；Remove Topic 额外携带 `topic_id + topic_epoch`；Add Topic 携带 `recording_id + generation + TopicOptions + operation_id`。V1 不建立 RecordingTargetGuard/TopicTargetGuard wrapper。
 
-**保护检查到 Recorder 线性化的竞态**：Server 可以用一次 Control Worker 上的状态快照做预拒绝，但若随后 Recorder 内部 Timed Stop/Disk Pause 改变状态，只有 RecorderControlSequencer 的最终状态/Guard 线性化点有效；任何“Server 检查后一定生效”的承诺都不合法。不能持 Coordinator 内部 mutex 横跨 JSON 或网络 I/O；目标身份守卫必须由 Recorder 自身的原子/锁状态条件或等价最终验证支持，否则该保护存在 TOCTOU。
+Recorder 串行 mutation 域在真正产生本次副作用前按固定顺序重新验证 identity：recording identity 失败返回 `StaleRecording / Effects::None`；recording 正确但 Topic epoch 过期返回 `StaleTopicEpoch / Effects::None`。Server 已取得 Completion 后也不能依赖先前 `state()` 的身份验证。交叉测试必须在“Server 最后一次预检后/Recorder 线性化前”改变 generation/epoch，证明旧请求绝不作用于新 Task/Topic。
 
-**operation_id 保留源值**：Client POST 给出的 operation_id 经验证后原样传递 TopicManager/RecordingCoordinator，不以 request_id 替换。Server 不对请求自动添加“重试一次”的行为，也不缓存“operation_id 已成功”作为幂等键。重复发同 ID 可能在 Recorder 中形成冲突，由其 Event/Domain 返回可信结果，而非 Server 暗中吞掉第二次调用。
+**预检到 Recorder 线性化的竞态：** Server 可以使用自己已验证的请求身份和最近状态做诊断性预拒绝，但权威结果始终来自 Recorder 串行域；任何“Server 检查后一定生效”的承诺都不合法。Server 不持 Recorder 内部锁横跨 JSON/网络 I/O，也不通过 `Error.message` 或事后 State 猜 stale 类型。
 
-**独立 Deadline Scheduler：** `domain_response_timeout_ms` 必须由**不在 Control Worker 上运行**的轻量 Timer/Deadline 调度器触发（可以复用受控的 Drogon timer/Server 调度域）。Control Worker 在 `RecorderControlHandle::wait_for()`/等价 Completion wait 中等待领域 DONE；Deadline Timer 只可 CAS ResponseSink 状态并尝试发送 `504/UNKNOWN`，**不得调用 `cancel_if_not_started()`、取消 Recorder Request、析构 RecorderLease 或释放唯一 Control Worker**。Handle 后续 DONE 时 Worker 捕获真实结果；若 Sink 已完成，只记录安全诊断并触发状态刷新，不重复发送。这一 Deadline 事件执行本身也必须有界且不参与 Recorder 锁等待。
+**operation_id 保留源值**：Client POST 给出的 operation_id 经验证后原样传递 Recorder 的 Topic Add/Remove API，并最终写入 Recorder-owned Topic Events；不以 request_id 替换。Server 不对请求自动添加“重试一次”的行为，也不缓存“operation_id 已成功”作为幂等键。重复发同 ID 由 Recorder 的 Event/Domain 证据规则裁定冲突/不确定性，而非 Server 暗中吞掉第二次调用。
 
-**ResultSink 一次性：** 每次 HTTP Request 无论领域 Handle DONE、deadline、客户端断线、Shutdown 交错，response promise/callback 只能完成/释放一次；重复完成是实现错误。HTTP UNKNOWN 是**本次传输可观察的请求结果状态**，不自动改变 Recorder state 或 durable Topic Event。
+**独立 Deadline Scheduler：** `domain_response_timeout_ms` 必须由**不在 Control Worker 上运行**的轻量 Timer/Deadline 调度器触发（可以复用受控的 Drogon timer/Server 调度域）。Control Worker 在 `Completion<T>::wait_for()` 或等价 observer wait 中等待领域 DONE；Deadline Timer 只可 CAS ResponseSink 状态并尝试发送 `504/UNKNOWN`，**不得取消 Recorder operation、析构 RecorderLease 或释放唯一 Control Worker**。Recorder `Completion<T>` 本身没有网络驱动的 cancel API。Completion 后续 DONE 时 Worker 捕获真实结果；若 Sink 已完成，只记录安全诊断并触发状态刷新，不重复发送。这一 Deadline 事件执行本身也必须有界且不参与 Recorder 锁等待。
 
-**Deadline Scheduler 的完整竞态闭环：** 排队 deadline 同样由独立 Timer 检查，且必须与 Control Worker 的 `QUEUED→STARTED` 在同一队列状态同步点竞争；只有抢先完成 `QUEUED→REJECTED_NOT_STARTED` 并安全摘链时才允许 `QUEUE_TIMEOUT/effects:NONE`。Domain response deadline 只能 CAS Sink 的 `PENDING→UNKNOWN_SENT/ABANDONED`，不得转移 Dispatcher 当前外部提交槽；Worker 先观察到 ControlHandle DONE 并抢到 Sink 时正常发送 SUCCESS/FAILURE，Timer 输掉竞争则不再发送 UNKNOWN。网络回执尝试之后的一次性槽释放与 ControlHandle/RecorderLease 的完成释放分别计数，不得为了节省响应槽销毁仍被领域请求引用的 RequestState。
+**ResultSink 一次性：** 每次 HTTP Request 无论领域 Completion DONE、deadline、客户端断线、Shutdown 交错，response promise/callback 只能完成/释放一次；重复完成是实现错误。HTTP UNKNOWN 是**本次传输可观察的请求结果状态**，不自动改变 Recorder state 或 durable Topic Event。
+
+**Deadline Scheduler 的完整竞态闭环：** 排队 deadline 同样由独立 Timer 检查，且必须与 Control Worker 的 `QUEUED→STARTED` 在同一队列状态同步点竞争；只有抢先完成 `QUEUED→REJECTED_NOT_STARTED` 并安全摘链时才允许 `QUEUE_TIMEOUT/effects:NONE`。Domain response deadline 只能 CAS Sink 的 `PENDING→UNKNOWN_SENT/ABANDONED`，不得转移 Dispatcher 当前外部提交槽；Worker 先观察到 Completion DONE 并抢到 Sink 时正常发送 SUCCESS/FAILURE，Timer 输掉竞争则不再发送 UNKNOWN。网络回执尝试之后的一次性槽释放与 Completion/RecorderLease 的完成释放分别计数，不得为了节省响应槽销毁仍被领域请求引用的 RequestState。
 
 ## 3.4 查询执行、Topic Evidence 与路径安全
 
-GET /status 使用已发布 immutable 快照，不对每个客户端调用 RecorderStatus。其余 Recorder 查询必须走隔离的 ReadDispatcher，初始建议 **2 Workers、队列容量 32、每查询绝对 wall-time 预算 3000 ms**，并对 Graph、History、Topic Evidence 各设置并发与扫描字节/条目上限。超时只限制网络回应，无法安全中断的阻塞文件查询仍须持有合法 RecorderLease，不能杀掉使用对象的线程来释放队列容量。**Read Worker 的执行期与 HTTP ResponseSink 的生命周期独立：** HTTP 超时或断线只完成一次网络请求终态，并停止新的响应尝试；Reader 必须继续持有领域 Lease 直至原生查询真实返回，Shutdown 超过 `read_grace_ms` 时按 §2.4 标记 UNSAFE_TO_DESTROY，不允许释放仍由 Reader 使用的 Recorder。排队而未开始的查询则可在可证明的队列同步点安全取消并释放其配额。
+GET /status 使用已发布 immutable 快照，不对每个客户端调用 recorder::State。其余 Recorder 查询必须走隔离的 ReadDispatcher，初始建议 **2 Workers、队列容量 32、每查询绝对 wall-time 预算 3000 ms**，并对 Graph、History、Topic Evidence 各设置并发与扫描字节/条目上限。超时只限制网络回应，无法安全中断的阻塞文件查询仍须持有合法 RecorderLease，不能杀掉使用对象的线程来释放队列容量。**Read Worker 的执行期与 HTTP ResponseSink 的生命周期独立：** HTTP 超时或断线只完成一次网络请求终态，并停止新的响应尝试；Reader 必须继续持有领域 Lease 直至原生查询真实返回，Shutdown 超过 `read_grace_ms` 时按 §2.4 标记 UNSAFE_TO_DESTROY，不允许释放仍由 Reader 使用的 Recorder。排队而未开始的查询则可在可证明的队列同步点安全取消并释放其配额。
 
 | Query 类型 | 输入 | 领域调用与边界 |
 |---|---|---|
@@ -401,7 +428,7 @@ HttpApi/ProtocolMapper 的唯一外部规范是 `protocol.md`，尤其 §1.2/§2
 
 **Topic Evidence 的二维裁定：** Server 必须保留 POST 的原始 `outcome/effects` 与随后 Evidence GET 的 `evidence_status` 两个独立事实。特别是 EVENT_COMMIT_FAILED 的 POST 仍为失败，不能因为重启后 Recorder 重新验证持久文件而改写旧 HTTP 的日志；Recovery 验证过的终态只能说明**现在可确认的持久化领域副作用**。Server 不在内存/Redis 创建补偿成功回执，也不以 Channel/状态推断领域成功。
 
-**异常边界**：C++ JSON ParseError、std::bad_alloc、Drogon Callback 抛错、Recorder 返回 error、文件读取异常都需要在适当 Worker 转为稳定 Protocol ErrorCode 和安全日志，不能让第三方异常越过 Drogon I/O EventLoop 或 ROS Callback 栈。Recorder 已进入领域后的错误映射**唯一服从 `protocol.md` §4.2.1**；Server Mapper 必须对 RecorderErrorCode 做穷尽匹配，不提供“未知枚举默认 500 后继续”的发布路径。OOM 时最低限度是停止 admission/降级服务并记录故障，不假设还能成功序列化复杂 JSON 响应。
+**异常边界**：C++ JSON ParseError、std::bad_alloc、Drogon Callback 抛错、Recorder 返回 error、文件读取异常都需要在适当 Worker 转为稳定 Protocol ErrorCode 和安全日志，不能让第三方异常越过 Drogon I/O EventLoop 或 ROS Callback 栈。Recorder 已进入领域后的错误映射**唯一服从 `protocol.md` §4.2.1**；Server Mapper 必须对 recorder::ErrorCode 做穷尽匹配，不提供“未知枚举默认 500 后继续”的发布路径。OOM 时最低限度是停止 admission/降级服务并记录故障，不假设还能成功序列化复杂 JSON 响应。
 
 **请求体/序列化预算**必须独立校验：最大 HTTP Body 字节、字段数组/嵌套深度、Topic 名称/URI/operation ID、状态 JSON 输出上限、每次序列化最大 heap bytes。若状态超限，应返回协议定义的 STATE_TOO_LARGE 或安全关闭 SSE；绝对不能用遗漏部分 Topic/录制身份的 JSON 冒充“完整 Snapshot”。验证 JSON 保留未知可选字段的兼容性，同时拒绝未知必需的修改语义。
 
@@ -409,27 +436,27 @@ HttpApi/ProtocolMapper 的唯一外部规范是 `protocol.md`，尤其 §1.2/§2
 
 ## 4.1 SnapshotSampler：成本预算、单一采样与降级
 
-SnapshotSampler 是**Server 的唯一周期性 RecorderStatus 采样入口**。HTTP GET /status、SSE Client 数量增长不会增加周期性 RecorderStatus 采样次数。控制命令 `ControlHandle` DONE 后可以向采样域发出合并的“尽快刷新”提示，但不直接从 Control Worker 把临时局部状态投递给 SSE。
+SnapshotSampler 是**Server 的唯一周期性 recorder::State 采样入口**。HTTP GET /status、SSE Client 数量增长不会增加周期性 recorder::State 采样次数。控制命令 `Completion` DONE 后可以向采样域发出合并的“尽快刷新”提示，但不直接从 Control Worker 把临时局部状态投递给 SSE。
 
 建议初始配置与状态：
 
 | 参数 | 初始默认 | 约束/理由 |
 |---|---:|---|
 | `status.sample_interval_ms` | 1000 | 候选 1 Hz；OPEN-02 最终可依据测量调整 |
-| `status.min_resample_interval_ms` | 200 | 多控制变化合并，避免每个消息/操作唤醒 status() |
+| `status.min_resample_interval_ms` | 200 | 多控制变化合并，避免每个消息/操作唤醒 state() |
 | `status.max_sample_age_ms` | 5000 | Server 认定采样已失效的候选预算 |
 | `status.healthy_refresh_interval_ms` | 2000 | 业务不变时发送同 revision 完整快照的新鲜度确认，严格小于 max_sample_age |
 | `status.sample_warning_p95_ms` | 100 | 调查触发阈值，不是发布 SLA：相对 1 s 周期 10% |
 | `status.max_consecutive_errors` | 1（采样错误立即标注，直到 stale 才发送 STALE） | 不把无效样本提升为 CURRENT |
 | `status.max_snapshot_bytes` | 786432 | 初始限制 768 KiB 的 Protocol State Data，保留 Envelope / SSE Frame 的字节空间，实际仍需逐帧校验 |
 
-上述周期与阈值是**可执行初值，未经过硬件验证**。Server 不得用加速采样掩盖 status() 的锁争用；如果 P95 超过周期 10%，先检查 RecorderStatus 分层采集及锁等待，再审采样节奏，不能简单拉长预算使 Client 永远看不到安全变化。
+上述周期与阈值是**可执行初值，未经过硬件验证**。Server 不得用加速采样掩盖 state() 的锁争用；如果 P95 超过周期 10%，先检查 recorder::State 分层采集及锁等待，再审采样节奏，不能简单拉长预算使 Client 永远看不到安全变化。
 
-**采样启动规则**：Server 必须取得第一份可信完整 RecorderStatus，并映射完整 Protocol State 后才允许向 SSE 注册首次 CURRENT；首次采样失败则返回 STATE_UNAVAILABLE/NOT_READY，控制是否开放另依据 Runtime/Recorder 安全就绪检查决定。样本必须拥有全部字段有效性信息，即使某些 CPU/RSS/Publisher 数据当前 unavailable/null。
+**采样启动规则**：Server 必须取得第一份可信完整 recorder::State，并映射完整 Protocol State 后才允许向 SSE 注册首次 CURRENT；首次采样失败则返回 STATE_UNAVAILABLE/NOT_READY，控制是否开放另依据 Runtime/Recorder 安全就绪检查决定。样本必须拥有全部字段有效性信息，即使某些 CPU/RSS/Publisher 数据当前 unavailable/null。
 
 **取样失败规则**：保留最近有效 PublishedState，记录最近成功的 steady 时间；不要将失败时间写入 observed_at。已有完整可信基线且状态 age 超过 max_sample_age 时，发布相同领域数据、`sample_validity: STALE` 的新 state_revision；若无基线或已损坏/Runtime 身份变更，拒绝构造虚假状态并要求 SSE 重同步/关闭。恢复成功重新发布 CURRENT 新版本。ResourceMonitor 某个子系统状态已变 UNKNOWN 也应按 Recorder 真实快照映射，不与 Server 整体采样失效混为一谈。
 
-Server status() 采样线程与 HTTP 读池不能在一个高负载历史列表请求下同时饥饿；采用独立 Worker 或在只读工作池中保留不可被 History/Evidence 使用的采样令牌。每次采样耗时、Coordinator 锁等待（如 Recorder 可观测）、P50/P95/P99、采样错误计数均属于 Server 诊断，不能在 SampleMutex 持有期间输出阻塞日志。
+Server State 采样线程与 HTTP 读池不能在一个高负载历史列表请求下同时饥饿；采用独立 Worker 或在只读工作池中保留不可被 History/Evidence 使用的采样令牌。每次采样耗时、Coordinator 锁等待（如 Recorder 可观测）、P50/P95/P99、采样错误计数均属于 Server 诊断，不能在 SampleMutex 持有期间输出阻塞日志。
 
 ## 4.2 PublishedState 的不可变性、revision 与时间
 
@@ -475,12 +502,12 @@ struct PublishedState {
 
 ## 4.3 单一发布序列与订阅竞态线性化
 
-**发布操作一次只由一个发布域执行**，并发工作线程提交的状态样本按实际完成/采样顺序由发布域裁定，不能让一个更旧的 RecorderStatus 晚到后覆盖已发布的新状态。V1.0 默认只有一个周期采样任务在途：`sampling_in_flight` 防止重复并发快照，控制“尽快刷新”只是合并置位标记，不能启动另一个不受控的采样。
+**发布操作一次只由一个发布域执行**，并发工作线程提交的状态样本按实际完成/采样顺序由发布域裁定，不能让一个更旧的 recorder::State 晚到后覆盖已发布的新状态。V1.0 默认只有一个周期采样任务在途：`sampling_in_flight` 防止重复并发快照，控制“尽快刷新”只是合并置位标记，不能启动另一个不受控的采样。
 
 处理流程：
 
 ```text
-RecorderStatus sampled on SnapshotWorker
+recorder::State sampled on SnapshotWorker
   → build complete Protocol State off locks
   → validate boundedness / run identity / valid fields
   → compare canonical domain with latest StatePayload
@@ -503,7 +530,7 @@ RecorderStatus sampled on SnapshotWorker
 
 ## 4.4 Status 的有界序列化与观察指标
 
-HTTP Status / SSE StateEnvelope 是 Server 映射产物，不能把 RecorderStatus C++ 类型或完整 Topic Runtime 引用暴露给 Client。每次采样到状态后，Mapper 应产生**同一协议版本**的纯值对象；所有动态数组有明确 Recorder/Server 上限，转换超出预算时拒绝发布、标记状态服务不可用并保留最近可信值用于 STALE（若可安全发布）。
+HTTP Status / SSE StateEnvelope 是 Server 映射产物，不能把 recorder::State C++ 类型或完整 Topic Runtime 引用暴露给 Client。每次采样到状态后，Mapper 应产生**同一协议版本**的纯值对象；所有动态数组有明确 Recorder/Server 上限，转换超出预算时拒绝发布、标记状态服务不可用并保留最近可信值用于 STALE（若可安全发布）。
 
 示例 1 MiB 状态预算是**完整序列化 JSON 的字节上限**，不是“如果太大就截断 Topics”。计算包含 UTF-8 编码后字节、JSON 转义、全部 Topic 数组和 ErrorRef；按实际序列化上限验证，而不只靠 topic 数 × 平均字节粗估。重复同一序列化数据给多个 Subscriber，可共享 `shared_ptr<const string>` 以减少应用态拷贝，但不能把这些共享引用漏算进生命周期与资源预算。
 
@@ -742,7 +769,7 @@ server:
     read_grace_ms: 5000
 ```
 
-**全局 HTTP Budget 的计数范围**：`http.max_outstanding_responses` 包含普通 GET/POST 的等待、执行及待发送响应，以及 SSE **握手阶段**；Stream 握手资源成功转移为长期 Session 后释放短 HTTP Response Slot，随后由 `sse.max_clients`、pending 字节和 Stream 生命周期配额独立核算。`control.max_outstanding_responses` 是其中控制 POST 的子配额，永远不能独立再扩大 HTTP 总上限。Control Worker 正等待的领域 Handle 和已超过 HTTP deadline 的操作由单独生命周期计数，不因 ResponseSink 结束而取消。Admission 原子预留遵守 **Global HTTP → Control/Read/Handshake 类别 → 执行队列/Subscriber Slot** 顺序，失败回滚并释放预留；同时为只读和握手保留合理服务能力，避免 64 个慢控制等待者把所有读接口排空。
+**全局 HTTP Budget 的计数范围**：`http.max_outstanding_responses` 包含普通 GET/POST 的等待、执行及待发送响应，以及 SSE **握手阶段**；Stream 握手资源成功转移为长期 Session 后释放短 HTTP Response Slot，随后由 `sse.max_clients`、pending 字节和 Stream 生命周期配额独立核算。`control.max_outstanding_responses` 是其中控制 POST 的子配额，永远不能独立再扩大 HTTP 总上限。Control Worker 正等待的领域 Completion 和已超过 HTTP deadline 的操作由单独生命周期计数，不因 ResponseSink 结束而取消。Admission 原子预留遵守 **Global HTTP → Control/Read/Handshake 类别 → 执行队列/Subscriber Slot** 顺序，失败回滚并释放预留；同时为只读和握手保留合理服务能力，避免 64 个慢控制等待者把所有读接口排空。
 
 **配置验证是启动前的一等契约**：
 
@@ -772,7 +799,7 @@ Server 与 Recorder 的日志需要同时满足 `FR-DAT-10 / AC-26`：可从 Run
 | Runtime | start phase/recovery findings、shutdown stage、grace expiration、remaining owners/leases、Context/Executor alive |
 | Security | denied/auth failure/rate limit、TLS/proxy misconfiguration、policy violations（消息不含 Secret） |
 
-**UNSAFE_TO_DESTROY 的最小故障诊断：** 即使 HTTP/Recorder 状态查询已经不可用，Runtime 仍应向进程级结构化日志、受控 stderr/journald 或 Supervisor 可采集的诊断通道尽力写出：`runtime_instance_id`、故障发生 UTC 与 monotonic elapsed、`shutdown_stage=UNSAFE_TO_DESTROY`、故障原因（例如 `DRAIN_TIMEOUT / READ_GRACE_EXPIRED / WRITER_BLOCKED`）、`last_completed_domain` 的操作类型/结束阶段与可信结果、`active_domain_calls`、`active_read_jobs`、`active_snapshot_jobs`、各类未归还 `RecorderLease` 数量、Writer/Executor/ROS Context 存活情况、输出根目录锁是否仍持有，以及未完成的响应/订阅计数。每项值若不可安全读取，明确写 `UNKNOWN`，**禁止为了补齐日志而访问已经卡死的 Recorder/Writer 锁或引发新的阻塞**。优先使用预保留的 bounded 诊断对象与非热路径错误通道；最终写日志本身也不是 Writer 已完成的证据。
+**UNSAFE_TO_DESTROY 的最小故障诊断：** 即使 HTTP/Recorder 状态查询已经不可用，Runtime 仍应向进程级结构化日志、受控 stderr/journald 或 Supervisor 可采集的诊断通道尽力写出：`runtime_instance_id`、故障发生 UTC 与 monotonic elapsed、`shutdown_stage=UNSAFE_TO_DESTROY`、故障原因（例如 `RECORDER_GRACE_EXPIRED / READ_GRACE_EXPIRED / WRITER_BLOCKED`）、`last_completed_domain` 的操作类型/结束阶段与可信结果、`active_domain_calls`、`active_read_jobs`、`active_snapshot_jobs`、各类未归还 `RecorderLease` 数量、Writer/Executor/ROS Context 存活情况、输出根目录锁是否仍持有，以及未完成的响应/订阅计数。每项值若不可安全读取，明确写 `UNKNOWN`，**禁止为了补齐日志而访问已经卡死的 Recorder/Writer 锁或引发新的阻塞**。优先使用预保留的 bounded 诊断对象与非热路径错误通道；最终写日志本身也不是 Writer 已完成的证据。
 
 Supervisor **不必**为 V1.0 引入特定 JSON 日志 SDK 或新监控子系统，但部署必须提供可判定的**失败退出/未正常 STOPPED** 证据，例如非零进程退出状态、受保护的结构化故障记录与 Supervisor 重启日志；这些字段格式可以在部署验收中细化，而不能只依赖普通 HTTP Server 进程已关闭的事实。进程强制终止时日志可能无法全部刷盘，故以最佳努力记录和独立监督事件交叉判断，不伪造完整审计链。
 
@@ -780,14 +807,14 @@ Supervisor **不必**为 V1.0 引入特定 JSON 日志 SDK 或新监控子系统
 
 | 请求/事件 | 必须记录的可用身份 | 不允许的推断 |
 |---|---|---|
-| 控制 POST 的 Validated/Admitted/HandleAcquired/DomainDone/ResponseAttempt | 同一条尝试的 `request_id`、客户端原始 `operation_id`、控制命令、runtime_instance_id、目标 recording_id/generation；Topic 操作还记录已知的 topic_id/epoch | HTTP 完成并不表示 Client 收到结果；operation_id 不是去重/查询 Registry 主键 |
+| 控制 POST 的 Validated/Admitted/CompletionAcquired/DomainDone/ResponseAttempt | 同一条尝试的 `request_id`、客户端原始 `operation_id`、控制命令、runtime_instance_id、目标 recording_id/generation；Topic 操作还记录已知的 topic_id/epoch | HTTP 完成并不表示 Client 收到结果；operation_id 不是去重/查询 Registry 主键 |
 | Topic Evidence GET | 独立的 GET `request_id`、路径中的 `recording_id + operation_id`、领域返回的 `topic_id/epoch`（仅可信可用时）、`evidence_status`/ErrorCode | NOT_FOUND/UNCERTAIN 不证明原 POST 未执行，不根据同名 Topic 认定成功 |
 | SSE Stream/Subscriber | 连接 `stream_id`、发布 `runtime_instance_id + state_revision`、Event 序列、订阅关闭原因 | SSE event id 不等于任何 Recorder 操作 ID |
 | Runtime Shutdown | shutdown_stage、触发来源、inflight domain/lease、相关 request_id/operation_id（已知才记） | 未完成领域工作时不能记录 STOPPED/COMPLETE |
 
 所有阶段采用结构化键值，并把未获取的 Topic 身份标为缺失而非虚构零。不同 HTTP 尝试可以携带同一 operation_id；日志允许按其聚合，但**不形成服务端持久 Operation Registry**。
 
-request_id 是**一次 HTTP 尝试**，operation_id 是逻辑操作证据身份；不能把二者合并，也不能将 HTTP 在途时间与 Recorder ControlHandle 生命周期等同。Server 日志可记录“response attempted”，不能记录“Client confirmed received”除非存在真实端到端确认（V1.0 不提供）。HTTP timeout UNKNOWN 时，日志应给出阶段 `QUEUED / HANDLE_ACQUIRED / DOMAIN_RUNNING / DOMAIN_DONE` 供排障，但不对外提供通用持久操作查询服务。
+request_id 是**一次 HTTP 尝试**，operation_id 是逻辑操作证据身份；不能把二者合并，也不能将 HTTP 在途时间与 Completion 生命周期等同。Server 日志可记录“response attempted”，不能记录“Client confirmed received”除非存在真实端到端确认（V1.0 不提供）。HTTP timeout UNKNOWN 时，日志应给出阶段 `QUEUED / COMPLETION_ACQUIRED / DOMAIN_RUNNING / DOMAIN_DONE` 供排障，但不对外提供通用持久操作查询服务。
 
 Server 指标采集不能反向影响 Recorder 数据路径：日志聚合/Prometheus 等监控框架不是 V1.0 必需品；可通过结构化日志 + 有界内存度量 + 受限部署采样满足最低验收。公开 Protocol Runtime/Status 响应只包含规范字段，不得为了新增内部度量而私自破坏 Protocol Schema。
 
@@ -798,15 +825,15 @@ Server 指标采集不能反向影响 Recorder 数据路径：日志聚合/Prome
 | 故障注入/测试 | 注入同步点 / 输入 | 必须断言 | 上位来源 |
 |---|---|---|---|
 | HTTP 路由/版本 | 13 条路径，Method、Content-Type、错误 JSON、超长 Body | 正确 Status/ErrorCode；无 Recorder 副作用 | FR-CTL-01 / AC-11 |
-| 单控制串行化 | Start 与 Stop/Topic Add/Remove 并发到来 | 同时最多一个 Server 提交的外部 ControlHandle 未 DONE；真正 mutation 由 Recorder Sequencer 唯一线性化；队列/完成顺序可追踪 | FR-CTL-02 / AC-12 |
-| Full Queue | 挂住 Stop ControlHandle，持续送新 POST | 达到控制队列上限后立即 429/effects NONE；内存有界 | NFR-PERF-04 / AC-12 |
+| 单控制串行化 | Start 与 Stop/Topic Add/Remove 并发到来 | 同时最多一个 Server 提交的外部 Completion 未 DONE；真正 mutation 由 Recorder 串行 mutation 域 唯一线性化；队列/完成顺序可追踪 | FR-CTL-02 / AC-12 |
+| Full Queue | 挂住 Stop Completion，持续送新 POST | 达到控制队列上限后立即 429/effects NONE；内存有界 | NFR-PERF-04 / AC-12 |
 | Queue Timeout vs STARTED | 在出队/timeout 线性化点挂起 | 只有真正 QUEUED 移除才返回 `503/QUEUE_TIMEOUT/FAILURE/effects:NONE`；开始后结果未知仍为 `504/UNKNOWN`；以当前 Protocol 定义为准 | FR-CTL-03 / AC-11 |
-| HTTP 丢包/取消 | Recorder 已进入 Stop，Client 断开或超时 | UNKNOWN 且不取消 ControlHandle、不提交第二个冲突外部 mutation | FR-CTL-03/08 / AC-11 |
+| HTTP 丢包/取消 | Recorder 已进入 Stop，Client 断开或超时 | UNKNOWN 且不取消 Completion、不提交第二个冲突外部 mutation | FR-CTL-03/08 / AC-11 |
 | Timed Stop / Disk Pause | 外部 Stop 时 Recorder 内部事件先发生 | IDLE/PAUSED 与该请求 SUCCESS/FAILURE 不互推 | FR-CTL-03 / AC-11 |
 | Stale Target / Epoch | 请求入队后 Runtime/Recording Generation 或同名 Epoch 改变 | 执行前再检查；不作用于新任务 | FR-CTL-02 / AC-11 |
 | Topic Evidence | Event durable PREPARED/终态、fsync 失败、冲突、截断、重启，以及 capability 不可用的诊断构建 | 查询调用 Recorder API，可信/UNCERTAIN 正确；capability=false 时 GET 为 503/EVIDENCE_UNAVAILABLE，不可宣布正式 READY/生产准入；Server 不另写 JSONL Parser | FR-CTL-03 / AC-11 |
 | GET/History 安全 | 恶意 ID、路径软链接、巨大扫描、并发 Cleanup | 只读/有界，未完整读取不能报 NOT_FOUND/COMPLETE | FR-DAT-09 / AC-23 |
-| status() 高频采样 | 64 Topic，Writer/Rolling 持续进行，GET/SSE Clients 增多 | Snapshot 查询次数不随订阅数线性增加；P95 量化、没有 Recorder 热路径退化 | FR-DAT-06 / AC-10 |
+| state() 高频采样 | 64 Topic，Writer/Rolling 持续进行，GET/SSE Clients 增多 | Snapshot 查询次数不随订阅数线性增加；P95 量化、没有 Recorder 热路径退化 | FR-DAT-06 / AC-10 |
 | 同 revision 变化 | observed_at 单独更新、Counter/elapsed 增长、STALE↔CURRENT | 仅纯采样元信息允许同 revision 更新；GET/SSE 业务内容一致 | FR-CTL-04/05 / AC-13 |
 | 首次 SSE 竞态 | Register 后/首帧前依次发布两个 Revision | 首帧完整 baseline、之后最新完整状态可达；无永久旧状态 | FR-CTL-04/05 / AC-13 |
 | SSE 空闲/STALE | Recorder 状态不变且正常采样，再注入长采样失败 | 同 revision 完整健康刷新；随后只用可信旧快照发 STALE 或断开，恢复新 CURRENT | FR-CTL-04/05 / AC-13 |
@@ -814,18 +841,18 @@ Server 指标采集不能反向影响 Recorder 数据路径：日志聚合/Prome
 | SSE 慢消费者 | Client 不读、半开、速率骤降，持续改变状态 | App/Trantor/Socket 资源增长有明确上限、能断连/释放；不能只看 send(true) | NFR-PERF-04 / AC-13 |
 | SSE 容量数学 | 64 Clients、1 MiB Snapshot、2 s Refresh、8 MiB/s Budget | 用实际编码字节/全局 Token Budget 验证可维持 N；容量不足拒绝或断开，不能延迟到超新鲜度时限；三层资源增长受测量约束 | OPEN-02 / AC-13 |
 | Runtime Startup | 锁冲突、Recorder/Writer 错误、Recovery partial、Port/TLS 失败 | 安全时可诊断继续；危险时不开放控制；资源逆序释放 | NFR-REL-01/04 / AC-17 |
-| Shutdown | Stop ControlHandle 长期未 DONE、Reader 永久阻塞且仍持有 Lease、SSE 尚有 Pending、重复 SIGTERM/SIGINT | 控制/Reader 超时只结束网络等待，未完成 Reader/Writer 不 detach、不提前释放 Recorder/Executor/锁，未终结不报 STOPPED；UNSAFE_TO_DESTROY 具有进程级诊断 | NFR-REL-04/05 / AC-17 |
+| Shutdown | Stop Completion 长期未 DONE、Reader 永久阻塞且仍持有 Lease、SSE 尚有 Pending、重复 SIGTERM/SIGINT | 控制/Reader 超时只结束网络等待，未完成 Reader/Writer 不 detach、不提前释放 Recorder/Executor/锁，未终结不报 STOPPED；UNSAFE_TO_DESTROY 具有进程级诊断 | NFR-REL-04/05 / AC-17 |
 | Auth/Remote | 缺失/错误 Bearer、read Token 调 control、host 改为 0.0.0.0 无 TLS、恶意代理 Header、跨 Origin/Web CSRF | 401/403/配置拒绝正确；Token 不泄漏；direct/trusted-proxy TLS 与 Scope 边界经 AC-18 验证后才允许远程发布 | NFR-SEC-01～03 / AC-18 |
 | 目标平台 | Humble/Jazzy × AMD64/ARM64，原生 Server 构建、启动、关闭 | Drogon/Trantor 依赖可复现，MCAP/Recorder 数据面未受网络干扰 | NFR-COMP-01～04 / AC-19/21 |
 | 日志/诊断 | Server 503、原生 EVENT_COMMIT_FAILED、SSE forced close、SIGTERM | 按 operation_id/request_id/phase 检索，Sensitive 字段脱敏 | FR-DAT-10 / AC-26 |
-| HTTP 额度分层 | 全局短响应槽 128、控制子配额 64、Read/SSE 握手抢占，超时后领域 Handle 仍可能未 DONE | 先全局后类别再队列地原子 Reserve/回滚；握手转 Stream 后只计 SSE 长连接；领域请求继续运行但不占已结束 ResponseSink；无槽位泄漏或读饿死 | NFR-PERF-04 / AC-12/13 |
+| HTTP 额度分层 | 全局短响应槽 128、控制子配额 64、Read/SSE 握手抢占，超时后领域 Completion 仍可能未 DONE | 先全局后类别再队列地原子 Reserve/回滚；握手转 Stream 后只计 SSE 长连接；领域请求继续运行但不占已结束 ResponseSink；无槽位泄漏或读饿死 | NFR-PERF-04 / AC-12/13 |
 | Readiness 状态映射 | STARTING/READY/DEGRADED/QUIESCING/DRAINING/UNSAFE_TO_DESTROY | Runtime 只输出 Protocol 四个 readiness 枚举；QUIESCING/DRAINING→STOPPING，UNSAFE/STOPPED 不提供正常 HTTP；未交付 MUST 不误报正式 READY | FR-CTL-01 / AC-11 |
 | SSE 完整帧字节限制 | 768 KiB 状态 Data、额外 JSON Envelope / SSE id 和 Unicode Escape、帧尺寸越界 | 按编码后全部 UTF-8 字节校验，握手前 503/STATE_TOO_LARGE 或已建 Stream 关闭，不截断业务 State | FR-CTL-04 / AC-13 |
 | 日志双身份 | Client 重用 operation_id 的多次 HTTP POST、Topic Evidence GET、有 topic_id/epoch 的结果 | 每次独立 request_id + 原 operation_id，Topic Evidence 记可信身份/状态，无法推断通用 Registry；日志不泄密 | FR-DAT-10 / AC-26 |
 | Read Lease Timeout / Shutdown | History/Evidence Reader 在 Recorder API 内永久挂起，read_grace 到期，稍后 Reader 自然返回 | 超时先终结 Sink 而非 Lease，UNSAFE_TO_DESTROY 不释放 Recorder/根目录锁；Reader 真实返回且所有屏障满足后方可正常收尾；否则走进程级监管 | NFR-REL-04/05 / AC-17 |
 | SSE 真实编码膨胀 | 极端 ROS Topic 名称、引号/控制字符与 Unicode、GET/SSE Envelope、完整 SSE Frame | 分别实测 State JSON、GET JSON、SSE 业务帧全部字节；256 KiB 不能充当最坏情况证明，超限明确拒绝不截断 | FR-CTL-04 / AC-13 |
 
-**必测时序**：Control Worker 刚从 FIFO 取出、目标身份预检完成但 Recorder Sequencer 尚未线性化、Stop ControlHandle 等待 Writer、StatePublisher 发布成功但 SSE 尚未取得 Stream、Session close 与 send 同时发生、最后 RecorderLease 归零前插入可控制 Barrier。不能只依赖长时间随机压力测试碰运气复现 UAF/死锁。
+**必测时序**：Control Worker 刚从 FIFO 取出、目标身份预检完成但 Recorder 串行 mutation 域 尚未线性化、Stop Completion 等待 Writer、StatePublisher 发布成功但 SSE 尚未取得 Stream、Session close 与 send 同时发生、最后 RecorderLease 归零前插入可控制 Barrier。不能只依赖长时间随机压力测试碰运气复现 UAF/死锁。
 
 **Drogon SSE 生产准入**：技术选择并不代表已通过。应使用真实慢读/断连/代理/长连接压力及 Client 实际 httpx-sse Parser 验证协议完整性、内存驻留高水位、回收时限、相互阻塞与 Runtime Shutdown。框架不能提供可验证资源上界且局部适配无效时，必须重新评审选择，不能放宽“业务正确性必须成立”的要求。
 
@@ -833,7 +860,7 @@ Server 指标采集不能反向影响 Recorder 数据路径：日志聚合/Prome
 
 Server 实施必须完整交付以下组成；缺少任一项时只能作为受限开发/诊断构建，不能宣称满足 V1.0 Server：
 
-1. **RuntimeHost**：统一 Owner 图、启动/Recovery 分类、受控信号与关闭屏障；所有正式入口遵守同一生命周期顺序。
+1. **RecorderRuntime**：统一 Owner 图、启动/Recovery 分类、受控信号与关闭屏障；所有正式入口遵守同一生命周期顺序。
 2. **Drogon 接入**：受控 v1.9.14/Trantor 版本、13 条路由、ServerConfig 与认证/限流入口。
 3. **ControlDispatcher**：唯一 Worker、有界 Admission、排队/领域完成/网络 deadline 区分、生命周期安全 ResponseSink。
 4. **ReadDispatcher**：Graph/History/Topic Evidence 受控读取，Recorder Domain-owned 解析，读写任务引用安全。
@@ -849,4 +876,4 @@ Server 实施必须完整交付以下组成；缺少任一项时只能作为受�
 | OPEN-01 | CPU 参考硬件/CPU 计量边界待冻结 | 状态采样/网络 CPU 占用纳入总 CPU 口径；参考机和阈值由验收规范决定 |
 | OPEN-02 | HTTP 延迟、SSE 可见时延、连接上限/容量待量化 | 验证 1 Hz / 5 s / 2 s 候选状态周期和 SSE 预算，正式冻结量化 Profile 与慢客户端测试 |
 
-**开发阶段维护：** 本文设计可以直接优化，遇到原生 Recorder Guard/Topic Evidence、HTTP Mapping、状态发布或 SSE 资源边界不合适时，应同步修改依赖模块的设计与验证。所有运行指标和生产准入结论必须来自真实 Drogon/Trantor 集成测试，不以设计完成代替实现证据。
+**开发阶段维护：** 本文设计可以直接优化，遇到原生 Recorder identity validation/Topic Evidence、HTTP Mapping、状态发布或 SSE 资源边界不合适时，应同步修改依赖模块的设计与验证。所有运行指标和生产准入结论必须来自真实 Drogon/Trantor 集成测试，不以设计完成代替实现证据。

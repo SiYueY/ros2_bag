@@ -2,7 +2,7 @@
 
 | 属性 | 内容 |
 |---|---|
-| 文档版本 | v0.3.4 |
+| 文档版本 | v0.3.5 |
 | 文档状态 | **DRAFT — V1.0 开发阶段，随时修订；规范尚未批准用于完整实施** |
 | 适用范围 | ros2_bag V1.0 |
 | 上位架构 | docs/architecture.md（开发稿，可直接联动修改） |
@@ -52,7 +52,7 @@ V1.0 必须提供可用 Topic 发现与动态管理、录制任务及历史索�
 | FR-REC-03 | MUST | 支持适配发布端 QoS，并可通过配置明确 QoS 策略；不兼容或无法订阅的情况有可识别错误和状态。 | AC-02 |
 | FR-REC-04 | MUST | 活动任务期间允许动态添加、移除 Topic；同名重添加须区分 Topic 生命周期，不能混入旧 Topic 实例的数据。**同一 recording task 内同名 Topic 的 type + serialization format + schema encoding + 完整 Schema SHA-256 必须保持一致**；Remove 后以不同类型或不同 Schema 重加必须在 Writer/Subscription 副作用前拒绝，类型变化通过新 recording task 承载。 | AC-03、AC-06 |
 | FR-REC-05 | MUST | 支持 Normal 模式，接受显式 Start/Stop；无消息录制也能正确结束和表达空结果。 | AC-04 |
-| FR-REC-06 | MUST | 支持 Timed 模式，使用 steady clock 计算总期限；暂停仍计入期限。TaskIngressState 保存不可变 steady deadline，**每个 Producer 在准入线性化点联合校验 generation/gate/deadline**；ROS Timer 只负责尽早触发 Stop，调度延迟不得扩大截止后的准入窗口。已经在截止前通过准入线性化点的消息仍可完成写入。因此“倒计时为 0”表示接入期限已到，不等于任务已完成/已进入 IDLE。 | AC-04 |
+| FR-REC-06 | MUST | 支持 Timed 模式，使用 steady clock 计算总期限；暂停仍计入期限。TaskIngressState 保存不可变 steady deadline，**每个 Producer 在准入线性化点联合校验 generation/gate/deadline**；Recorder 串行 mutation loop 的 steady timed wait 只负责尽早推进 Timed Stop，调度延迟不得扩大截止后的准入窗口。V1 不依赖 ROS Timer 承担 hard cutoff correctness。已经在截止前通过准入线性化点的消息仍可完成写入。因此“倒计时为 0”表示接入期限已到，不等于任务已完成/已进入 IDLE。 | AC-04 |
 | FR-REC-07 | MUST | 支持 Rolling 模式，分段形成可独立读取的 Bag，并对达到保留条件的已完成分段执行自动清理；暂停期间保留窗口继续推进。 | AC-05 |
 | FR-REC-08 | MUST | 支持 Pause/Resume/Stop，提供可识别状态与暂停原因；不得在已停止或安全禁止的状态下错误恢复接入。默认 `auto_resume=false` 时，系统危险解除且稳定后必须保持明确的“等待人工 Resume”暂停原因，使用户可**一次直接 Resume** 恢复；Resume 不得清除仍生效的磁盘危险。 | AC-04、AC-08 |
 | FR-REC-09 | MUST | 录制链路具备可配置的消息/字节预算，超限按确定性策略处置；应区分队列预算、分配或入队失败所致的接入丢弃，与消息接纳后的 Writer/存储失败，提供对应计数与故障诊断，不得静默丢弃或无界缓存。 | AC-07、AC-12、AC-27 |
@@ -71,7 +71,7 @@ V1.0 必须提供可用 Topic 发现与动态管理、录制任务及历史索�
 | FR-DAT-03 | MUST | 提供录制任务、分段和 Topic 事件的持久化事实，准确表达完成、删除中、已删除、不完整及不确定状态。Segment/Task 标记 COMPLETE 前，除 Writer Close 外还必须按支持的本地 POSIX 故障模型同步 MCAP、metadata、必要目录项，再提交 durable Manifest；Manifest fsync 不能替代数据文件同步。 | AC-05、AC-09 |
 | FR-DAT-04 | MUST | 非正常终止后保守恢复：保留可能仍有价值的 INCOMPLETE 数据，不自动删除损坏或未知状态片段；有依据才可确认清理已完成。Rolling retention 的新删除授权不得由墙钟差值产生：进程内使用 steady age；重启后 durable COMPLETE 重新计满完整 retention，只有崩溃前已 durable DELETING 才可直接继续删除。 | AC-05、AC-09 |
 | FR-DAT-05 | MUST | 磁盘安全保护覆盖空间临界及采样不可知/过期；安全状态不足时禁止不安全启动或恢复，并提供原因诊断。 | AC-08 |
-| FR-DAT-06 | MUST | 对外提供录制、Topic、消息计数/丢弃、Queue/Pool、磁盘、CPU/RSS/线程/FD 等诊断信息；Topic 计数应区分实时成功写入（`written_live`）和 Snapshot 跨 Segment 成功重放（`replayed_to_new_segment`），不得将重放当作新接收消息；Cleanup 应暴露 `cleanup_queue_depth`、`cleanup_pending_total` 和 `cleanup_queue_full_count` 等可诊断计数，并区分队列等待项与持久化待删项。未采集数据与零值须可区分。 | AC-10 |
+| FR-DAT-06 | MUST | 对外提供录制、Topic、消息计数/丢弃、Queue/Pool、磁盘、CPU/RSS/线程/FD 等诊断信息；Topic 计数应区分实时成功写入（`written_live`）和 Snapshot 跨 Segment 成功重放（`replayed_to_new_segment`），不得将重放当作新接收消息；Cleanup 应暴露等待队列、durable pending、当前 active Segment/持续时长、warning、queue-full 与累计删除等有界诊断，并区分队列等待项、当前 active 项与持久化待删项。未采集数据与零值须可区分。 | AC-10 |
 | FR-DAT-07 | MUST | 区分录制领域事实、Recorder Snapshot 与网络通知；Snapshot 不冒充完整历史事件，存储异常须可被查询和诊断。 | AC-09、AC-10、AC-13 |
 | FR-DAT-08 | MUST | 同一输出目录不得被两个相互协作的 Recorder Runtime 同时用于可能冲突的恢复、录制或自动清理。 | AC-09 |
 | FR-DAT-09 | MUST | Recorder 领域提供限定在配置输出根目录内的**只读历史任务索引/查询能力**，支持按 ID/名称、时间范围检索，并返回录制身份、路径、状态及可获得的起止时间、分段和消息摘要；Server 仅做鉴权、调用与 Protocol 映射，不重复实现 Manifest/Recovery 解析。单任务 Segment 详情必须分页且 Manifest Segment 历史有明确容量上限；只允许将最老的 durable REMOVED 连续前缀压缩为汇总计数/高水位，其他状态不得为省空间丢弃。达到上限且无法安全压缩时停止继续创建 Segment，而不是无界增长。缺失的时间、计数等元数据显式为未知，不能伪造零值。 | AC-23 |
@@ -83,7 +83,7 @@ V1.0 必须提供可用 Topic 发现与动态管理、录制任务及历史索�
 | ID | 级别 | 需求 | 验收 |
 |---|---|---|---|
 | FR-CTL-01 | MUST | 通过 HTTP/JSON 提供录制任务、Topic 控制和权威状态查询，输入校验、错误语义与 API 版本一致且有文档。 | AC-11、AC-13 |
-| FR-CTL-02 | MUST | 同一 Recorder 的外部状态变更具有可判断的调用顺序和有界受理能力；内部定时停止、磁盘保护等变化可安全交错。Recorder mutation 通过进程内受管 Completion/ControlHandle 表达真实 DONE；HTTP ResponseSink 超时可以先结束，但 Server 在该 Handle DONE 前不得释放唯一外部 mutation 执行权去启动下一项冲突操作。 | AC-11、AC-12、AC-17 |
+| FR-CTL-02 | MUST | 同一 Recorder 的外部状态变更具有可判断的调用顺序和有界受理能力；内部 Timed Stop、Rolling、磁盘保护等变化可安全交错。Recorder mutation 通过进程内受管 `Completion<T>` 表达真实 DONE；HTTP ResponseSink 超时可以先结束，但 Server 在该 Completion DONE 前不得释放唯一外部 mutation 执行权去启动下一项冲突操作。Recorder 在领域线性化点直接校验 recording/generation/topic identity，不依赖 Target/Guard wrapper。 | AC-11、AC-12、AC-17 |
 | FR-CTL-03 | MUST | HTTP 超时、断线或取消不等于 Recorder 操作失败。**原始请求结果**只由该次请求的可信同步回执判定；后续与具体 `recording_id + operation_id + 领域身份` 精确关联的持久化证据只能确认相应**领域终态/副作用**，不得倒填或改写原始 HTTP `OperationResult`。仅时间窗口、当前状态值相符或事件序列位置均不足以证明某次请求的归属或成功。缺少可信同步回执时原始结果保留 `UNKNOWN`；Topic Add/Remove 可另行查询精确关联的领域证据，Start/Stop/Pause/Resume 在 V1.0 不提供通用请求级终态查询。Client 不得自动重试有副作用的命令。 | AC-11 |
 | FR-CTL-04 | MUST | SSE 向订阅者通知录制状态变化；首次连接和重连能建立完整状态基线，慢客户端与订阅建立期间的缓冲超限不致破坏状态一致性。 | AC-13 |
 | FR-CTL-05 | MUST | SSE 不承担原始 ROS 2 消息流与可靠事件日志；客户端事件缺口、Runtime 代际变化或连接恢复时可重新同步权威状态。 | AC-13 |
@@ -152,20 +152,20 @@ V1.0 必须提供可用 Topic 发现与动态管理、录制任务及历史索�
 | AC-01 | 标准和未静态编译进 Recorder 的自定义消息在类型支持可用时均能录制，字段与发布值一致；类型支持缺失时返回清楚错误。 | FR-REC-01 |
 | AC-02 | ROS Graph 可见无发布者、未发现、多类型冲突及 QoS 兼容/不兼容场景有可重复的发现、列表与错误结果；不把当前未发现误报为绝对不存在。 | FR-REC-02、FR-REC-03、FR-REC-12 |
 | AC-03 | 动态 Add/Remove/同名重添加与 Stop 并发；无旧 epoch 串入新实例、无错误身份或 UAF；同任务内 Remove 类型 A 后同名 Add 类型 B/Schema 变化在任何新 Writer/Subscription 副作用前拒绝，同签名重加可正常产生新 Epoch。 | FR-REC-04、NFR-REL-01 |
-| AC-04 | Normal/Timed/Pause/Resume/Stop 正常、空数据、错误状态及 Timed 暂停时长边界可重复验证；人为延迟 Timed Timer/Executor 后，deadline 后 Producer 仍无法准入；默认系统暂停恢复安全后用户可一次直接 Resume。 | FR-REC-05、FR-REC-06、FR-REC-08、FR-REC-10 |
+| AC-04 | Normal/Timed/Pause/Resume/Stop 正常、空数据、错误状态及 Timed 暂停时长边界可重复验证；覆盖 `Idle→Initializing→Recording`、Initializing 失败/Shutdown 接管和 Resume 与 Timed/Disk/Shutdown 的线性化竞态；人为延迟 Recorder steady deadline scheduler/Executor 后，deadline 后 Producer 仍无法准入；默认系统暂停恢复安全后用户可一次直接 Resume。 | FR-REC-05、FR-REC-06、FR-REC-08、FR-REC-10 |
 | AC-05 | Rolling 分段独立可读；Retention 仅对获得 steady 删除授权的 COMPLETE 分段清理，墙钟前跳/回跳不提前删除；重启后未授权 COMPLETE 重新计满 retention，durable DELETING 可继续；暂停时窗口推进，Snapshot 与清理结果正确。 | FR-REC-07、FR-REC-11、FR-DAT-03、FR-DAT-04 |
 | AC-06 | MCAP CDR 与 Schema/Channel 可读；纯自定义消息及其传递依赖在分析端不安装原消息包时能正确还原嵌套结构、字段和值。 | FR-DAT-01、FR-DAT-02、FR-REC-01、NFR-COMP-02 |
 | AC-07 | Queue/Pool/Snapshot 预算极限、并发消息、溢出和停止 Drain 测试；无无界内存、无已接纳数据静默丢失。 | FR-REC-09、FR-REC-10、FR-REC-11、NFR-PERF-04、NFR-REL-01 |
 | AC-08 | 磁盘 WARNING/CRITICAL/UNKNOWN、采样超时及恢复条件；危险状态拒绝不安全 Start/Resume。默认 `auto_resume=false` 时安全稳定后进入可识别的 DISK_RECOVERY_PENDING，用户无需先 Pause 即可一次直接 Resume；活动危险原因不得被 Resume 清除。 | FR-DAT-05、FR-DAT-06、NFR-REL-02、FR-REC-08 |
 | AC-09 | 硬退出、模拟数据文件/metadata/目录/Manifest 各同步阶段失败、部分 Event 写入、INCOMPLETE、DELETING、重复 Recovery；只有 MCAP/metadata/目录项和 Manifest 均满足持久化顺序才可 COMPLETE，数据不误删，输出根目录互斥有效。 | FR-DAT-03、FR-DAT-04、FR-DAT-07、FR-DAT-08、NFR-REL-01、NFR-REL-02、NFR-SEC-03 |
-| AC-10 | 录制/Topic/丢弃/磁盘/CPU/RSS/线程/FD 指标可观察；分别核对 `written_live`、`replayed_to_new_segment`，重放不计入原始接收量；Cleanup 队列满时 `cleanup_queue_depth`、`cleanup_pending_total`、`cleanup_queue_full_count` 可见，待删意图不因拒绝入队而消失。未采样、零值与错误状态可区分；诊断日志可关联关键错误。 | FR-DAT-06、FR-DAT-07、FR-DAT-10、NFR-REL-06 |
+| AC-10 | 录制/Topic/丢弃/磁盘/CPU/RSS/线程/FD 指标可观察；分别核对 `written_live`、`replayed_to_new_segment`，重放不计入原始接收量；Cleanup 队列满或 native delete 阻塞时，等待数量、durable pending、active Segment、动态 `active_for`、warning、queue-full 与累计删除可见，待删意图不因拒绝入队而消失。未采样、零值与错误状态可区分；诊断日志可关联关键错误。 | FR-DAT-06、FR-DAT-07、FR-DAT-10、NFR-REL-06 |
 | AC-11 | 并发 Start/Stop、Timeout/断连及内部定时停止、磁盘保护交错。**子场景 A：Stop 请求超时，同时内部定时 Stop 使状态变为 Idle，不能凭 Idle 认定该请求成功；子场景 B：Stop 请求超时，同时磁盘保护触发 Pause，最终状态为 Paused，不能直接认定该请求失败**。缺乏可信同步回执时原始 `OperationResult` 保持 UNKNOWN；刷新 CurrentStatus 只能说明当前状态。对 Topic Add/Remove，仅精确关联的 durable Topic Evidence 可另行确认领域终态/副作用，且不得把原始 HTTP UNKNOWN 改写为 SUCCESS。Client 提示用户且不自动重试有副作用的操作。 | FR-CTL-01、FR-CTL-02、FR-CTL-03、FR-CTL-07、FR-CTL-08、NFR-REL-05 |
 | AC-12 | 控制面过载、任务队列满、慢请求、并发查询；请求有界拒绝且 Recorder 录制数据面可持续工作。 | FR-CTL-02、NFR-REL-02、NFR-REL-03、FR-REC-09、NFR-PERF-04 |
 | AC-13 | SSE 首次连接/重连/订阅同步空窗/超限/慢客户端/代际变化；无永久陈旧状态，必要时重新全量同步。 | FR-CTL-01、FR-CTL-04、FR-CTL-05、FR-DAT-07、NFR-PERF-04、NFR-REL-03、NFR-REL-05 |
 | AC-14 | Client 同步/异步接口、错误分类、资源释放、SSE 重连；UNKNOWN 后刷新状态但不伪造操作终态或自动重试；CLI/TUI/Web 共享一致的操作语义。 | FR-CTL-06、FR-CTL-07、FR-CTL-08、FR-APP-04、NFR-REL-05 |
 | AC-15 | CLI 自动化及退出码、TUI 状态和断线提示、Web 控制与会话保护；Topic 列表和历史入口符合应用能力约定，异常状态可见且不误报成功。 | FR-APP-01、FR-APP-02、FR-APP-03、FR-APP-04、FR-APP-05、FR-APP-06、FR-APP-07 |
 | AC-16 | 固定标准负载与资源观测；发布端频率须处于预先约定的偏差内，否则标准端到端负载验收无效；有效试验逐 Topic 序号损失率小于 1%，并记录 CPU/RSS/存储及 Publisher/DDS/Recorder 分层归因。 | NFR-PERF-01、NFR-PERF-02、NFR-PERF-03、NFR-PERF-04、NFR-PERF-05、NFR-PERF-06、NFR-REL-03、NFR-REL-06 |
-| AC-17 | SIGINT/SIGTERM、重复 Shutdown、并发 Stop、Reader/Writer 生命周期和 Executor 自等待风险；普通 mutation 的 ControlHandle 在 HTTP/调用方等待超时后仍可保持领域 Lease 直到真实 DONE，唯一外部 mutation 执行权不会提前释放；无死锁、UAF 或遗留活跃写入。 | FR-CTL-02、NFR-REL-01、NFR-REL-04 |
+| AC-17 | SIGINT/SIGTERM、重复 Shutdown、并发 Stop、Reader/Writer 生命周期和 Executor 自等待风险；普通 mutation 的 Completion 在 HTTP/调用方等待超时后仍可保持领域 Lease 直到真实 DONE，唯一外部 mutation 执行权不会提前释放；无死锁、UAF 或遗留活跃写入。 | FR-CTL-02、NFR-REL-01、NFR-REL-04 |
 | AC-18 | 覆盖缺失/错误 Bearer Token、read-only Token 调用 control、Token 泄漏检查、TLS 缺失/证书错误、伪造 `X-Forwarded-*`、非受信代理、Web Session/CSRF、跨 Origin、恶意输入与路径；全部拒绝不安全操作且不泄露 Secret。 | NFR-SEC-01、NFR-SEC-02、NFR-SEC-03 |
 | AC-19 | Humble/Jazzy × AMD64/ARM64 原生构建、启动、Stop、MCAP 读回及依赖检查。 | NFR-COMP-01、NFR-COMP-03 |
 | AC-20 | PlotJuggler/MCAP 解析器在两发行版的录制端 × 分析端 2×2 实机/容器组合验证字段和值，并保存插件与 Schema 信息。 | NFR-COMP-02 |

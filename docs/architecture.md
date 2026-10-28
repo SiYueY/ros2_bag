@@ -2,7 +2,7 @@
 
 | 属性 | 内容 |
 |---|---|
-| 文档版本 | v0.3.4 |
+| 文档版本 | v0.3.5 |
 | 文档状态 | **DRAFT — V1.0 开发阶段，随时修订；规范尚未批准用于完整实施** |
 | 文档范围 | V1.0 系统架构、组件边界与跨层契约 |
 | 技术选型依据 | `docs/system_technology_selection.md` |
@@ -122,22 +122,38 @@ flowchart TB
 
 ### C++ 工程组织与实现基线（冻结）
 
-下一代 C++ 工程按完整 Runtime 系统组织，而不是按历史 Recorder-only 原型组织：
+下一代 C++ 工程按完整 Runtime 系统组织，而不是按历史 Recorder-only 原型组织。V1.0 统一采用**项目级头文件/源文件分离 + 模块目录镜像**，整个工程只有一套顶层 `include/` 与 `src/`：
 
 ```text
-include/ros2_bag/result.hpp
-include/ros2_bag/recorder/
-src/recorder/
-src/server/
-src/runtime/
+ros2_bag/
+├── include/
+│   └── ros2_bag/
+│       ├── result.hpp
+│       ├── recorder_runtime.hpp
+│       ├── runtime_config.hpp
+│       ├── output_root_lock.hpp
+│       ├── recorder/
+│       └── server/
+├── src/
+│   ├── main.cpp
+│   ├── recorder_runtime.cpp
+│   ├── runtime_config.cpp
+│   ├── output_root_lock.cpp
+│   ├── recorder/
+│   └── server/
+└── tests/
+    ├── unit/
+    │   ├── recorder/
+    │   ├── server/
+    │   └── runtime/
+    └── integration/
 ```
 
-`ros2_bag::Result<T, E>` 是项目级基础 vocabulary，精确语义、文件组织和测试要求以
-`result.md` 的 **FROZEN** 契约为准；所有新 C++ 代码和本文档中的 C++ 示例以
-`cpp_coding_guidelines.md` 为规范基线。Recorder 公共 API 位于
-`ros2_bag::recorder`，其 private implementation 留在 `src/recorder/` 或受限的
-implementation header；Server 位于 `ros2_bag::server`；Runtime 位于
-`ros2_bag::runtime`。
+不得为 Recorder/Server 再建立 `src/recorder/include + src/recorder/src`、`src/server/include + src/server/src` 之类独立小工程布局；也不建立 `src/runtime/`。Runtime 的 `main.cpp / RecorderRuntime / RuntimeConfig / OutputRootLock` 直接位于顶层 C++ composition-root 层。
+
+`ros2_bag::Result<T, E>` 是项目级基础 vocabulary，精确语义、文件组织和测试要求以 `result.md` 的 **FROZEN** 契约为准；所有新 C++ 代码和本文档中的 C++ 示例以 `cpp_coding_guidelines.md` 为规范基线。Recorder 领域类型/API 位于 `ros2_bag::recorder`，Server 类型位于 `ros2_bag::server`；composition-root 类型如 `RecorderRuntime / RuntimeConfig / OutputRootLock` 直接属于顶层 `ros2_bag` 项目层，不为了目录对称再制造 `ros2_bag::runtime` 子模块。
+
+顶层 `include/ros2_bag/` 是**项目统一 header 根**，不自动等于稳定第三方 SDK 或 ABI 承诺。是否安装哪些 header 由发布/CMake `install(...)` 另行决定；开发阶段允许接口直接演进。
 
 Server 只能依赖 Recorder 稳定 public API，不能包含其 private implementation 或访问
 Writer、Queue、持久化内部对象。Runtime 同时拥有 Recorder 与 Server，并负责它们的
@@ -145,28 +161,26 @@ Writer、Queue、持久化内部对象。Runtime 同时拥有 Recorder 与 Serve
 或 `protocol/` C++ 子系统；Protocol 是文档定义的跨语言 wire contract，不是 C++
 子系统。历史上含义模糊的 `ros2_bag_core` 不再使用。
 
-未来 CMake target 应反映真实依赖方向：Recorder implementation 可被一个内部 Recorder
-target 承载，Server target 依赖其 public API，Runtime executable 组合二者。是否拆出
-target 必须由链接边界、编译隔离或可测试性证明；不得为了目录对称性预先创建空 target。
+CMake target 应反映真实依赖方向：Recorder implementation 可以由内部 Recorder target 承载，Server target 依赖 Recorder API，最终 executable 组合二者。默认由一个顶层 `CMakeLists.txt` 作为项目构建权威；如果未来源文件规模需要拆分多个 CMake 文件，只是构建文件组织优化，仍保持单一顶层工程和统一 `include/src` 布局，不意味着 Recorder/Server 成为独立发布子工程。
 
-Recorder 通过原生 C++ 接口提供录制启动、定时启动、停止、暂停、恢复、动态 Topic 管理、状态快照及 Shutdown。接口契约可由 `RecordingCoordinator` 等录制领域对象承载；精确 C++ 签名、返回语义和线程约束由 `recorder.md` 定义。
+Recorder 通过直接原生 C++ 领域方法提供 Start/Stop/Pause/Resume、动态 Topic 管理、状态/历史查询及 Shutdown；异步 mutation 统一返回 `Completion<T>`。V1.0 不恢复 `RecordingCoordinator / RecorderFacade / Request/Response / Target/Guard / ControlHandle` 等旧抽象；精确 C++ 签名、返回语义和线程约束由 `recorder.md` 定义。
 
-Recorder 内部管理 Topic 订阅、队列预算、消息池、Writer、快照缓存、清理与资源监测。录制状态至少区分 `Idle / Recording / Paused / Stopping / Failed`；具体状态转换及错误返回属于 Recorder 接口契约。
+Recorder 内部管理 Topic 订阅、队列预算、固定有界消息池、Writer、快照缓存、清理与资源监测。运行态固定区分 `Idle / Initializing / Recording / Paused / Stopping / Failed`；`Initializing` 是真实可观察状态，不能在 Server/Protocol 中伪装成 Idle 或 Recording。
 
 **实例与任务边界：** V1.0 中**一个 Runtime 管理一个 Recorder 实例，同一时刻最多一个活动录制任务**。该任务可包含多个动态 Topic，并可采用 Normal、Timed 或 Rolling 模式；Rolling 的多个存储分段仍属于同一任务。任务结束后可以顺序启动下一任务。多个任务并行录制、多 Recorder 注册表及跨实例协调不属于 V1.0 范围。
 
 **跨层契约：**
 
 1. Server 通过类型明确的 C++ 原生方法调用 Recorder，不直接获取 Writer、Queue 或修改 Manifest。
-2. Recorder 方法的调用线程、完成条件、错误结果及 Shutdown 并发规则必须被 Server 适配；Recorder 的控制调用可能同步等待 Writer 或 Executor 协作，不得假定所有调用立即返回。
-3. Recorder 的 `RecorderStatus` 是状态快照，不是 HTTP 资源模型；Server 负责向独立 Protocol 数据模型转换。
+2. Recorder mutation 方法返回受管 `Completion<T>`；调用返回只表示 Recorder 已接管/拒绝该操作，不等于领域结果已经完成。Server 的 HTTP deadline 只结束网络等待，不取消已经进入 Recorder 的 operation。
+3. Recorder 的 `State` 是领域状态快照，不是 HTTP 资源模型；Server 负责向独立 Protocol 数据模型转换。
 4. Recorder 中 `recording_id`、`recording_generation`、Topic ID/Epoch、`operation_id` 等领域身份不得与 HTTP 请求 ID、SSE 事件 ID 自动等同。
 5. 保留 `manifest.json`、`topic_events.jsonl`、`recovery.json` 的存储领域语义。网络协议的事件序列或缓存不自动具备相同的持久性保证。
 6. Recorder 内部的定时 Stop、Rolling 轮转与磁盘保护回调不由 HTTP 请求触发。Server 必须允许这些内部事件与外部控制安全交错，不得将对外请求的串行化误认为 Recorder 内部全部状态变化都通过 Server 发生。
 
 Runtime 必须遵守“**先取得输出目录所有权锁，再执行恢复**”的顺序。输出目录进程级互斥由 Runtime 负责，不得隐含为 Recorder 的自动行为；其他嵌入 Recorder 的宿主同样必须保证输出目录所有权。
 
-**Recorder 内部时间事件的执行域：** ROS Executor Timer 只发布有界触发事件，不在回调线程完成可能阻塞的 Timed Stop、Rolling Rotate、磁盘保护收尾。**RecorderControlSequencer 是所有 Task/Topic/Writer mutation 的唯一领域线性化执行域**：Server 的独立 ControlWorker 只负责网络 Admission、外部 FIFO 和等待 Recorder `ControlHandle`，它把请求提交给 Sequencer，不能与 Sequencer 形成第二个“关闭权”裁决点。唯一例外是不会推进领域状态机的**无阻塞安全 Gate**：Producer 准入可在自身线性化点因 Timed steady deadline 或磁盘危险原子拒绝新准入，并仅向 Sequencer 提交合并事件；Writer Close、Topic 状态、Manifest 终态仍只能由 Sequencer 协调。Writer 本身始终由独立 Writer Thread 独占。Stop/Shutdown 必须真实等待 Sequencer/Handle 所代表的领域工作结束后再回收 Recorder 和 ROS Context。
+**Recorder 内部时间事件的执行域：** Recorder 的唯一串行 mutation 域是所有 Task/Topic/Writer mutation 的领域线性化执行域，同时处理外部 Start/Stop/Pause/Resume/Add/Remove 与内部 Timed Stop、Rolling deadline、Disk Safety、Writer/Cleanup/Executor result、Shutdown。V1 的 Rolling/Timed deadline 由该 mutation loop 自身使用 steady-clock timed wait（例如 `condition_variable::wait_until`）维护，不增加 ROS Timer 或第二个 Recorder timer thread。Server 的独立 Control Worker 只负责网络 Admission、外部 FIFO 和等待 Recorder `Completion<T>`，不能与 Recorder 串行域形成第二个“关闭权”裁决点。唯一例外是不会推进完整领域状态机的**无阻塞安全 Gate**：Producer 准入可因 Timed hard deadline 或磁盘危险原子拒绝新消息，并仅向 Recorder 串行域发布/合并安全事件；Writer Close、Topic 状态、Manifest 终态仍只能由 Recorder 串行域裁决。Writer 本身由独立 Writer Thread 独占。Stop/Shutdown 必须真实等待对应 Completion 与 Recorder-owned native/worker work 结束后再回收 Recorder 和 ROS Context。
 
 ## 3.2 Server 与独立 Protocol
 
@@ -176,7 +190,7 @@ Server 至少遵守以下架构约束：
 
 - 把外部输入转换为受校验的 Recorder 参数；在网络边界处理认证、授权和请求大小限制。
 - 可能阻塞的 Recorder 调用不得直接长时间占用 Drogon 网络 I/O 事件循环；调度、并发限制和关闭同步必须受控，不预设独立大型任务框架。
-- **同一 Recorder 的外部状态变更调用必须串行化：** Server 同时最多持有一个“已提交给 Recorder 且领域尚未 DONE”的外部 mutation；请求的受理、提交和完成顺序必须可判断。Recorder 返回受管 `ControlHandle` 后，即使 HTTP ResponseSink 已超时/断开，Server 仍保持该外部执行槽，直到 Handle DONE；不得仅因网络等待结束就提交下一项冲突 mutation。队列和执行单元必须有界。
+- **同一 Recorder 的外部状态变更调用必须串行化：** Server 同时最多持有一个“已提交给 Recorder 且对应 `Completion<T>` 尚未 DONE”的外部 mutation；请求的受理、提交和完成顺序必须可判断。即使 HTTP ResponseSink 已超时/断开，Server 仍保持该外部执行槽直到 Completion DONE；不得仅因网络等待结束就提交下一项冲突 mutation。队列和执行单元必须有界。
 - 只读状态查询可以在 Recorder 快照访问具备线程安全保证的前提下并发进行；内部定时器、磁盘保护和 Writer 故障仍可能并发改变领域状态，由 Recorder 的状态与同步约束裁决；Server 必须使用 Recorder 返回结果与后续权威快照识别冲突，不得推断自己的请求必然获胜。`server.md` 必须定义典型竞态下的结果解释与同步方式（例如外部 Stop 与磁盘保护 Pause 交错）。具体执行器与锁方案留给 `server.md`，不预先引入通用任务框架。
 - SSE 基于 Drogon 异步 Streaming 能力实现，订阅者与待发送数据必须有界；连接断开时释放相应资源，不允许慢客户端影响录制路径。
 - Server 重启与 Recorder 同属 Runtime 生命周期；不能把 HTTP 服务状态当成录制持久状态。
@@ -263,12 +277,12 @@ ROS 2 Executor / GenericSubscription
 
 网络控制路径经 Server 调用 Recorder 原生接口，不得绕过状态检查、Topic 身份规则、Writer 串行约束及持久化边界。
 
-控制请求与持续录制可以并发，但有两层不同的串行域。Server Control Worker 只负责外部 HTTP 状态变更的有界 Admission/Deadline/调用顺序；Recorder 自己的 RecorderControlSequencer 是**所有领域变更的最终线性化执行域**，同时接收外部 Start/Stop/Pause/Resume/Add/Remove 和内部 Timed Stop、Rolling、Disk Safety、Writer Failure。后者不能依赖 Server 存在。HTTP 连接寿命不是 Recorder 锁寿命；请求断连或超时不得取消已经被 Recorder Sequencer claim 的领域操作，也不能让后续冲突操作越过尚未完成的领域事务。
+控制请求与持续录制可以并发，但有两层不同的串行域。Server Control Worker 只负责外部 HTTP 状态变更的有界 Admission/Deadline/调用顺序；Recorder 自己的 Recorder 串行 mutation 域 是**所有领域变更的最终线性化执行域**，同时接收外部 Start/Stop/Pause/Resume/Add/Remove 和内部 Timed Stop、Rolling、Disk Safety、Writer Failure。后者不能依赖 Server 存在。HTTP 连接寿命不是 Recorder 锁寿命；请求断连或超时不得取消已经被 Recorder Sequencer claim 的领域操作，也不能让后续冲突操作越过尚未完成的领域事务。
 
 必须满足：
 
 - 网络 I/O、SSE 编码或客户端缓存不进入 ROS 回调和 Writer 热路径。
-- 同一 Recorder 的外部状态变更先经 Server 有界串行 Admission，再由 RecorderControlSequencer 与内部安全事件统一裁决；两层队列都必须有界，调用方取消不意味着已 STARTED 的领域操作撤销。
+- 同一 Recorder 的外部状态变更先经 Server 有界串行 Admission，再由 Recorder 串行 mutation 域 与内部安全事件统一裁决；两层队列都必须有界，调用方取消不意味着已 STARTED 的领域操作撤销。
 - 任何操作的“完成”以实际领域完成边界为依据；HTTP 请求结束不自动证明操作已写入磁盘。
 - Server 不持有 Recorder 内部锁后再等待网络、用户界面或远程资源。
 - 停止、动态移除 Topic、Writer Drain、Rolling 轮转等顺序必须遵守 `recorder.md` 定义的领域契约。

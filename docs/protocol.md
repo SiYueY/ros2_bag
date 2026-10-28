@@ -2,7 +2,7 @@
 
 | 属性 | 内容 |
 |---|---|
-| 文档版本 | v0.1.7 |
+| 文档版本 | v0.1.8 |
 | 文档状态 | **DRAFT — V1.0 开发阶段，随时修订；规范尚未批准用于完整实施** |
 | 适用范围 | Recorder Runtime 的 HTTP/1.1、JSON、SSE 跨语言协议 |
 | 架构依据 | docs/architecture.md（开发稿，可直接联动修改） |
@@ -130,8 +130,8 @@ HTTP GET、POST 控制与 SSE 共用清晰的版本/授权/过载语义。Server
 | POST | `/api/v1/control/stop` | Stop 当前受身份保护的 Task | control | Recorder |
 | POST | `/api/v1/control/pause` | Pause 当前受身份保护的 Task | control | Recorder |
 | POST | `/api/v1/control/resume` | Resume 当前受身份保护的 Task | control | Recorder |
-| POST | `/api/v1/control/topics/add` | Add Topic 到指定任务 | control | Recorder/TopicManager |
-| POST | `/api/v1/control/topics/remove` | Remove 指定 Topic Epoch | control | Recorder/TopicManager |
+| POST | `/api/v1/control/topics/add` | Add Topic 到指定任务 | control | Recorder Topic Add API |
+| POST | `/api/v1/control/topics/remove` | Remove 指定 Topic Epoch | control | Recorder Topic Remove API |
 | GET | `/api/v1/events` | SSE 初始全量快照与后续变化 | read | Server 订阅与状态发布 |
 
 **所有 GET 路由均为 Recorder 领域只读操作**：不得调用 Recorder 的任何变更方法，不得触发录制状态转移、Recovery、Cleanup、Manifest/Topic Event 写入或磁盘文件修复。`GET /api/v1/events` 可以在 Server 网络层创建/释放**有界订阅资源**，`GET /api/v1/status` 可以触发**只读状态采样**，这两者不属于 Recorder 领域变更；不得把“HTTP GET 安全”误解为完全没有网络内存与 CPU 消耗。`/api/v1/recordings/{recording_id}` 的参数在路由解码前后均必须经过路径安全校验。未知路由为 404；已知路径但 Method 不允许为 405，携带规范 `Allow`。控制必须检查权限和 Server 关闭状态，即使 Recorder 自身当前允许该操作。
@@ -211,11 +211,11 @@ Server 在真正调用 Recorder 前验证 **Runtime 身份、任务 ID、Generat
 | `pause` | 不再允许新消息接入、暂停归因已发布；已接纳数据可以继续安全写入 | `state: PAUSED`、`paused_reasons` |
 | `resume` | 清除本任务 USER 暂停意图，并在磁盘已安全且稳定期满足时确认 `DISK_RECOVERY_PENDING`；活动系统危险原因不由用户请求清除 | 返回真实 `state` 与 `paused_reasons`；只有原因集合为空时才为 RECORDING |
 
-Stop 的 200/SUCCESS 不表示用户还能从 HTTP 重新开始原来的 recording_id，也不能在失败时强行将 INCOMPLETE 标为 COMPLETE。发生 `DRAIN_TIMEOUT` 时，若 Server 确实取得 Recorder 的领域错误结果，可返回 `FAILURE + DRAIN_TIMEOUT`，其 `effects: POSSIBLE`；若网络已经超时且没有可信领域结果，则本次请求是 `UNKNOWN`。Recorder 可能仍为 `STOPPING`，状态不能当成调用结果的替代。
+Stop 的 200/SUCCESS 不表示用户还能从 HTTP 重新开始原来的 recording_id，也不能在失败时强行将 INCOMPLETE 标为 COMPLETE。发生 `DRAIN_TIMEOUT` 时，若 Server 确实取得 Recorder 的领域错误结果，可返回 `FAILURE + DRAIN_TIMEOUT`，effects 按 Recorder 实际 Result 原样映射；若网络已经超时且没有可信领域结果，则本次请求是 `UNKNOWN`。Recorder 可能仍为 `STOPPING`，状态不能当成调用结果的替代。
 
 Paused 原因值域固定为 `USER / DISK_CRITICAL / DISK_UNKNOWN / DISK_RECOVERY_PENDING`，使用集合语义。错误响应中的 `details.protection_reason` 表示仍阻止 Resume 的保护锁存原因，不等同于 Status 中最新的 `disk.state`。Pause 在尚无 USER 时增加 USER，即使任务已经因磁盘原因 PAUSED 也可 SUCCESS；已有 USER 再 Pause 返回 `ALREADY_PAUSED / effects:NONE`。`DISK_CRITICAL/DISK_UNKNOWN` 表示对应系统保护仍然生效：可能是当前采样仍危险，也可能是瞬时采样已改善但 `resume_stable_sec` 尚未满足，因此不能把 paused reason 当成最新 `disk.state` 的别名。`DISK_RECOVERY_PENDING` 表示默认 `auto_resume=false` 下危险已经解除并满足稳定期、但 ingress 继续关闭等待人工确认。Resume 可在 USER 或 DISK_RECOVERY_PENDING 存在时调用：移除 USER，并仅在 Recorder 用新鲜安全样本再次确认后移除 DISK_RECOVERY_PENDING；仍生效的 DISK_CRITICAL/DISK_UNKNOWN 永不由 Resume 清除。最终 reasons 为空且 Timed deadline 未触发、Task 未 Stopping/Failed 时才重新开放 ingress。仅有仍生效的系统保护且无 USER/PENDING 时返回 `DISK_UNSAFE / effects:NONE`。Server 不得自行增加、替换或删除任何暂停原因。
 
-**重复操作规则：** 在 Recorder 明确已完成且当前状态非法时返回相应 INVALID_STATE/ALREADY_FINISHED 诊断；“安全上可以再次调用 Stop”不等于对外无条件幂等或自动返回 SUCCESS。Client 不应在请求 UNKNOWN 后自动发第二次 Stop/Pause/Resume。
+**重复操作规则：** 在 Recorder 明确已完成且当前状态不再允许该控制时返回 `INVALID_STATE`；Pause 的 USER reason 已存在时使用专门的 `ALREADY_PAUSED`。V1 不保留独立 `ALREADY_FINISHED` Recorder 错误。“安全上可以再次调用 Stop”不等于对外无条件幂等或自动返回 SUCCESS。Client 不应在请求 UNKNOWN 后自动发第二次 Stop/Pause/Resume。
 
 ## 2.4 Topic Add / Remove：类型、QoS 与 Epoch
 
@@ -358,11 +358,11 @@ Remove 按**具体 Topic Epoch** 执行，不允许只按名称删除“当前�
 
 `GET /api/v1/status` 返回第 §3.2 节的**完整 Recorder 状态**，不是只返回“发生变化的字段”。Server 应通过受控的状态发布协调器把 Recorder 状态样本与 `state_revision` 绑定，返回的领域内容、revision、Runtime 身份必须来自**同一已发布状态对象**；并发 HTTP 查询不能独立随意递增版本。**相同 revision 对应相同的规范性领域状态（含任务/Topic/资源状态、业务计数和安全有效性），仅 `observed_at` 等纯采样元信息可更新而不改变 revision**；不得以这一例外修改任何实际领域计数、暂停原因或有效性。
 
-每个 Status 返回 `observed_at`（采样时刻 UTC）和 `sample_validity`（`CURRENT / STALE`）；Server 可以复用尚在约定有效期内的最近权威状态样本，但若超出 Server 配置的新鲜度预算必须主动采样或返回可识别 `STATE_UNAVAILABLE`，不能悄悄把过期缓存当成当前状态。**已经失效的采样不得以新时间戳或心跳“刷新”成 CURRENT**；SSE 的失效通知与重同步见 §5.4。**采样时刻不是 HTTP 响应生成时刻**；RecorderStatus 在各子系统间不是全局瞬时原子快照，须保留 source/采样有效性。
+每个 Status 返回 `observed_at`（采样时刻 UTC）和 `sample_validity`（`CURRENT / STALE`）；Server 可以复用尚在约定有效期内的最近权威状态样本，但若超出 Server 配置的新鲜度预算必须主动采样或返回可识别 `STATE_UNAVAILABLE`，不能悄悄把过期缓存当成当前状态。**已经失效的采样不得以新时间戳或心跳“刷新”成 CURRENT**；SSE 的失效通知与重同步见 §5.4。**采样时刻不是 HTTP 响应生成时刻**；Recorder State 在各子系统间不是全局瞬时原子快照，须保留 source/采样有效性。
 
 ## 3.2 Status JSON：身份、任务、Topic、资源和诊断
 
-外部稳定 Recorder 状态枚举：`IDLE / RECORDING / PAUSED / STOPPING / FAILED`；必须区分无任务时的 `null` 与数字 0/空字符串。Topic 实例使用 `ADDING / ARMED / ACTIVE / REMOVING / REMOVED / FAILED`，只能由 Recorder 确认真实状态，Server 不得从当前 ROS Graph 推断 Topic 已成功加入。
+外部稳定 Recorder 状态枚举：`IDLE / INITIALIZING / RECORDING / PAUSED / STOPPING / FAILED`；必须区分无任务时的 `null` 与数字 0/空字符串。`INITIALIZING` 表示第一份 durable INITIALIZING Manifest 已建立、Task 已真实存在，但 Start completion boundary 尚未完成，Task ingress 仍 CLOSED；Server 不得把它折叠成 IDLE 或 RECORDING。Topic 实例使用 `ADDING / ARMED / ACTIVE / REMOVING / REMOVED / FAILED`，只能由 Recorder 确认真实状态，Server 不得从当前 ROS Graph 推断 Topic 已成功加入。
 
 **完整状态对象的基准形态：**
 
@@ -437,7 +437,6 @@ Remove 按**具体 Topic Epoch** 执行，不允许只按名称删除“当前�
     "pool": {
       "fixed_capacity": 81920,
       "in_use": 2,
-      "fallback_in_use": 0,
       "allocation_failures": "0"
     },
     "cleanup": {
@@ -445,6 +444,9 @@ Remove 按**具体 Topic Epoch** 执行，不允许只按名称删除“当前�
       "cleanup_pending_total": 0,
       "cleanup_queue_full_count": "0",
       "active_segment_id": null,
+      "active_for_seconds": null,
+      "warning_active": false,
+      "total_removed": "0",
       "last_error": null
     },
     "disk": {
@@ -472,7 +474,7 @@ Remove 按**具体 Topic Epoch** 执行，不允许只按名称删除“当前�
 | 字段组 | 必须保持的语义 |
 |---|---|
 | `runtime_instance_id / state_revision` | 联合辨识 Server 发布的状态版本；不能仅比较 revision 的数字 |
-| `recorder.state` | 当前 Recorder 稳定状态；IDLE 时 recording_id、recording_generation、effective_config 均为 null |
+| `recorder.state` | 当前 Recorder 稳定状态；IDLE 时 recording_id、recording_generation、effective_config 均为 null；INITIALIZING 时 recording identity/effective_config 已存在但 ingress 尚未开放，控制面不得假装已 RECORDING |
 | `recorder.recording_generation` | Task 域身份，不能替代 SSE 版本；变更任务时 Topic 的相应身份必须一致或显式声明采样不稳定 |
 | `elapsed_wall/active/paused` | 与 `recorder.md` 时间概念一致，seconds；未知时 null，不能输出负时长 |
 | `recorder.effective_config` | 当前 Task 不可变配置；无 Task 时 null。TIMED 的 duration_seconds 使用 steady clock且暂停计入；ROLLING segment/retention 为实际值；compression/timestamp_policy 为 Recorder 冻结事实。UI 可用 duration_seconds-elapsed_wall_seconds 推算剩余期限，但 0 不表示 Stop 完成 |
@@ -487,6 +489,9 @@ Remove 按**具体 Topic Epoch** 执行，不允许只按名称删除“当前�
 | `cleanup.cleanup_queue_depth` | 等待项数，不包括 Worker 当前正在处理的单项 |
 | `cleanup.cleanup_pending_total` | durable DELETING/cleanup_pending 总量，可含尚未入队和在途 |
 | `cleanup.cleanup_queue_full_count` | 满队列导致的累计拒绝，绝不等于删除失败次数 |
+| `cleanup.active_segment_id / active_for_seconds` | 单线程 Cleanup 当前最多一个 active Segment；active_for 每次 Recorder State 采样按 steady-clock 动态计算，未 active 时为 null |
+| `cleanup.warning_active` | active_for 达到 cleanup warning 阈值时为 true；仅诊断，不改变 durable delete authorization |
+| `cleanup.total_removed` | 当前 Runtime/Recorder 观测口径内成功完成删除的累计数；不等于 durable pending 总数 |
 | `disk.state` | `NORMAL / WARNING / CRITICAL / UNKNOWN`，安全判断不以旧 sample 数字代替 |
 | `process.valid` | 未采样/初始差分不足/关闭时标记 false；CPU、RSS、FD 等不可得数据使用 null |
 | `last_error / secondary_errors` | 结构化 ErrorRef；`secondary_errors` 最多 8 项，Recorder 只保留最新有界诊断；不得因列表增长使 Status 无界 |
@@ -526,9 +531,13 @@ Remove 按**具体 Topic Epoch** 执行，不允许只按名称删除“当前�
         "observation": "VISIBLE",
         "types": ["sensor_msgs/msg/JointState"],
         "publisher_count": 1,
+        "publisher_qos_profiles": [
+          {"reliability":"RELIABLE","durability":"VOLATILE","history":"KEEP_LAST","depth":10}
+        ],
+        "publisher_qos_profiles_truncated": false,
         "actual_hz": null,
         "frequency_validity": "UNAVAILABLE",
-        "recordability": "CANDIDATE",
+        "recordability": "RECORDABLE",
         "diagnostics": []
       }
     ],
@@ -540,7 +549,7 @@ Remove 按**具体 Topic Epoch** 执行，不允许只按名称删除“当前�
 }
 ```
 
-`observation`：`VISIBLE / VISIBLE_NO_PUBLISHER / NOT_FOUND / UNAVAILABLE`。对于列表查询，只枚举可见结果；仅精确 `name` 查询返回 NOT_FOUND（这是观察结果，不是永久事实）。同名多类型时 `recordability: TYPE_CONFLICT`，类型支持缺失 `TYPE_SUPPORT_UNAVAILABLE`，QoS 不兼容可显式 `QOS_INCOMPATIBLE`；不得为了让 UI 显示“可录”而静默选择任意类型。无法采样 Publisher 频率时为 null，不能显示 0 Hz 作为事实。
+`observation`：`VISIBLE / VISIBLE_NO_PUBLISHER / NOT_FOUND / UNAVAILABLE`。对于列表查询，只枚举可见结果；仅精确 `name` 查询返回 NOT_FOUND（这是观察结果，不是永久事实）。`recordability` 是 Recorder `TopicRecordability` 的网络汇总：`RECORDABLE / TYPE_CONFLICT / TYPE_SUPPORT_UNAVAILABLE / QOS_INCOMPATIBLE`，优先级与 Recorder 保持一致。`types[]` 保留本次 observation 的去重稳定类型集合；同名多类型时不得挑一个类型伪装唯一。`publisher_count` 是真实观测数量，可以大于 `publisher_qos_profiles.size()`；profile 列表被 Recorder 上限截断时必须设置 `publisher_qos_profiles_truncated=true`。无法采样 Publisher 频率时为 null，不能显示 0 Hz 作为事实。
 
 分页基于**动态 ROS Graph 非原子观察**，offset/limit 不是长期一致的 Snapshot Cursor；两次查询之间新增/移除 Topic 可能导致重复/漏项，Client 可重新扫描。Server 不维护一个长期 Topic 数据库，发现是 Recorder 的只读能力，不由三套 Application 分别调用 ROS Graph 自行推断。
 
@@ -588,7 +597,7 @@ Remove 按**具体 Topic Epoch** 执行，不允许只按名称删除“当前�
 }
 ```
 
-历史 `recording_state` 使用 `RECORDING / PAUSED / STOPPING / COMPLETE / INCOMPLETE / FAILED / UNKNOWN`。这是**历史任务持久化/读取视图**，与当前 `recorder.state` 不完全相同；例如某个历史任务为 INCOMPLETE，并不意味着新 Runtime 的 Recorder 现在为 Failed。已删除的 Rolling Segment 在详情中以状态 `REMOVED` 表示，不把它们从历史事实中悄悄抹去。
+历史 `recording_state` 使用 `INITIALIZING / RECORDING / FINALIZING / COMPLETE / INCOMPLETE / FAILED / UNKNOWN`，直接映射 Recorder 持久 `TaskState`；**不包含 PAUSED**，因为 Pause 只属于当前 `RecorderState/PauseState`，从不持久化成 TaskState。`FINALIZING` 对应尚未形成 terminal durable state 的 Task。该历史视图与当前 `recorder.state` 明确分离；例如某个历史任务为 INCOMPLETE，并不意味着新 Runtime 的 Recorder 现在为 FAILED。已删除的 Rolling Segment 在详情中以状态 `REMOVED` 表示，不把它们从历史事实中悄悄抹去。
 
 `GET /api/v1/recordings/{recording_id}` 返回同一 HistoryEntry 加上分页 `segments` 列表。Segment 含 ID、状态（`WRITING / FINALIZING / COMPLETE / DELETING / REMOVED / INCOMPLETE`）、可读相对标识、开始/完成时间及可得消息数；另返回 `segment_page:{limit,offset,has_more}` 与 `segment_history_summary:{segments_created_total,segments_removed_total,removed_segments_compacted_total,compacted_through_segment_id}`，其中累计值使用十进制字符串，high-water mark 无压缩时为 null。已压缩的历史只允许来自 durable REMOVED 连续前缀；不能从 summary 反推出已删除文件仍存在。缺少 Manifest、权限不足或数据损坏时应返回合法 UNKNOWN/诊断或错误；**不能从“文件目录还在”推断 COMPLETE**。
 
@@ -661,7 +670,7 @@ HTTP POST 到达
 | 403 | `PERMISSION_DENIED` | POST: FAILURE；GET: 无 outcome | 具备身份但无 read/control 所需权限；拒绝执行 |
 | 404 | `RESOURCE_NOT_FOUND / TOPIC_NOT_FOUND` | FAILURE（若请求合法） | 未知路径/录制任务/目标 Topic 资源；Evidence NOT_FOUND 不默认映射此码 |
 | 405 | `METHOD_NOT_ALLOWED` | FAILURE | 只读端点误用控制方法等 |
-| 409 | `INVALID_STATE / ALREADY_PAUSED / ALREADY_FINISHED / STALE_RUNTIME / STALE_RECORDING / STALE_TOPIC_EPOCH / TOPIC_TYPE_CONFLICT / RECORDING_EXISTS` | FAILURE | 领域状态、重复控制、冲突或目标身份不匹配 |
+| 409 | `INVALID_STATE / ALREADY_PAUSED / STALE_RUNTIME / STALE_RECORDING / STALE_TOPIC_EPOCH / TOPIC_TYPE_CONFLICT / RECORDING_EXISTS` | FAILURE | 领域状态、重复控制、冲突或目标身份不匹配 |
 | 413 | `REQUEST_TOO_LARGE` | FAILURE | 超过有界请求体/字段大小 |
 | 415 | `UNSUPPORTED_MEDIA_TYPE` | FAILURE | POST 请求的 Content-Type 不支持（GET/SSE 的不可接受 Accept 应为 HTTP 406） |
 | 406 | `NOT_ACCEPTABLE` | FAILURE | 客户端声明的 Accept 不支持要求的响应媒体类型 |
@@ -669,7 +678,7 @@ HTTP POST 到达
 | 429 | `CONTROL_QUEUE_FULL / RATE_LIMITED` | FAILURE、effects:NONE | Server 受理前有界拒绝，无 Recorder 调用；可用 Retry-After |
 | 500 | `EVENT_COMMIT_FAILED / STORAGE_ERROR / DRAIN_TIMEOUT / INTERNAL_ERROR` | FAILURE | 已取得 Recorder 的确定领域失败；effects 必须按 Recorder 原样映射，不能用 504 代替 |
 | 503 | `RUNTIME_NOT_READY / DISK_UNSAFE / RECORDER_UNAVAILABLE / RECORDER_RESOURCE_EXHAUSTED / EVIDENCE_UNAVAILABLE / STATE_UNAVAILABLE / STATE_TOO_LARGE / QUEUE_TIMEOUT` | FAILURE | 环境安全、Recorder 资源/执行域、恢复/状态证据或服务不可用；`QUEUE_TIMEOUT` **仅表示控制请求已排队但在进入 Recorder 前原子移除成功**，`effects:NONE` |
-| 504 | `OPERATION_RESULT_UNKNOWN` | UNKNOWN | **Server 在 HTTP 回复预算内尚未取得 Recorder ControlHandle 的 DONE Result，或可信响应丢失**；不是 Recorder 的领域错误码 |
+| 504 | `OPERATION_RESULT_UNKNOWN` | UNKNOWN | **Server 在 HTTP 回复预算内尚未取得 Recorder Completion 的 DONE Result，或可信响应丢失**；不是 Recorder 的领域错误码 |
 
 ### 4.2.1 Recorder Error → Protocol 的唯一映射
 
@@ -677,31 +686,32 @@ HTTP POST 到达
 
 | Recorder / Server 原因 | HTTP | Protocol ErrorCode | outcome / effects | retryable |
 |---|---:|---|---|---|
-| Recorder `INVALID_ARGUMENT` | 400 | `INVALID_ARGUMENT` | FAILURE / Recorder effects（通常 NONE） | false |
-| Recorder `TYPE_CONFLICT` | 409 | `TOPIC_TYPE_CONFLICT` | FAILURE / Recorder effects | false |
-| Recorder `TYPE_SUPPORT_UNAVAILABLE` | 422 | `TYPE_SUPPORT_UNAVAILABLE` | FAILURE / Recorder effects | false |
-| Recorder `SCHEMA_UNAVAILABLE` | 422 | `SCHEMA_UNAVAILABLE` | FAILURE / Recorder effects | false |
-| Recorder `UNSUPPORTED_QOS` | 422 | `UNSUPPORTED_QOS` | FAILURE / Recorder effects | false |
-| Recorder `INVALID_STATE` | 409 | `INVALID_STATE` | FAILURE / Recorder effects | false |
-| Recorder `ALREADY_PAUSED` | 409 | `ALREADY_PAUSED` | FAILURE / NONE | false |
-| Recorder `ALREADY_FINISHED` | 409 | `ALREADY_FINISHED` | FAILURE / NONE | false |
-| Recorder `RECORDING_EXISTS` | 409 | `RECORDING_EXISTS` | FAILURE / NONE | false |
-| Recorder `STALE_RECORDING` | 409 | `STALE_RECORDING` | FAILURE / NONE | false |
-| Recorder `STALE_TOPIC_EPOCH` | 409 | `STALE_TOPIC_EPOCH` | FAILURE / NONE | false |
-| Recorder `NOT_FOUND` / `TOPIC_NOT_FOUND` | 404 | `RESOURCE_NOT_FOUND` / `TOPIC_NOT_FOUND` | FAILURE / NONE | false |
-| Recorder `DISK_FULL` | 503 | `DISK_UNSAFE` + `details.protection_reason=DISK_CRITICAL` | FAILURE / Recorder effects | false |
-| Recorder `DISK_STATE_UNKNOWN` | 503 | `DISK_UNSAFE` + `details.protection_reason=DISK_UNKNOWN` | FAILURE / Recorder effects | false |
-| Recorder `RESOURCE_EXHAUSTED` | 503 | `RECORDER_RESOURCE_EXHAUSTED` | FAILURE / Recorder effects | false |
-| Recorder `EXECUTOR_UNAVAILABLE` | 503 | `RECORDER_UNAVAILABLE` | FAILURE / Recorder effects | false |
-| Recorder `WRITER_ERROR` / `STORAGE_UNAVAILABLE` | 500 | `STORAGE_ERROR` | FAILURE / Recorder effects | false |
-| Recorder `EVENT_COMMIT_FAILED` | 500 | `EVENT_COMMIT_FAILED` | FAILURE / Recorder effects | false |
-| Recorder `DRAIN_TIMEOUT` **作为最终 DONE Result** | 500 | `DRAIN_TIMEOUT` | FAILURE / Recorder effects（通常 POSSIBLE） | false |
-| Recorder `GENERATION_VIOLATION` / `POOL_FATAL` | 500 若仍能安全回应，否则连接可能终止 | `INTERNAL_ERROR` | fail-safe / 真实 effects | false |
+| Recorder `ErrorCode::InvalidArgument` | 400 | `INVALID_ARGUMENT` | FAILURE / Recorder effects（通常 NONE） | false |
+| Recorder `ErrorCode::InvalidState` | 409 | `INVALID_STATE` | FAILURE / Recorder effects | false |
+| Recorder `ErrorCode::AlreadyPaused` | 409 | `ALREADY_PAUSED` | FAILURE / NONE | false |
+| Recorder `ErrorCode::RecordingExists` | 409 | `RECORDING_EXISTS` | FAILURE / NONE | false |
+| Recorder `ErrorCode::StaleRecording` | 409 | `STALE_RECORDING` | FAILURE / NONE | false |
+| Recorder `ErrorCode::StaleTopicEpoch` | 409 | `STALE_TOPIC_EPOCH` | FAILURE / NONE | false |
+| Recorder `ErrorCode::TopicTypeConflict` | 409 | `TOPIC_TYPE_CONFLICT` | FAILURE / Recorder effects | false |
+| Recorder `ErrorCode::NotFound` | 404 | `RESOURCE_NOT_FOUND` 或 `TOPIC_NOT_FOUND` | FAILURE / Recorder effects（通常 NONE） | false |
+| Recorder `ErrorCode::UnsupportedQos` | 422 | `UNSUPPORTED_QOS` | FAILURE / Recorder effects | false |
+| Recorder `ErrorCode::TypeUnavailable` | 422 | `TYPE_SUPPORT_UNAVAILABLE` | FAILURE / Recorder effects | false |
+| Recorder `ErrorCode::SchemaUnavailable` | 422 | `SCHEMA_UNAVAILABLE` | FAILURE / Recorder effects | false |
+| Recorder `ErrorCode::ResourceExhausted` | 503 | `RECORDER_RESOURCE_EXHAUSTED` | FAILURE / Recorder effects | false |
+| Recorder `ErrorCode::DiskCritical` | 503 | `DISK_UNSAFE` + `details.protection_reason=DISK_CRITICAL` | FAILURE / Recorder effects | false |
+| Recorder `ErrorCode::DiskUnknown` | 503 | `DISK_UNSAFE` + `details.protection_reason=DISK_UNKNOWN` | FAILURE / Recorder effects | false |
+| Recorder `ErrorCode::Unavailable` | 503 | `RECORDER_UNAVAILABLE` | FAILURE / Recorder effects | false |
+| Recorder `ErrorCode::StorageError` | 500 | `STORAGE_ERROR` | FAILURE / Recorder effects | false |
+| Recorder `ErrorCode::EventCommitFailed` | 500 | `EVENT_COMMIT_FAILED` | FAILURE / Recorder effects | false |
+| Recorder `ErrorCode::DrainTimeout` **作为最终 DONE Result** | 500 | `DRAIN_TIMEOUT` | FAILURE / Recorder effects | false |
+| Recorder `ErrorCode::InternalError` | 500 | `INTERNAL_ERROR` | FAILURE / Recorder effects | false |
 | Server admission 容量满，尚未调用 Recorder | 429 | `CONTROL_QUEUE_FULL` | FAILURE / NONE | false |
 | Server FIFO timeout 且原子证明未 STARTED | 503 | `QUEUE_TIMEOUT` | FAILURE / NONE | false |
-| HTTP reply deadline 到达、Handle 尚未 DONE | 504 | `OPERATION_RESULT_UNKNOWN` | UNKNOWN / POSSIBLE | false |
+| HTTP reply deadline 到达、Completion 尚未 DONE | 504 | `OPERATION_RESULT_UNKNOWN` | UNKNOWN / POSSIBLE | false |
 
-**`DRAIN_TIMEOUT` 与 HTTP 504 严格分离。** 前者是 Recorder 已完成 ControlHandle 并明确给出的领域 FAILURE；后者表示 Server 尚未得到领域终态。Server 不得因为某个本地等待预算到期就制造 Recorder `DRAIN_TIMEOUT`，Recorder 也不得用网络 deadline 决定自身领域结果。**对所有控制 POST，§4.2.1 表中的 `retryable` 规范值统一为 `false`**：即使某个条件稍后可能恢复，也必须由 Application/用户在重新读取当前状态、重新验证 Target 后显式创建新的 OperationAttempt；Server/SDK 不允许依据 ErrorCode 自动重放。GET 查询的 429/503 可以独立返回可退避重试提示，但该语义不得传播到控制 POST。
+`NotFound` 的 404 Protocol code 由**当前路由/目标类型**确定：例如历史 Task 查询映射 `RESOURCE_NOT_FOUND`，明确的 Topic 资源操作可映射 `TOPIC_NOT_FOUND`。Server 不解析 `Error.message` 来区分。上表对 Recorder v0.3.6 的全部可恢复 `ErrorCode` 必须穷尽匹配；新增枚举而 Mapper 未更新必须使契约测试/构建失败。已证明的内部不变量破坏（例如 Pool double-release）属于 fail-fast，不作为普通 `ErrorCode` 通过 HTTP 500 继续服务。
+
+**`DRAIN_TIMEOUT` 与 HTTP 504 严格分离。** 前者是 Recorder 已完成 Completion 并明确给出的领域 FAILURE；后者表示 Server 尚未得到领域终态。Server 不得因为某个本地等待预算到期就制造 Recorder `DRAIN_TIMEOUT`，Recorder 也不得用网络 deadline 决定自身领域结果。**对所有控制 POST，§4.2.1 表中的 `retryable` 规范值统一为 `false`**：即使某个条件稍后可能恢复，也必须由 Application/用户在重新读取当前状态、重新验证 recording/generation/topic identity 后显式创建新的 OperationAttempt；Server/SDK 不允许依据 ErrorCode 自动重放。GET 查询的 429/503 可以独立返回可退避重试提示，但该语义不得传播到控制 POST。
 
 ### 4.2.2 受理前拒绝允许省略 operation_id
 
@@ -709,7 +719,7 @@ HTTP POST 到达
 
 `QUEUE_TIMEOUT` 的规范性组合为 **HTTP 503 / FAILURE / effects:NONE / retryable:false**：它不是 `CONTROL_QUEUE_FULL` 的受理前 429，也不是已可能执行的 `OPERATION_RESULT_UNKNOWN` 504。Server 必须凭队列状态线性化证据证明原生调用未发生；控制 POST 即使获得 QUEUE_TIMEOUT 也不默认允许 Client 自动重试。此状态码与 Outcome 的组合属于当前 Protocol 规范，Server/Client 不可各自解释。
 
-表中 429/503 等应在 JSON 中提供稳定 ErrorCode；当 Recorder 在安全保护中返回明确错误时，HTTP 503 + FAILURE 并不代表“Recorder 线程已停止”或“任务已失败”。**所有 RecorderErrorCode 必须落入 §4.2.1 的已定义映射；新增 Recorder ErrorCode 若没有同步更新 Protocol/Server/Client/测试，编译或契约测试必须失败，不能落入默认 500 后继续发布。** 对于无法确定本次操作是否执行过的队列竞争，不能借 429/503 隐瞒 UNKNOWN。409 中的目标保护冲突表示**本次调用被 Server 在进入领域方法之前拒绝**；如果 Recorder 在调用中检测状态冲突，是否存在副作用则按 Recorder 返回信息如实表达。
+表中 429/503 等应在 JSON 中提供稳定 ErrorCode；当 Recorder 在安全保护中返回明确错误时，HTTP 503 + FAILURE 并不代表“Recorder 线程已停止”或“任务已失败”。**所有 Recorder ErrorCode 必须落入 §4.2.1 的已定义映射；新增 Recorder ErrorCode 若没有同步更新 Protocol/Server/Client/测试，编译或契约测试必须失败，不能落入默认 500 后继续发布。** 对于无法确定本次操作是否执行过的队列竞争，不能借 429/503 隐瞒 UNKNOWN。409 中的目标保护冲突表示**本次调用被 Server 在进入领域方法之前拒绝**；如果 Recorder 在调用中检测状态冲突，是否存在副作用则按 Recorder 返回信息如实表达。
 
 `retryable` 属性仅帮助 Client 识别可尝试的**新请求前置状态**，不能自动为任何领域控制操作赋予幂等性。错误消息为安全的高层诊断，不包含 API Key、TLS 私钥、物理文件绝对路径、内部堆栈或 ROS CDR Payload。技术排障使用 request_id 关联受保护日志。
 
@@ -843,7 +853,6 @@ SSE 帧使用标准 UTF-8、LF 行终止，字段采用 `event:`、`id:`、`data
     "pool": {
       "fixed_capacity": 81920,
       "in_use": 0,
-      "fallback_in_use": 0,
       "allocation_failures": "0"
     },
     "cleanup": {
@@ -878,13 +887,13 @@ SSE 帧使用标准 UTF-8、LF 行终止，字段采用 `event:`、`id:`、`data
 ```text
 id: 93ac8a61-69f4-49c8-b3fa-400c4f396499/1
 event: state.snapshot
-data: {"api_version":"1.0","state":{"runtime_instance_id":"9815222c-f39d-4d45-8d1a-bc7f68e75af6","state_revision":"87","observed_at":"2026-10-25T10:11:18.345Z","sample_validity":"CURRENT","recorder":{"state":"RECORDING","recording_id":"run_001","recording_generation":"12","effective_config":{"mode":"ROLLING","duration_seconds":null,"segment_duration_seconds":60,"retention_duration_seconds":600,"compression":"LZ4","timestamp_policy":"RECEIVE"},"paused_reasons":[],"elapsed_wall_seconds":305.2,"elapsed_active_seconds":300.1,"paused_total_seconds":5.1,"last_error":null,"secondary_errors":[]},"topics":[],"topics_removed_recent":[],"topics_removed_total":"0","queue":{"used_messages":0,"max_messages":65536,"used_bytes":"0","max_bytes":"67108864"},"pool":{"fixed_capacity":81920,"in_use":0,"fallback_in_use":0,"allocation_failures":"0"},"cleanup":{"cleanup_queue_depth":0,"cleanup_pending_total":0,"cleanup_queue_full_count":"0","active_segment_id":null,"last_error":null},"disk":{"state":"NORMAL","sampled_at":"2026-10-25T10:11:12.345Z","valid":true,"available_bytes":"10485760000","used_percent":35.2,"failure_count":0},"process":{"sampled_at":"2026-10-25T10:11:12.345Z","valid":false,"cpu_percent_single_core":null,"rss_bytes":null,"thread_count":null,"fd_count":null}}}
+data: {"api_version":"1.0","state":{"runtime_instance_id":"9815222c-f39d-4d45-8d1a-bc7f68e75af6","state_revision":"87","observed_at":"2026-10-25T10:11:18.345Z","sample_validity":"CURRENT","recorder":{"state":"RECORDING","recording_id":"run_001","recording_generation":"12","effective_config":{"mode":"ROLLING","duration_seconds":null,"segment_duration_seconds":60,"retention_duration_seconds":600,"compression":"LZ4","timestamp_policy":"RECEIVE"},"paused_reasons":[],"elapsed_wall_seconds":305.2,"elapsed_active_seconds":300.1,"paused_total_seconds":5.1,"last_error":null,"secondary_errors":[]},"topics":[],"topics_removed_recent":[],"topics_removed_total":"0","queue":{"used_messages":0,"max_messages":65536,"used_bytes":"0","max_bytes":"67108864"},"pool":{"fixed_capacity":81920,"in_use":0,"allocation_failures":"0"},"cleanup":{"cleanup_queue_depth":0,"cleanup_pending_total":0,"cleanup_queue_full_count":"0","active_segment_id":null,"active_for_seconds":null,"warning_active":false,"total_removed":"0","last_error":null},"disk":{"state":"NORMAL","sampled_at":"2026-10-25T10:11:12.345Z","valid":true,"available_bytes":"10485760000","used_percent":35.2,"failure_count":0},"process":{"sampled_at":"2026-10-25T10:11:12.345Z","valid":false,"cpu_percent_single_core":null,"rss_bytes":null,"thread_count":null,"fd_count":null}}}
 
 : heartbeat
 
 id: 93ac8a61-69f4-49c8-b3fa-400c4f396499/2
 event: state.changed
-data: {"api_version":"1.0","state":{"runtime_instance_id":"9815222c-f39d-4d45-8d1a-bc7f68e75af6","state_revision":"88","observed_at":"2026-10-25T10:11:20.345Z","sample_validity":"CURRENT","recorder":{"state":"PAUSED","recording_id":"run_001","recording_generation":"12","effective_config":{"mode":"ROLLING","duration_seconds":null,"segment_duration_seconds":60,"retention_duration_seconds":600,"compression":"LZ4","timestamp_policy":"RECEIVE"},"paused_reasons":["USER"],"elapsed_wall_seconds":307.2,"elapsed_active_seconds":300.1,"paused_total_seconds":7.1,"last_error":null,"secondary_errors":[]},"topics":[],"topics_removed_recent":[],"topics_removed_total":"0","queue":{"used_messages":0,"max_messages":65536,"used_bytes":"0","max_bytes":"67108864"},"pool":{"fixed_capacity":81920,"in_use":0,"fallback_in_use":0,"allocation_failures":"0"},"cleanup":{"cleanup_queue_depth":0,"cleanup_pending_total":0,"cleanup_queue_full_count":"0","active_segment_id":null,"last_error":null},"disk":{"state":"NORMAL","sampled_at":"2026-10-25T10:11:14.345Z","valid":true,"available_bytes":"10485760000","used_percent":35.2,"failure_count":0},"process":{"sampled_at":"2026-10-25T10:11:14.345Z","valid":false,"cpu_percent_single_core":null,"rss_bytes":null,"thread_count":null,"fd_count":null}}}
+data: {"api_version":"1.0","state":{"runtime_instance_id":"9815222c-f39d-4d45-8d1a-bc7f68e75af6","state_revision":"88","observed_at":"2026-10-25T10:11:20.345Z","sample_validity":"CURRENT","recorder":{"state":"PAUSED","recording_id":"run_001","recording_generation":"12","effective_config":{"mode":"ROLLING","duration_seconds":null,"segment_duration_seconds":60,"retention_duration_seconds":600,"compression":"LZ4","timestamp_policy":"RECEIVE"},"paused_reasons":["USER"],"elapsed_wall_seconds":307.2,"elapsed_active_seconds":300.1,"paused_total_seconds":7.1,"last_error":null,"secondary_errors":[]},"topics":[],"topics_removed_recent":[],"topics_removed_total":"0","queue":{"used_messages":0,"max_messages":65536,"used_bytes":"0","max_bytes":"67108864"},"pool":{"fixed_capacity":81920,"in_use":0,"allocation_failures":"0"},"cleanup":{"cleanup_queue_depth":0,"cleanup_pending_total":0,"cleanup_queue_full_count":"0","active_segment_id":null,"active_for_seconds":null,"warning_active":false,"total_removed":"0","last_error":null},"disk":{"state":"NORMAL","sampled_at":"2026-10-25T10:11:14.345Z","valid":true,"available_bytes":"10485760000","used_percent":35.2,"failure_count":0},"process":{"sampled_at":"2026-10-25T10:11:14.345Z","valid":false,"cpu_percent_single_core":null,"rss_bytes":null,"thread_count":null,"fd_count":null}}}
 
 ```
 
@@ -1015,7 +1024,7 @@ Server/Client 不应再各自解释相同字段。以下事项属于**已定语�
 |---|---|---|
 | 外部变更执行队列 | `server.md` | 串行化范围、容量、Admission/执行竞态、等待/关闭预算与线程不自等待 |
 | Topic operation 证据 | `recorder.md` + `server.md` | **当前设计：**Recorder 提供 `lookup_topic_operation(recording_id, operation_id)` 或等价的只读领域能力（§1.3/§2.4），统一 Event/Recovery 语义及 fsync 失败窗口；Server 仅负责鉴权、有界查询调度与 Protocol 映射，不解析 JSONL。**该 API 的 C++ 实现及其故障注入验证是发布验收前必须关闭的实施项**，设计规范不代表它已实现 |
-| Runtime Shutdown | `server.md` | 有限等待与 DRAIN_TIMEOUT、Writer/Executor/Object 生命周期、受控异常退出 |
+| Runtime Shutdown | `server.md` | Completion-based 有限等待、Writer/Executor/Object 生命周期、UNSAFE_TO_DESTROY 与受控异常退出 |
 | 状态协调器 | `server.md` | `PublishedState`、采样周期、Revision 递增规则、合并、GET/SSE 同一对象来源；**量化**样本新鲜度预算、状态采样/发布周期、同 revision 全量刷新时机、单连接/全局带宽、全量帧大小与排队/传输延迟；无可信完整旧样本时不允许凭空构造 STALE |
 | SSE 实施预算 | `server.md` | 连接数/每连接字节与事件上限、慢发送检测、Streaming 隐性缓冲、清理 |
 | Client SDK | `client.md` | HTTPX 同步/异步调用、状态新鲜度、UNKNOWN、Evidence Lookup、异常与取消语义 |

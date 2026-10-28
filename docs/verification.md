@@ -2,7 +2,7 @@
 
 | 属性 | 内容 |
 |---|---|
-| 版本 | v0.1.2 |
+| 版本 | v0.1.3 |
 | 状态 | **DRAFT — 验证规格仍可调整，实际测试未执行** |
 | 依据 | requirements.md 的 AC-01～27，以及本文件 V-* 场景；recorder/protocol/server/client 当前开发稿 |
 | 适用 | Recorder、Runtime/Server、Protocol、Python Client、CLI/TUI/Web、MCAP 分析端 |
@@ -111,23 +111,25 @@ MCAP 的录制端与分析端两维 2×2（H→H、H→J、J→H、J→J）独�
 | V-REC-TOPIC-02 | 已注册 Channel 但 subscription 失败，PREPARED 终态 fsync 故障 | 不开放 ingress、终态不可信时 UNCERTAIN，Event 身份可信 | AC-03/09/11 |
 | V-REC-TOPIC-03 | 3000 次 Add/Remove，同名再加与跨 Stop | Epoch 独立；按秒 RSS/FD/线程/Schema/Channel/TopicEvent 统计，无无界资源增长 | AC-03/16 |
 | V-REC-TOPIC-04 | Task 内先 Add `/x` 类型/Schema A→Remove→同名 Add 类型 B；另测同类型名但完整 Schema SHA-256 改变；对照同签名 A 的合法重加 | B/Schema 变化在 TOPIC_ADD_PREPARED、Writer register、Subscription create 前拒绝；同签名重加产生新 Epoch 且数据不串代 | AC-03/06 |
+| V-REC-TOPIC-05 | Graph 同名多类型、70 个 Publisher endpoint、profile 截断与 Auto QoS 并列 candidate | DiscoveredTopic.types 保留稳定去重集合；publisher_count 为真实观测数；profiles 最多 64 且 truncated=true；相同 Graph/default 得到稳定 Auto candidate | AC-02/22 |
 | V-REC-MODE-01 | Normal、Timed 到期、Paused 仍计时、Stop 重入 | 不错误延长 Timed，Stop 完成包含 Writer/Manifest | AC-04 |
 | V-REC-MODE-02 | Rolling 空流、全部 Topic 删除、Pause 无消息、空段打开后 Stop | 不持续创建无界空段，首消息合法建段，Manifest 与真实文件匹配 | AC-04/05 |
 | V-REC-MODE-03 | Snapshot 达单 Topic/全局上限、Rolling 恰好边界、Writer Replay 失败 | 双预算/驱逐一致；Replay 计数独立，失败不伪报 Live 写入 | AC-05/07/10 |
 | V-REC-RETENTION-01 | COMPLETE Segment 后系统 UTC 前跳 24h/回跳 24h；进程重启分别发生在 COMPLETE 未授权与 durable DELETING 两种状态 | 墙钟变化不改变删除授权；同进程只按 steady age；重启后 COMPLETE 重新计满完整 retention，DELETING 直接幂等续删 | AC-05/09 |
 | V-REC-HISTORY-01 | Rolling 产生超过 `history.max_segment_records_per_task` 的 Segment，大量最老 Segment 已 REMOVED；另造无可压缩 REMOVED 前缀的满容量状态 | 仅 durable REMOVED 连续前缀被汇总；segment_limit/offset 分页有界且 summary 计数守恒；无法安全压缩时不创建下一 Segment并进入明确容量失败 | AC-05/23 |
 | V-REC-DISK-01 | 首次 statvfs 失败、连续失败、样本超过有效年龄、阻塞、CRITICAL、恢复、USER Pause | 起始 UNKNOWN 不允许 Start，系统恢复不解除 USER Pause；Recorder 热锁不等待 statvfs | AC-08 |
-| V-REC-CLEAN-01 | Cleanup 删除接口注入 35s、队列满、CleanupWorker 2s 退避唤醒与 DELETING 重启 | 不阻塞 Coordinator/ROS Executor、不新增线程/Timer；durable pending 不丢，Worker 退避后安全重新 claim，不重复删除，不误删 INCOMPLETE | AC-05/09/10 |
+| V-REC-CLEAN-01 | Cleanup 删除接口注入 35s、队列满、Cleanup worker 2s 退避唤醒与 DELETING 重启 | 不阻塞 Recorder 串行 mutation 域/ROS Executor、不新增 heartbeat/watchdog；durable pending 不丢，State.active_for 动态增长，Worker 退避后安全重新 claim，不重复删除，不误删 INCOMPLETE | AC-05/09/10/17 |
 | V-REC-RECOVERY-01 | ≥10 次约 30s 录制后 SIGKILL/重启/读回 | 保存发布/接收/录入序号、丢失窗口、Manifest/Event/Recovery，未知不宣称 COMPLETE | AC-09/16/17 |
-| V-REC-STOP-01 | Writer、Cleanup remove_all 或 ResourceMonitor statvfs 永久阻塞；Runtime 重复信号 | request_shutdown O(1) 返回 Handle；Runtime deadline 仍运行并进入 UNSAFE_TO_DESTROY；不 detach、不进入 Recorder destructor、不假 STOPPED/COMPLETE | AC-17 |
-| V-REC-TIMER-01 | Humble/Jazzy 单 Executor Worker：Rolling Timer 命中时人为阻塞 Writer.Close；并行 Topic 10×1000Hz；Timed Stop/外部 Stop 竞争同一 Task | Timer 只发布 O(1) 事件，ROS callback 不同步等待 Writer/Executor；内部 Sequencer 有界去重、Stop 唯一所有者，不出现活锁、UAF、双 Close、错误重开 ingress | AC-03/04/07/16/17 |
+| V-REC-STOP-01 | Writer、Cleanup remove_all 或 ResourceMonitor statvfs 永久阻塞；Runtime 重复信号 | shutdown() O(1) 返回 Completion<void>；Runtime deadline 仍运行并进入 UNSAFE_TO_DESTROY；不 detach、不进入 Recorder destructor、不假 STOPPED/COMPLETE | AC-17 |
+| V-REC-TIMER-01 | Humble/Jazzy 单 Executor Worker：Recorder steady `wait_until` 命中 Rolling/Timed deadline 时人为阻塞 Writer.Close；并行 Topic 10×1000Hz；Timed Stop/外部 Stop 竞争同一 Task | Producer hard deadline 不因 scheduler/Writer 延迟扩大；Recorder 串行 mutation loop 有界合并内部事件，ROS callback 不同步等待 Writer/Executor；Stop 唯一所有者，不出现活锁、UAF、双 Close、错误重开 ingress | AC-03/04/07/16/17 |
 | V-REC-TIMER-02 | 1000 个空 Rolling 周期、1000 个 Pause 周期、首次 Live 消息在长期空闲后、Replay-only Segment | 最多一个空物理 Writer，`segments[]` 只包含真实打开文件且 segment_id/path 从 0 同号、严格连续；首次 Live 合法写入且归属正确，重放不触发无限空段 | AC-04/05/10 |
-| V-REC-SEQ-01 | 外部 Stop 已排队但尚未 Sequencer claim，同时内部 TimedStop/WriterFailure/Shutdown 注入 | RecorderControlSequencer 给出唯一合法顺序；系统安全事件不因外部队列满丢失；Writer Close/Finalize 至多一个所有者 | AC-03/04/17 |
-| V-REC-EXEC-01 | ExecutorCall 分别在 PENDING、CAS STARTED 后、Subscription 已创建后制造等待超时；随后 Stop/Shutdown | 仅 PENDING 可取消为未执行；STARTED 必须继续到 DONE并保留 Lease；Stop 不释放 Topic/Queue/Node 造成迟到 UAF | AC-03/17 |
-| V-REC-EVENT-01 | 两个外部 Topic 操作误用相同 UUID；随后 Stop 自动移除多个 Topic | 外部复用产生 CONFLICT/UNCERTAIN；内部移除 origin=INTERNAL、operation_id=null，不污染 Topic Evidence | AC-03/11/14 |
-| V-REC-START-01 | 任务目录预先存在、两个 Start 同时请求、首个 statvfs 永久阻塞 | 目录不被复用/覆盖；最多一个 Start 取得启动权；Start 有界返回 DISK_STATE_UNKNOWN，Recorder Control/ROS Executor 不执行 statvfs | AC-04/08/17 |
+| V-REC-SEQ-01 | 外部 Stop 已提交但 Recorder 串行 mutation 域尚未 claim，同时内部 TimedStop/WriterFailure/Shutdown 注入 | Recorder 串行 mutation 域给出唯一合法线性化顺序；系统安全事件不因外部 admission 队列满丢失；Writer Close/Finalize 至多一个所有者 | AC-03/04/17 |
+| V-REC-EXEC-01 | Recorder→ROS Executor 的内部 operation 分别在 not-started、started 后、Subscription 已创建后制造等待超时；随后 Stop/Shutdown | 仅 PENDING 可取消为未执行；STARTED 必须继续到 DONE并保留 Lease；Stop 不释放 Topic/Queue/Node 造成迟到 UAF | AC-03/17 |
+| V-REC-EVENT-01 | 两个外部 Topic 操作误用相同 UUID；随后 Stop 自动移除多个 Topic | 外部复用不选择“最近一次”终态，Evidence 返回 UNCERTAIN/冲突诊断；内部移除 origin=INTERNAL、operation_id=null，不污染 Topic Evidence | AC-03/11/14 |
+| V-REC-START-01 | 任务目录预先存在、两个 Start 同时请求、INITIALIZING Manifest 成功/失败/dir-fsync uncertainty、首个磁盘采样不可用 | 目录不被复用/覆盖；最多一个 Start 取得启动权；可观察 Idle→Initializing→Recording；durable 前失败保持 Idle，durability uncertain 进入 Failed/persistence poison 并保留目录供 Recovery；磁盘证据不足返回 DiskUnknown | AC-04/08/09/17 |
 | V-REC-CONFIG-01 | Runtime 配置为 LZ4/rolling 默认 60/600；启动后篡改全局 YAML；依次 Start NORMAL/TIMED/ROLLING | 当前 Runtime 不受文件变化影响；StartCommand mode 正确覆盖任务模式，ROLLING 缺省取 60/600；Manifest/Status/StartResult effective_config 完全一致；重启后才加载新 RuntimeConfig | AC-04/05/25 |
 | V-REC-PAUSE-01 | `auto_resume=false`：DISK_CRITICAL 后用户 Pause，磁盘安全稳定；再直接 Resume。另测 `auto_resume=true` 的纯系统暂停 | 危险解除后 false 路径为 USER+DISK_RECOVERY_PENDING；一次 Resume 在新鲜安全复核后清 USER/PENDING 并恢复；true 路径仅在无 USER 时自动恢复 | AC-04/08/13 |
+| V-REC-PAUSE-02 | Resume 与 Timed deadline、DiskCritical/DiskUnknown、shutdown_requested 在串行域线性化点竞争 | Timed/Shutdown 先赢返回 InvalidState/None；Disk 恶化按是否已清 USER 返回 None 或 ConfirmedPartial；Success 时 PauseState empty + Recording + gate OPEN 原子可见 | AC-04/08/11 |
 | V-REC-CLEAN-02 | Task A 仍有持久 DELETING pending 时 Stop A/Start B；旧项失败+Worker 2s Retry+Shutdown/重启 | 旧任务目录不被新任务字段替换，Claim 按 Task/Segment/Manifest 身份去重，不跨根目录，Writer/SSE 不等待删除，Shutdown 不释放仍在用的 Lease | AC-05/09/17 |
 
 
@@ -172,7 +174,7 @@ sample_c/msg/Outer.msg
 | V-REC-GUARD-02 | 两个 Start 竞争，同时存在 Timed Stop | 至多一个 Start 获取领域启动权；非法/已存在 recording_id 无副作用拒绝；不能覆盖原 Task/目录 |
 | V-REC-GUARD-03 | Topic Remove 的旧 Epoch 与同名重新加入的新 Epoch 交错 | 旧 Remove 不可销毁新订阅 |
 | V-REC-TIME-01 | ROS use_sim_time 暂停/回跳，业务 Header.stamp 不等于接收时刻 | RECEIVE 仍取 Unix 系统时间；MCAP log_time=publish_time；Timed/Rolling 用 steady clock |
-| V-REC-TIME-02 | Timed deadline 前人为阻塞/延迟 ROS Timer/Executor 5 s，Subscription Producer 仍持续执行；另让 Sequencer 忙于其他 Native 等待 | 每个 `try_enter(now)` 自己检查不可变 steady deadline；deadline 后新 Producer 均拒绝，不依赖 Timer callback 已运行；deadline 前已准入消息可 Drain，最终 Stop 可延迟 | AC-04/17 |
+| V-REC-TIME-02 | Timed deadline 前人为阻塞/延迟 Recorder steady deadline scheduler/Executor 5 s，Subscription Producer 仍持续执行；另让 Recorder 串行 mutation 域忙于其他 Native 等待 | 每个 `try_enter(now)` 自己检查不可变 steady deadline；deadline 后新 Producer 均拒绝，不依赖 scheduler 已运行；deadline 前已准入消息可 Drain，最终 Stop 可延迟 | AC-04/17 |
 | V-REC-PAUSE-02 | USER Pause 与 DISK_CRITICAL 以两种顺序交错；磁盘安全稳定后再 Resume | 原因集合不互相覆盖；USER 不被系统恢复清除；auto_resume=false 将解除的磁盘原因转成 DISK_RECOVERY_PENDING；一次 Resume 清 USER/PENDING 后才可重开 ingress | AC-04/08 |
 | V-REC-PAUSE-03 | 仅 DISK_UNKNOWN 导致 PAUSED：危险仍活动时直接 Resume；随后安全稳定进入 PENDING 再直接 Resume；已有 USER 时重复 Pause | 活动危险时 `DISK_UNSAFE/effects:NONE`；安全 pending 后一次 Resume SUCCESS 并恢复；重复 USER Pause 为 ALREADY_PAUSED/effects:NONE | AC-04/08 |
 | V-STATE-01 | 同 revision 的完整 SSE 状态先后具有较新/较旧 observed_at，或偷偷改变业务值 | 有效新采样刷新 observed_at，不回退时间；业务值变动必须增加 revision |
@@ -193,7 +195,7 @@ sample_c/msg/Outer.msg
 | rename 后、目录 fsync 前失败 | 新旧版本究竟 durable 未知；不能向调用者报 COMPLETE | old/new 版本校验和与诊断 |
 | Topic ADD PREPARED fsync 前失败 | 副作用必须在安全序列中禁止或保留不可信证据 | Event tail/operation_id |
 | Topic PREPARED 已 durable，Writer 注册后但 ADDED 未提交 | UNCERTAIN；Channel 可存在但 Client 不可误认请求成功 | Event+MCAP Channel+Reader |
-| TOPIC_ADDED 行可读但终态 fsync 失败 | 进程内已知失败时 Event Evidence 不可报告 CONFIRMED_SUCCESS | Event/Coordinator fsync injection result |
+| TOPIC_ADDED 行可读但终态 fsync 失败 | 进程内已知失败时 Event Evidence 不可报告 CONFIRMED_SUCCESS | Topic Event fsync injection result + Recorder mutation result |
 | Writer Close、MCAP/metadata/目录同步均成功，但 Manifest COMPLETE 提交失败 | 仍不能宣称 Recording Task COMPLETE；数据可 durable/readable 也不替代任务终态 | Writer log/data sync log/manifest/recovery |
 | Segment durable DELETING、删除前 SIGKILL | Recovery 保留删除意图，安全重试完整 Segment 删除 | Segment/Manifest SHA |
 | 删除系统调用已完成，REMOVED durable 前 SIGKILL | 再次恢复是幂等删除，不能把不存在目标误当损坏/删错文件 | 容器/目录差分 |
@@ -209,8 +211,8 @@ sample_c/msg/Outer.msg
 |---|---|---|---|
 | V-SRV-01 | 控制 32 排队满、Control Worker Native 阻塞 | 429 受理前拒绝；503 已排队但确定未开始；504 已可能进入且结果未知 | AC-11/12 |
 | V-SRV-02 | Stop HTTP 超时同时 Timed Stop→IDLE 或 Disk Pause→PAUSED | 两种终态均不归因为该请求，UNKNOWN 保留 | AC-11 |
-| V-SRV-HANDLE-01 | Recorder `stop()` 立即返回未 DONE ControlHandle；HTTP 30s deadline 先到，领域在 35s DONE；其间第二个外部 Resume/Start 已排队 | 30s 可发 504 UNKNOWN 并释放 ResponseSink，但唯一外部 mutation 槽继续被首 Handle 占用；第二请求不进入 Recorder；35s DONE 后才推进下一项，无 UAF/双完成 | AC-11/12/17 |
-| V-SRV-MAP-01 | 参数化遍历 RecorderErrorCode 与 Server admission/timeout 原因 | 每项恰好匹配 Protocol §4.2.1 的 HTTP/ErrorCode/outcome/effects；新增未映射枚举使契约测试失败；Recorder DRAIN_TIMEOUT=明确 FAILURE，只有 Handle 未 DONE 才 504 UNKNOWN | AC-11/12 |
+| V-SRV-COMPLETION-01 | Recorder `stop()` 立即返回未 DONE `Completion<void>`；HTTP 30s deadline 先到，领域在 35s DONE；其间第二个外部 Resume/Start 已排队 | 30s 可发 504 UNKNOWN 并释放 ResponseSink，但唯一外部 mutation 槽继续被首 Completion 占用；第二请求不进入 Recorder；35s DONE 后才推进下一项，无 UAF/双完成 | AC-11/12/17 |
+| V-SRV-MAP-01 | 参数化遍历 `recorder::ErrorCode` 全部枚举与 Server admission/timeout 原因 | `RecordingExists/StaleRecording/StaleTopicEpoch/TopicTypeConflict/AlreadyPaused/DrainTimeout` 等每项恰好匹配 Protocol §4.2.1 的 HTTP/ErrorCode/outcome/effects；新增未映射枚举使契约测试失败；只有 Completion 未 DONE/可信回执丢失才 504 UNKNOWN | AC-11/12 |
 | V-SRV-03 | Topic PREPARED/ADDED fsync 故障、Topic Evidence 精确查询 | 只在 ID+Topic+可信持久证据一致时 CONFIRMED，UNCERTAIN/NOT_FOUND 不自动 POST | AC-11/14 |
 | V-SRV-EVIDENCE-RESTART | 终态已写但 fsync 返回失败；先在同进程 GET，然后控制进程退出/重启后按真实幸存文件分别测试完整终态、截断尾行和冲突终态 | 进程内已知失败返回 UNCERTAIN；重启后真实完整可信事件可确认**现存领域终态**但不伪造原同步 fsync 成功/HTTP SUCCESS；坏记录 UNCERTAIN | AC-09/11/14 |
 | V-SRV-04 | Status Revision 竞争、注册→采样→首帧、同 Revision 新 observed_at | GET/SSE 单源，完整基线先到、STALE/恢复的新 Revision 正确 | AC-13 |
