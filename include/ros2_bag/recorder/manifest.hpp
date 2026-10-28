@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "ros2_bag/result.hpp"
@@ -27,13 +28,19 @@ public:
         ManifestData data);
     static Result<Manifest, Error> load(const std::filesystem::path& task_directory);
 
-    const ManifestData& data() const noexcept { return data_; }
-    const std::filesystem::path& task_directory() const noexcept { return task_directory_; }
+    const ManifestData& data() const noexcept;
+    const std::filesystem::path& task_directory() const noexcept;
     Result<void, Error> commit(ManifestData data);
 
 private:
-    Manifest(std::filesystem::path task_directory, ManifestData data)
-    : task_directory_(std::move(task_directory)), data_(std::move(data)) {}
+    Manifest(std::filesystem::path task_directory, ManifestData data);
+
+    static std::string sanitize_error_message(std::string message);
+    static std::string serialize(const ManifestData& data);
+    static Result<ManifestData, Error> deserialize(std::string_view content);
+    static Result<void, Error> write_durable(
+        const std::filesystem::path& path,
+        std::string_view content);
 
     std::filesystem::path task_directory_;
     ManifestData data_;

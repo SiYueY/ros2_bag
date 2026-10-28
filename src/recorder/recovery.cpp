@@ -17,11 +17,6 @@
 namespace ros2_bag::recorder {
 namespace {
 
-bool terminal(TaskState state) {
-    return state == TaskState::Completed || state == TaskState::Failed ||
-           state == TaskState::Incomplete;
-}
-
 Error storage_error(std::string message) {
     return {ErrorCode::StorageError, Effects::None, std::move(message)};
 }
@@ -42,7 +37,9 @@ bool write_all(const int file, const char* bytes, std::size_t remaining) {
     return true;
 }
 
-Result<void, Error> write_recovery_evidence(
+}  // namespace
+
+Result<void, Error> Recovery::write_evidence(
     const std::filesystem::path& directory,
     const std::string& recording_id,
     const std::vector<RecoveryFinding>& findings) {
@@ -87,7 +84,7 @@ Result<void, Error> write_recovery_evidence(
     return Result<void, Error>();
 }
 
-bool safe_relative_path(const std::string& path) {
+bool Recovery::safe_relative_path(const std::string& path) {
     const std::filesystem::path value(path);
     if (value.empty() || value.is_absolute()) {
         return false;
@@ -100,22 +97,25 @@ bool safe_relative_path(const std::string& path) {
     return true;
 }
 
-}  // namespace
-
 Result<RecoveryReport, Error> Recovery::run(const std::filesystem::path& output_root) {
     RecoveryReport report;
     std::map<std::string, std::filesystem::path> task_directories;
     std::error_code filesystem_error;
-    if (!std::filesystem::exists(output_root, filesystem_error))
+    if (!std::filesystem::exists(output_root, filesystem_error)) {
         return Result<RecoveryReport, Error>(std::move(report));
-    if (filesystem_error)
+    }
+    if (filesystem_error) {
         return Result<RecoveryReport, Error>(unexpect, storage_error(filesystem_error.message()));
+    }
     for (const auto& entry : std::filesystem::directory_iterator(output_root, filesystem_error)) {
-        if (filesystem_error)
+        if (filesystem_error) {
             return Result<RecoveryReport, Error>(
                 unexpect,
                 storage_error(filesystem_error.message()));
-        if (!entry.is_directory() || entry.is_symlink()) continue;
+        }
+        if (!entry.is_directory() || entry.is_symlink()) {
+            continue;
+        }
         const auto loaded = Manifest::load(entry.path());
         if (!loaded) {
             report.findings.push_back(
@@ -190,7 +190,10 @@ Result<RecoveryReport, Error> Recovery::run(const std::filesystem::path& output_
             }
         }
         const auto& current = manifest.data();
-        if (terminal(current.task.state)) continue;
+        if (current.task.state == TaskState::Completed || current.task.state == TaskState::Failed ||
+            current.task.state == TaskState::Incomplete) {
+            continue;
+        }
         if (current.manifest_revision == std::numeric_limits<std::uint64_t>::max()) {
             report.findings.push_back(
                 {data.task.recording_id, "manifest_revision_exhausted", "manifest is read-only"});
@@ -217,12 +220,13 @@ Result<RecoveryReport, Error> Recovery::run(const std::filesystem::path& output_
                  committed.error().message});
             continue;
         }
+        std::string finding_message = "recovery did not resume prior recording";
+        if (invalid_segment_path) {
+            finding_message =
+                "recovery did not resume prior recording; invalid segment path retained";
+        }
         report.findings.push_back(
-            {incomplete.task.recording_id,
-             "task_marked_incomplete",
-             invalid_segment_path
-                 ? "recovery did not resume prior recording; invalid segment path retained"
-                 : "recovery did not resume prior recording"});
+            {incomplete.task.recording_id, "task_marked_incomplete", std::move(finding_message)});
     }
     for (const auto& entry : task_directories) {
         std::vector<RecoveryFinding> findings;
@@ -234,7 +238,7 @@ Result<RecoveryReport, Error> Recovery::run(const std::filesystem::path& output_
         if (findings.empty()) {
             continue;
         }
-        const auto persisted = write_recovery_evidence(entry.second, entry.first, findings);
+        const auto persisted = write_evidence(entry.second, entry.first, findings);
         if (!persisted) {
             report.findings.push_back(
                 {entry.first, "recovery_evidence_write_failed", persisted.error().message});

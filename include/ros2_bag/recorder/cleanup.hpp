@@ -13,6 +13,7 @@
 #include <string>
 #include <thread>
 
+#include "ros2_bag/result.hpp"
 #include "ros2_bag/recorder/error.hpp"
 #include "ros2_bag/recorder/state.hpp"
 
@@ -27,7 +28,7 @@ struct DeleteWork {
 
 struct DeleteResult {
     DeleteWork work;
-    std::optional<Error> error;
+    Result<void, Error> result;
 };
 
 class Cleanup {
@@ -48,6 +49,11 @@ public:
     CleanupState state() const;
 
 private:
+    struct Active {
+        DeleteWork work;
+        std::chrono::steady_clock::time_point since;
+    };
+
     void run();
 
     const std::size_t queue_capacity_;
@@ -57,10 +63,9 @@ private:
     std::condition_variable condition_;
     std::queue<DeleteWork> queue_;
     bool stopping_ = false;
-    std::optional<DeleteWork> active_;
-    std::optional<std::chrono::steady_clock::time_point> active_since_;
-    std::uint64_t queue_full_count_ = 0;
-    std::uint64_t total_removed_ = 0;
+    std::optional<Active> active_;
+    std::uint64_t queue_full_ = 0;
+    std::uint64_t removed_ = 0;
     std::optional<Error> last_error_;
     std::thread thread_;
 };

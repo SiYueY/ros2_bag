@@ -35,12 +35,8 @@ struct Error {
     std::string message;
 };
 
-inline bool operator==(const Error& left, const Error& right) {
-    return left.code == right.code && left.effects == right.effects &&
-           left.message == right.message;
-}
-
-inline bool operator!=(const Error& left, const Error& right) { return !(left == right); }
+bool operator==(const Error& left, const Error& right);
+bool operator!=(const Error& left, const Error& right);
 
 }  // namespace ros2_bag::recorder
 

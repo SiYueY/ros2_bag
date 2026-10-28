@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <variant>
 #include <vector>
 
 #include "ros2_bag/result.hpp"
@@ -14,29 +15,37 @@ namespace ros2_bag::recorder {
 using TopicId = std::uint64_t;
 using OperationId = std::string;
 
-enum class QosMode { Auto, Explicit };
+inline constexpr std::uint32_t kMaxQosDepth = 10000;
+
 enum class Reliability { Reliable, BestEffort };
 enum class Durability { Volatile, TransientLocal };
 enum class History { KeepLast, KeepAll };
 
 struct QosOptions {
-    QosMode mode = QosMode::Auto;
-    std::optional<Reliability> reliability;
-    std::optional<Durability> durability;
-    std::optional<History> history;
-    std::optional<std::uint32_t> depth;
+    struct Auto {};
+
+    struct Explicit {
+        Reliability reliability = Reliability::Reliable;
+        Durability durability = Durability::Volatile;
+        History history = History::KeepLast;
+        std::uint32_t depth = 10;
+    };
+
+    using Mode = std::variant<Auto, Explicit>;
+
+    Mode mode = Auto{};
 };
 
 struct QosSelection {
     QosOptions qos;
-    std::size_t compatible_publisher_count = 0;
-    bool all_publishers_compatible = true;
+    std::size_t compatible_publishers = 0;
+    bool all_compatible = true;
 };
 
 struct TopicOptions {
     std::string name;
     std::string type;
-    std::optional<QosOptions> qos;
+    QosOptions qos;
     std::optional<double> expected_hz;
 };
 
@@ -54,21 +63,25 @@ struct TopicInfo {
 enum class TopicRecordability { Recordable, TypeConflict, TypeUnavailable, QosIncompatible };
 
 struct DiscoveredTopic {
+    struct Publishers {
+        std::size_t count = 0;
+        std::vector<QosOptions> profiles;
+        bool truncated = false;
+    };
+
     std::string name;
     std::vector<std::string> types;
-    std::size_t publisher_count = 0;
     TopicRecordability recordability = TopicRecordability::Recordable;
-    std::vector<QosOptions> publisher_qos_profiles;
-    bool publisher_qos_profiles_truncated = false;
+    Publishers publishers;
 };
 
-Result<QosOptions, Error> normalize_qos(const std::optional<QosOptions>& options);
+Result<QosOptions, Error> normalize_qos(const QosOptions& options);
 bool qos_compatible(const QosOptions& publisher, const QosOptions& subscription) noexcept;
 Result<QosSelection, Error> select_qos(
-    const std::optional<QosOptions>& options,
+    const QosOptions& options,
     const std::vector<QosOptions>& publisher_profiles,
     std::size_t publisher_count,
-    bool publisher_profiles_truncated);
+    bool profiles_truncated);
 Result<void, Error> validate_topic_options(const TopicOptions& options);
 
 }  // namespace ros2_bag::recorder

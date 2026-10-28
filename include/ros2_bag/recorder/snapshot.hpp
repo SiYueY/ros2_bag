@@ -29,7 +29,7 @@ public:
         std::chrono::steady_clock::time_point now);
     std::vector<RecordedMessage> replay_for(std::uint64_t generation) const;
     void erase_topic(TopicId topic_id, std::uint64_t topic_epoch);
-    std::size_t total_bytes() const noexcept { return total_bytes_; }
+    std::size_t total_bytes() const noexcept;
 
 private:
     struct Entry {

@@ -5,6 +5,8 @@
 
 namespace ros2_bag::recorder {
 
+MessagePool::Node::Node(std::size_t index) : index(index) {}
+
 MessagePool::MessagePool(std::size_t capacity) {
     if (capacity == 0) {
         throw std::invalid_argument("MessagePool capacity must be positive");

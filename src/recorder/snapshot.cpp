@@ -71,10 +71,16 @@ void Snapshot::enforce_topic(TopicEntries& entries, std::chrono::steady_clock::t
     for (const auto& entry : entries) {
         bytes += entry.message.payload_bytes;
     }
-    while (!entries.empty() &&
-           (entries.size() > config_.max_messages_per_topic ||
-            bytes > config_.max_bytes_per_topic ||
-            (config_.max_age && now - entries.front().inserted_at > *config_.max_age))) {
+    while (!entries.empty()) {
+        const bool too_many_messages = entries.size() > config_.max_messages_per_topic;
+        const bool too_many_bytes = bytes > config_.max_bytes_per_topic;
+        bool too_old = false;
+        if (config_.max_age) {
+            too_old = now - entries.front().inserted_at > *config_.max_age;
+        }
+        if (!too_many_messages && !too_many_bytes && !too_old) {
+            break;
+        }
         bytes -= entries.front().message.payload_bytes;
         total_bytes_ -= entries.front().message.payload_bytes;
         entries.pop_front();
@@ -103,6 +109,8 @@ void Snapshot::enforce_total() {
         }
     }
 }
+
+std::size_t Snapshot::total_bytes() const noexcept { return total_bytes_; }
 
 void Snapshot::erase_entry(TopicEntries& entries, TopicEntries::iterator entry) {
     total_bytes_ -= entry->message.payload_bytes;

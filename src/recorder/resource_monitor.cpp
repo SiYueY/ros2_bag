@@ -8,22 +8,6 @@
 #include <utility>
 
 namespace ros2_bag::recorder {
-namespace {
-
-std::int64_t steady_now_ns() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
-
-std::int64_t system_now_ns() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-
-}  // namespace
-
 void DiskAdmissionState::publish(
     DiskSafetyState state,
     std::int64_t valid_until_steady_ns) noexcept {
@@ -37,12 +21,16 @@ std::optional<DiskAdmissionSnapshot> DiskAdmissionState::read(
     std::uint32_t maximum_retries) const noexcept {
     for (std::uint32_t attempt = 0; attempt < maximum_retries; ++attempt) {
         const auto first = sequence_.load(std::memory_order_acquire);
-        if ((first & 1U) != 0U) continue;
+        if ((first & 1U) != 0U) {
+            continue;
+        }
         const DiskAdmissionSnapshot snapshot{
             state_.load(std::memory_order_relaxed),
             valid_until_steady_ns_.load(std::memory_order_relaxed)};
         const auto second = sequence_.load(std::memory_order_acquire);
-        if (first == second && (second & 1U) == 0U) return snapshot;
+        if (first == second && (second & 1U) == 0U) {
+            return snapshot;
+        }
     }
     return std::nullopt;
 }
@@ -58,7 +46,9 @@ ResourceMonitor::ResourceMonitor(
 
 ResourceMonitor::~ResourceMonitor() {
     stop();
-    if (thread_.joinable()) thread_.join();
+    if (thread_.joinable()) {
+        thread_.join();
+    }
 }
 
 void ResourceMonitor::stop() {
@@ -69,13 +59,15 @@ void ResourceMonitor::stop() {
 void ResourceMonitor::run() {
     while (!stopping_.load()) {
         const auto value = sample();
-        if (value.valid || value.consecutive_failures >= config_.failure_threshold) {
-            const auto valid_until =
-                value.valid
-                    ? steady_now_ns() +
-                          std::chrono::duration_cast<std::chrono::nanoseconds>(config_.max_age)
-                              .count()
-                    : steady_now_ns();
+        if (value.state != DiskSafetyState::Unknown ||
+            value.consecutive_failures >= config_.failure_threshold) {
+            auto valid_until = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count();
+            if (value.state != DiskSafetyState::Unknown) {
+                valid_until +=
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(config_.max_age).count();
+            }
             admission_.publish(value.state, valid_until);
         }
         try {
@@ -89,7 +81,9 @@ void ResourceMonitor::run() {
 
 DiskSample ResourceMonitor::sample() {
     DiskSample result;
-    result.sampled_at_ns = system_now_ns();
+    result.sampled_at_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
     struct statvfs filesystem {};
     if (::statvfs(config_.path.c_str(), &filesystem) != 0 || filesystem.f_blocks == 0) {
         ++consecutive_failures_;
@@ -99,7 +93,6 @@ DiskSample ResourceMonitor::sample() {
     }
     consecutive_failures_ = 0;
     result.consecutive_failures = 0;
-    result.valid = true;
     result.available_bytes = static_cast<std::uint64_t>(filesystem.f_bavail) * filesystem.f_frsize;
     const auto used_blocks = filesystem.f_blocks - filesystem.f_bavail;
     result.used_percent =

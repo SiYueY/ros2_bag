@@ -31,7 +31,7 @@ private:
     enum class Lifecycle { Running, Stopping, Stopped };
 
     struct Node {
-        explicit Node(std::size_t index) : index(index) {}
+        explicit Node(std::size_t index);
         std::size_t index;
         rclcpp::SerializedMessage message;
         bool in_use = false;

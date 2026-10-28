@@ -11,14 +11,17 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 include(CTest)
 
 find_package(rclcpp QUIET)
-find_package(rosbag2_cpp QUIET)
+find_package(rosbag2_storage QUIET)
+find_package(rosbag2_storage_mcap QUIET)
 find_package(ament_index_cpp QUIET)
 find_package(mcap_vendor QUIET)
 find_package(OpenSSL REQUIRED)
 
-if(rclcpp_FOUND AND rosbag2_cpp_FOUND AND ament_index_cpp_FOUND AND mcap_vendor_FOUND)
+if(rclcpp_FOUND AND rosbag2_storage_FOUND AND rosbag2_storage_mcap_FOUND AND ament_index_cpp_FOUND AND mcap_vendor_FOUND)
   add_library(ros2_bag_recorder
     src/recorder/config.cpp
+    src/recorder/completion.cpp
+    src/recorder/error.cpp
     src/recorder/message_pool.cpp
     src/recorder/message_queue.cpp
     src/recorder/resource_monitor.cpp
@@ -31,10 +34,16 @@ if(rclcpp_FOUND AND rosbag2_cpp_FOUND AND ament_index_cpp_FOUND AND mcap_vendor_
     src/recorder/writer.cpp
     src/recorder/topic.cpp
     src/recorder/admission.cpp
-    src/recorder/schema.cpp)
-  target_include_directories(ros2_bag_recorder PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    src/recorder/schema.cpp
+    src/recorder/state.cpp)
+  target_include_directories(
+    ros2_bag_recorder
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/concurrentqueue
+      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/json/include)
   target_compile_features(ros2_bag_recorder PUBLIC cxx_std_17)
-  target_link_libraries(ros2_bag_recorder PUBLIC rclcpp::rclcpp rosbag2_cpp::rosbag2_cpp ament_index_cpp::ament_index_cpp mcap_vendor::mcap OpenSSL::Crypto)
+  target_link_libraries(ros2_bag_recorder PUBLIC rclcpp::rclcpp rosbag2_storage::rosbag2_storage ament_index_cpp::ament_index_cpp mcap_vendor::mcap OpenSSL::Crypto)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(ros2_bag_recorder PRIVATE -Wall -Wextra -Wpedantic -Werror)
   endif()

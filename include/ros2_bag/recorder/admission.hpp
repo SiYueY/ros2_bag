@@ -4,7 +4,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <optional>
 
 #include "ros2_bag/recorder/resource_monitor.hpp"
 #include "ros2_bag/recorder/state.hpp"
@@ -25,7 +24,7 @@ public:
     void open(
         std::uint64_t generation,
         std::uint64_t topic_epoch,
-        std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt) noexcept;
+        std::int64_t deadline_steady_ns = 0) noexcept;
     void close() noexcept;
 
     AdmissionResult admit(

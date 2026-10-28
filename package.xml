@@ -9,6 +9,7 @@
   <depend>ament_index_cpp</depend>
   <depend>mcap_vendor</depend>
   <depend>rclcpp</depend>
-  <depend>rosbag2_cpp</depend>
+  <depend>rosbag2_storage</depend>
+  <depend>rosbag2_storage_mcap</depend>
   <export><build_type>ament_cmake</build_type></export>
 </package>

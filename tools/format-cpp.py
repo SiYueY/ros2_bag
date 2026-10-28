@@ -28,7 +28,7 @@ def main():
     changed = []
     for folder in ('include', 'src', 'tests'):
         for path in sorted((ROOT / folder).rglob('*')):
-            if path.suffix not in ('.cpp', '.hpp'):
+            if path.suffix not in ('.cpp', '.cc', '.h', '.hpp'):
                 continue
             result = formatted(path)
             if path.read_text() != result:

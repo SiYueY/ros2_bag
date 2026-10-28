@@ -57,12 +57,12 @@ void test_config() {
 
     ros2_bag::recorder::StartOptions options;
     options.recording_id = "valid-id";
-    options.mode = ros2_bag::recorder::TaskMode::Rolling;
+    options.mode = ros2_bag::recorder::StartOptions::Rolling{};
     const auto task_config = ros2_bag::recorder::make_task_config(config, options);
     CHECK(task_config.has_value());
-    CHECK(task_config->segment_duration == config.rolling_segment_duration);
+    CHECK(task_config->rolling.segment_duration == config.rolling.segment_duration);
 
-    options.mode = ros2_bag::recorder::TaskMode::Timed;
+    options.mode = ros2_bag::recorder::StartOptions::Timed{};
     CHECK(!ros2_bag::recorder::make_task_config(config, options).has_value());
 }
 
@@ -81,16 +81,16 @@ void test_pool() {
 }
 
 void test_queue_and_disk_snapshot() {
-    ros2_bag::recorder::MessageQueue queue(1, 10);
+    ros2_bag::recorder::MessageQueue queue(1, 10, 1);
     ros2_bag::recorder::RecordedMessage first;
     first.payload_bytes = 6;
     CHECK(queue.try_push(first));
     CHECK(!queue.try_push(first));
-    CHECK(queue.state().used_messages == 1U);
-    CHECK(queue.state().used_bytes == 6U);
+    CHECK(queue.state().messages.used == 1U);
+    CHECK(queue.state().bytes.used == 6U);
     const auto popped = queue.pop_for(std::chrono::milliseconds(0));
     CHECK(popped.has_value());
-    CHECK(queue.state().used_bytes == 0U);
+    CHECK(queue.state().bytes.used == 0U);
     queue.close();
     CHECK(!queue.pop_for(std::chrono::milliseconds(0)).has_value());
 
@@ -182,9 +182,9 @@ void test_recovery() {
         ros2_bag::recorder::Recorder recorder(config);
         const auto detail = recorder.get_task("recover-me");
         CHECK(detail.has_value());
-        CHECK(detail->recovered);
-        CHECK(detail->recovery_findings_available);
-        CHECK(detail->incomplete_segment_count == 1U);
+        CHECK(detail->recovery.recovered);
+        CHECK(detail->recovery.has_findings);
+        CHECK(detail->recovery.incomplete_segments == 1U);
         CHECK(recorder.shutdown().wait_for(std::chrono::seconds(1)));
     }
     std::ofstream corrupt(root / "recover-me" / "topic_events.jsonl");
@@ -303,17 +303,17 @@ void test_task_query_boundaries() {
         ros2_bag::recorder::Manifest::create(root / second.task.recording_id, second).has_value());
     ros2_bag::recorder::RecorderConfig config;
     config.output_root = root;
-    config.max_task_scan_entries = 1;
+    config.history.max_task_scan_entries = 1;
     ros2_bag::recorder::Recorder recorder(config);
     const auto detail = recorder.get_task(data.task.recording_id);
     CHECK(detail.has_value());
-    CHECK(detail->incomplete_segment_count == 1U);
-    CHECK(detail->detail_segment_count == 1U);
-    CHECK(detail->total_segment_count == 1U);
+    CHECK(detail->recovery.incomplete_segments == 1U);
+    CHECK(detail->segments.available == 1U);
+    CHECK(detail->segments.total == 1U);
     const auto beyond = recorder.get_task(data.task.recording_id, 1, 1);
     CHECK(beyond.has_value());
-    CHECK(beyond->segments.empty());
-    CHECK(!beyond->segment_has_more);
+    CHECK(beyond->segments.items.empty());
+    CHECK(!beyond->segments.has_more);
     const auto tasks = recorder.list_tasks(0, 10);
     CHECK(tasks.has_value());
     CHECK(tasks->scan_truncated);
@@ -409,8 +409,9 @@ void test_timed_task() {
     ros2_bag::recorder::Recorder recorder(config);
     ros2_bag::recorder::StartOptions options;
     options.recording_id = "timed-task";
-    options.mode = ros2_bag::recorder::TaskMode::Timed;
-    options.duration = std::chrono::milliseconds(10);
+    options.mode = ros2_bag::recorder::StartOptions::Timed{};
+    std::get<ros2_bag::recorder::StartOptions::Timed>(options.mode).duration =
+        std::chrono::milliseconds(10);
     const auto started = recorder.start(options);
     CHECK(started.wait_for(std::chrono::milliseconds(1000)));
     CHECK(started.result()->has_value());
@@ -435,12 +436,13 @@ void test_cleanup() {
         1,
         std::chrono::seconds(1),
         [&](ros2_bag::recorder::DeleteResult result) {
-            succeeded.store(!result.error.has_value());
+            succeeded.store(result.result.has_value());
             called.store(true);
         });
     CHECK(cleanup.enqueue({"cleanup", 1, root, 4}));
-    for (int attempt = 0; attempt < 100 && !called.load(); ++attempt)
+    for (int attempt = 0; attempt < 100 && !called.load(); ++attempt) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     CHECK(called.load());
     CHECK(succeeded.load());
     CHECK(!std::filesystem::exists(root));
@@ -454,32 +456,34 @@ void test_topic_validation() {
     CHECK(ros2_bag::recorder::validate_topic_options(options).has_value());
     const auto automatic = ros2_bag::recorder::normalize_qos(options.qos);
     CHECK(automatic.has_value());
-    CHECK(automatic->mode == ros2_bag::recorder::QosMode::Explicit);
-    CHECK(automatic->depth == std::optional<std::uint32_t>(10));
+    CHECK(std::holds_alternative<ros2_bag::recorder::QosOptions::Explicit>(automatic->mode));
+    CHECK(std::get<ros2_bag::recorder::QosOptions::Explicit>(automatic->mode).depth == 10);
     ros2_bag::recorder::QosOptions best_effort;
-    best_effort.mode = ros2_bag::recorder::QosMode::Explicit;
-    best_effort.reliability = ros2_bag::recorder::Reliability::BestEffort;
-    best_effort.durability = ros2_bag::recorder::Durability::Volatile;
-    best_effort.history = ros2_bag::recorder::History::KeepLast;
-    best_effort.depth = 5;
+    ros2_bag::recorder::QosOptions::Explicit best_effort_qos;
+    best_effort_qos.reliability = ros2_bag::recorder::Reliability::BestEffort;
+    best_effort_qos.durability = ros2_bag::recorder::Durability::Volatile;
+    best_effort_qos.history = ros2_bag::recorder::History::KeepLast;
+    best_effort_qos.depth = 5;
+    best_effort.mode = best_effort_qos;
     const auto automatic_selection =
-        ros2_bag::recorder::select_qos(std::nullopt, {best_effort}, 1, false);
+        ros2_bag::recorder::select_qos(options.qos, {best_effort}, 1, false);
     CHECK(automatic_selection.has_value());
     CHECK(
-        automatic_selection->qos.reliability == std::optional<ros2_bag::recorder::Reliability>(
-                                                    ros2_bag::recorder::Reliability::BestEffort));
-    CHECK(automatic_selection->all_publishers_compatible);
+        std::get<ros2_bag::recorder::QosOptions::Explicit>(automatic_selection->qos.mode)
+            .reliability == ros2_bag::recorder::Reliability::BestEffort);
+    CHECK(automatic_selection->all_compatible);
     ros2_bag::recorder::QosOptions explicit_reliable = *automatic;
     const auto explicit_selection =
         ros2_bag::recorder::select_qos(explicit_reliable, {best_effort}, 1, false);
     CHECK(explicit_selection.has_value());
-    CHECK(!explicit_selection->all_publishers_compatible);
+    CHECK(!explicit_selection->all_compatible);
     options.expected_hz = 0.0;
     CHECK(!ros2_bag::recorder::validate_topic_options(options).has_value());
     options.expected_hz.reset();
     ros2_bag::recorder::QosOptions invalid;
-    invalid.mode = ros2_bag::recorder::QosMode::Explicit;
-    invalid.history = ros2_bag::recorder::History::KeepAll;
+    auto invalid_qos = ros2_bag::recorder::QosOptions::Explicit{};
+    invalid_qos.history = ros2_bag::recorder::History::KeepAll;
+    invalid.mode = invalid_qos;
     options.qos = invalid;
     CHECK(!ros2_bag::recorder::validate_topic_options(options).has_value());
 }
@@ -510,6 +514,45 @@ void test_topic_mutation_requires_ros_node() {
     std::filesystem::remove_all(root, ignored);
 }
 
+void test_concurrent_message_queue() {
+    constexpr std::size_t producer_count = 4;
+    constexpr std::size_t messages_per_producer = 1000;
+    constexpr std::size_t total_messages = producer_count * messages_per_producer;
+
+    ros2_bag::recorder::MessageQueue queue(total_messages, total_messages, producer_count);
+    std::vector<std::thread> producers;
+    producers.reserve(producer_count);
+
+    for (std::size_t producer = 0; producer < producer_count; ++producer) {
+        producers.emplace_back([&queue, producer] {
+            for (std::size_t index = 0; index < messages_per_producer; ++index) {
+                ros2_bag::recorder::RecordedMessage message;
+                message.topic_id = static_cast<ros2_bag::recorder::TopicId>(producer + 1);
+                message.payload_bytes = 1;
+                CHECK(queue.try_push(std::move(message)));
+            }
+        });
+    }
+
+    for (auto& producer : producers) {
+        producer.join();
+    }
+
+    const auto queued = queue.state();
+    CHECK(queued.messages.used == total_messages);
+    CHECK(queued.bytes.used == total_messages);
+
+    const auto batch = queue.pop_batch(total_messages);
+    CHECK(batch.size() == total_messages);
+
+    const auto drained = queue.state();
+    CHECK(drained.messages.used == 0U);
+    CHECK(drained.bytes.used == 0U);
+
+    queue.close();
+    CHECK(queue.pop_batch(1).empty());
+}
+
 void test_admission_gate() {
     ros2_bag::recorder::DiskAdmissionState disk;
     const auto now = std::chrono::steady_clock::now();
@@ -521,12 +564,17 @@ void test_admission_gate() {
     gate.open(3, 4);
     CHECK(gate.admit(3, 4, disk, now) == ros2_bag::recorder::AdmissionResult::Accepted);
     CHECK(gate.admit(2, 4, disk, now) == ros2_bag::recorder::AdmissionResult::StaleIdentity);
-    gate.open(3, 4, now + std::chrono::milliseconds(1));
+    gate.open(
+        3,
+        4,
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            (now + std::chrono::milliseconds(1)).time_since_epoch())
+            .count());
     CHECK(
         gate.admit(3, 4, disk, now + std::chrono::milliseconds(1)) ==
         ros2_bag::recorder::AdmissionResult::TimedDeadline);
     CHECK(gate.admit(3, 4, disk, now) == ros2_bag::recorder::AdmissionResult::NotAccepting);
-    CHECK(gate.counters().timed_deadline == 1U);
+    CHECK(gate.counters().admission.timed_deadline == 1U);
 }
 
 void test_resource_monitor() {
@@ -542,7 +590,9 @@ void test_resource_monitor() {
         ros2_bag::recorder::ResourceMonitor monitor(
             config,
             admission,
-            [&](ros2_bag::recorder::DiskSample sample) { sampled.store(sample.valid); });
+            [&](ros2_bag::recorder::DiskSample sample) {
+                sampled.store(sample.state != ros2_bag::recorder::DiskSafetyState::Unknown);
+            });
         for (int attempt = 0; attempt < 100 && !sampled.load(); ++attempt) {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
@@ -566,15 +616,15 @@ void test_writer_mcap_smoke() {
     const auto root = std::filesystem::temp_directory_path() / "ros2_bag_writer_mcap_test";
     std::error_code ignored;
     std::filesystem::remove_all(root, ignored);
-    ros2_bag::recorder::Writer writer(8);
-    const auto opened = writer.open((root / "segment_000001").string());
-    CHECK(opened.wait_for(std::chrono::seconds(5)));
-    if (!opened.result() || !opened.result()->has_value()) {
+
+    ros2_bag::recorder::Writer writer(ros2_bag::recorder::CompressionMode::Lz4);
+    const auto opened = writer.open(root / "segment_000001");
+    if (!opened) {
         std::cerr << "SKIP writer MCAP smoke: storage plugin unavailable\n";
-        writer.shutdown();
         std::filesystem::remove_all(root, ignored);
         return;
     }
+
     ros2_bag::recorder::TopicInfo topic;
     topic.topic_id = 1;
     topic.topic_epoch = 1;
@@ -583,30 +633,42 @@ void test_writer_mcap_smoke() {
     const auto resolved_schema = ros2_bag::recorder::resolve_schema(topic.type);
     CHECK(resolved_schema.has_value());
     topic.schema_sha256 = resolved_schema->sha256;
+
     const auto registered = writer.register_topic(topic);
-    CHECK(registered.wait_for(std::chrono::seconds(5)));
-    CHECK(registered.result()->has_value());
-    ros2_bag::recorder::RecordedMessage message;
-    message.message = std::make_shared<rclcpp::SerializedMessage>(4);
-    auto& serialized = message.message->get_rcl_serialized_message();
-    serialized.buffer[0] = 0;
-    serialized.buffer[1] = 1;
-    serialized.buffer[2] = 0;
-    serialized.buffer[3] = 0;
-    serialized.buffer_length = 4;
-    message.payload_bytes = 4;
-    message.receive_timestamp_ns = 1;
-    const auto written = writer.write(message, topic.name, topic.type);
-    CHECK(written.wait_for(std::chrono::seconds(5)));
-    CHECK(written.result()->has_value());
+    CHECK(registered.has_value());
+
+    auto frozen_topic = std::make_shared<ros2_bag::recorder::TopicInfo>(topic);
+    std::vector<ros2_bag::recorder::RecordedMessage> batch;
+    constexpr std::size_t payload_size = 4096;
+    for (std::int64_t index = 0; index < 256; ++index) {
+        ros2_bag::recorder::RecordedMessage message;
+        message.topic = frozen_topic;
+        message.topic_id = topic.topic_id;
+        message.topic_epoch = topic.topic_epoch;
+        message.message = std::make_shared<rclcpp::SerializedMessage>(payload_size);
+        auto& serialized = message.message->get_rcl_serialized_message();
+        std::fill_n(serialized.buffer, payload_size, 0);
+        serialized.buffer_length = payload_size;
+        message.payload_bytes = payload_size;
+        message.receive_timestamp_ns = index + 1;
+        batch.push_back(std::move(message));
+    }
+
+    const auto written = writer.write_batch(batch);
+    CHECK(written.has_value());
+
     const auto closed = writer.close();
-    CHECK(closed.wait_for(std::chrono::seconds(5)));
-    CHECK(closed.result()->has_value());
+    CHECK(closed.has_value());
+
     std::filesystem::path mcap_file;
     for (const auto& entry : std::filesystem::recursive_directory_iterator(root, ignored)) {
-        if (entry.path().extension() == ".mcap") mcap_file = entry.path();
+        if (entry.path().extension() == ".mcap") {
+            CHECK(mcap_file.empty());
+            mcap_file = entry.path();
+        }
     }
     CHECK(!mcap_file.empty());
+
     mcap::McapReader reader;
     CHECK(reader.open(mcap_file.string()).ok());
     CHECK(reader.readSummary(mcap::ReadSummaryMethod::AllowFallbackScan).ok());
@@ -619,8 +681,20 @@ void test_writer_mcap_smoke() {
     CHECK(schema != nullptr);
     CHECK(schema->encoding == "ros2msg");
     CHECK(!schema->data.empty());
+    CHECK(!reader.chunkIndexes().empty());
+    CHECK(std::any_of(
+        reader.chunkIndexes().begin(),
+        reader.chunkIndexes().end(),
+        [](const mcap::ChunkIndex& chunk) { return chunk.compression == "lz4"; }));
+
+    std::size_t message_count = 0;
+    for (const auto& message_view : reader.readMessages()) {
+        (void)message_view;
+        ++message_count;
+    }
+    CHECK(message_count == batch.size());
+
     reader.close();
-    writer.shutdown();
     std::filesystem::remove_all(root, ignored);
 }
 
@@ -640,14 +714,16 @@ void test_recorder_ros_integration() {
     {
         ros2_bag::recorder::RecorderConfig config;
         config.output_root = root;
-        config.disk_min_free_bytes = 0;
-        config.disk_pause_percent = 99.0;
+        config.disk.min_free_bytes = 0;
+        config.disk.pause_percent = 99.0;
         ros2_bag::recorder::Recorder recorder(config, node);
         ros2_bag::recorder::StartOptions start;
         start.recording_id = "integration";
-        start.mode = ros2_bag::recorder::TaskMode::Rolling;
-        start.segment_duration = std::chrono::seconds(1);
-        start.retention_duration = std::chrono::seconds(1);
+        start.mode = ros2_bag::recorder::StartOptions::Rolling{};
+        std::get<ros2_bag::recorder::StartOptions::Rolling>(start.mode).segment_duration =
+            std::chrono::seconds(1);
+        std::get<ros2_bag::recorder::StartOptions::Rolling>(start.mode).retention_duration =
+            std::chrono::seconds(1);
         const auto started = recorder.start(start);
         CHECK(started.wait_for(std::chrono::seconds(5)));
         CHECK(started.result()->has_value());
@@ -661,9 +737,9 @@ void test_recorder_ros_integration() {
                 return candidate.name == "/recorder_foundation";
             });
         CHECK(discovered_topic != discovered->end());
-        CHECK(discovered_topic->publisher_count != 0);
-        CHECK(discovered_topic->publisher_qos_profiles.empty());
-        CHECK(discovered_topic->publisher_qos_profiles_truncated);
+        CHECK(discovered_topic->publishers.count != 0);
+        CHECK(discovered_topic->publishers.profiles.empty());
+        CHECK(discovered_topic->publishers.truncated);
         CHECK(
             discovered_topic->recordability ==
             ros2_bag::recorder::TopicRecordability::QosIncompatible);
@@ -704,11 +780,11 @@ void test_recorder_ros_integration() {
             publisher->publish(serialized);
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
             const auto state = recorder.state();
-            if (!state.topics.empty() && state.topics.front().written_messages != 0) {
+            if (!state.topics.empty() && state.topics.front().messages.written != 0) {
                 break;
             }
         }
-        CHECK(recorder.state().topics.front().written_messages != 0);
+        CHECK(recorder.state().topics.front().messages.written != 0);
         const auto paused = recorder.pause(task.recording_id, task.generation);
         CHECK(paused.wait_for(std::chrono::seconds(5)));
         CHECK(paused.result()->has_value());
@@ -716,35 +792,35 @@ void test_recorder_ros_integration() {
         const auto resumed = recorder.resume(task.recording_id, task.generation);
         CHECK(resumed.wait_for(std::chrono::seconds(10)));
         CHECK(resumed.result()->has_value());
-        CHECK(recorder.state().current_segment->segment_id >= 2);
+        CHECK(recorder.state().segments.current->segment_id >= 2);
         for (int attempt = 0; attempt < 400; ++attempt) {
             publisher->publish(serialized);
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
             const auto state = recorder.state();
-            if (!state.topics.empty() && state.topics.front().written_messages != 0 &&
-                state.current_segment && state.current_segment->segment_id >= 3 &&
-                state.cleanup.total_removed != 0)
+            if (!state.topics.empty() && state.topics.front().messages.written != 0 &&
+                state.segments.current && state.segments.current->segment_id >= 3 &&
+                state.cleanup.removed != 0) {
                 break;
+            }
         }
         const auto state = recorder.state();
         CHECK(!state.topics.empty());
-        CHECK(state.topics.front().publisher_count != 0);
-        CHECK(state.topics.front().publisher_visibility_fresh);
-        CHECK(!state.topics.front().qos_compatible.has_value());
-        CHECK(state.topics.front().received_messages != 0);
-        CHECK(state.topics.front().written_messages != 0);
-        CHECK(state.topics.front().actual_hz.has_value());
-        CHECK(state.topics.front().gap.has_value());
-        CHECK(!*state.topics.front().gap);
-        CHECK(state.current_segment.has_value());
-        CHECK(state.current_segment->segment_id >= 3);
-        CHECK(state.rotation_lag.has_value());
-        CHECK(state.process.has_value());
-        CHECK(state.process->valid);
-        CHECK(state.process->rss_bytes.has_value());
-        CHECK(state.process->thread_count.has_value());
-        CHECK(state.process->fd_count.has_value());
-        CHECK(state.cleanup.total_removed != 0);
+        CHECK(state.topics.front().publishers.count != 0);
+        CHECK(state.topics.front().publishers.fresh);
+        CHECK(
+            state.topics.front().publishers.compatibility ==
+            ros2_bag::recorder::TopicState::Compatibility::Unknown);
+        CHECK(state.topics.front().messages.received != 0);
+        CHECK(state.topics.front().messages.written != 0);
+        CHECK(state.topics.front().frequency.gap != ros2_bag::recorder::TopicState::Gap::Unknown);
+        CHECK(state.topics.front().frequency.gap == ros2_bag::recorder::TopicState::Gap::Normal);
+        CHECK(state.segments.current.has_value());
+        CHECK(state.segments.current->segment_id >= 3);
+        CHECK(state.segments.rotation_lag >= std::chrono::milliseconds(0));
+        CHECK(state.process.memory.rss_bytes > 0);
+        CHECK(state.process.threads.count > 0);
+        CHECK(state.process.file_descriptors.count > 0);
+        CHECK(state.cleanup.removed != 0);
         const auto stopped = recorder.stop(task.recording_id, task.generation);
         CHECK(stopped.wait_for(std::chrono::seconds(10)));
         CHECK(stopped.result()->has_value());
@@ -777,6 +853,7 @@ int main(int argc, char** argv) {
     test_cleanup();
     test_topic_validation();
     test_topic_mutation_requires_ros_node();
+    test_concurrent_message_queue();
     test_admission_gate();
     test_resource_monitor();
     test_schema_identity();

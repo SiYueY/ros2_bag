@@ -1,142 +1,120 @@
 #include "ros2_bag/recorder/topic.hpp"
 
 #include <cmath>
-#include <array>
-#include <utility>
 
 namespace ros2_bag::recorder {
-namespace {
 
-Error invalid(std::string message) {
-    return {ErrorCode::UnsupportedQos, Effects::None, std::move(message)};
-}
-
-bool same_qos(const QosOptions& left, const QosOptions& right) noexcept {
-    return left.reliability == right.reliability && left.durability == right.durability &&
-           left.history == right.history && left.depth == right.depth;
-}
-
-QosOptions runtime_default_qos() {
-    QosOptions qos;
-    qos.mode = QosMode::Explicit;
-    qos.reliability = Reliability::Reliable;
-    qos.durability = Durability::Volatile;
-    qos.history = History::KeepLast;
-    qos.depth = 10;
-    return qos;
-}
-
-const std::array<QosOptions, 8>& auto_candidates() {
-    static const auto candidates = [] {
-        std::array<QosOptions, 8> values{};
-        std::size_t index = 0;
-        for (const auto reliability : {Reliability::Reliable, Reliability::BestEffort}) {
-            for (const auto durability : {Durability::TransientLocal, Durability::Volatile}) {
-                for (const auto history : {History::KeepLast, History::KeepAll}) {
-                    QosOptions qos;
-                    qos.mode = QosMode::Explicit;
-                    qos.reliability = reliability;
-                    qos.durability = durability;
-                    qos.history = history;
-                    if (history == History::KeepLast) {
-                        qos.depth = 10;
-                    }
-                    values[index++] = std::move(qos);
-                }
-            }
-        }
-        return values;
-    }();
-    return candidates;
-}
-
-}  // namespace
-
-Result<QosOptions, Error> normalize_qos(const std::optional<QosOptions>& options) {
-    if (!options || options->mode == QosMode::Auto) {
-        if (options &&
-            (options->reliability || options->durability || options->history || options->depth)) {
-            return Result<QosOptions, Error>(
-                unexpect,
-                invalid("auto QoS cannot include explicit fields"));
-        }
-        return Result<QosOptions, Error>(runtime_default_qos());
+Result<QosOptions, Error> normalize_qos(const QosOptions& options) {
+    if (std::holds_alternative<QosOptions::Auto>(options.mode)) {
+        QosOptions normalized;
+        normalized.mode = QosOptions::Explicit{};
+        return Result<QosOptions, Error>(std::move(normalized));
     }
-    const auto& qos = *options;
-    if (!qos.reliability || !qos.durability || !qos.history) {
+
+    const auto& explicit_qos = std::get<QosOptions::Explicit>(options.mode);
+    if (explicit_qos.history == History::KeepLast &&
+        (explicit_qos.depth == 0 || explicit_qos.depth > kMaxQosDepth)) {
         return Result<QosOptions, Error>(
             unexpect,
-            invalid("explicit QoS requires reliability, durability and history"));
+            Error{
+                ErrorCode::UnsupportedQos,
+                Effects::None,
+                "keep-last QoS requires depth in [1, 10000]"});
     }
-    if (*qos.history == History::KeepLast &&
-        (!qos.depth || *qos.depth == 0 || *qos.depth > 10000)) {
+    if (explicit_qos.history == History::KeepAll && explicit_qos.depth != 0) {
         return Result<QosOptions, Error>(
             unexpect,
-            invalid("keep-last QoS requires depth in [1, 10000]"));
+            Error{ErrorCode::UnsupportedQos, Effects::None, "keep-all QoS cannot include depth"});
     }
-    if (*qos.history == History::KeepAll && qos.depth) {
-        return Result<QosOptions, Error>(unexpect, invalid("keep-all QoS cannot include depth"));
-    }
-    return Result<QosOptions, Error>(qos);
+    return Result<QosOptions, Error>(options);
 }
 
 bool qos_compatible(const QosOptions& publisher, const QosOptions& subscription) noexcept {
-    if (!publisher.reliability || !publisher.durability || !publisher.history ||
-        !subscription.reliability || !subscription.durability || !subscription.history) {
+    const auto* publisher_qos = std::get_if<QosOptions::Explicit>(&publisher.mode);
+    const auto* subscription_qos = std::get_if<QosOptions::Explicit>(&subscription.mode);
+    if (!publisher_qos || !subscription_qos) {
         return false;
     }
-    const auto reliability_compatible = *publisher.reliability == Reliability::Reliable ||
-                                        *subscription.reliability == Reliability::BestEffort;
-    const auto durability_compatible = *publisher.durability == Durability::TransientLocal ||
-                                       *subscription.durability == Durability::Volatile;
+
+    const auto reliability_compatible = publisher_qos->reliability == Reliability::Reliable ||
+                                        subscription_qos->reliability == Reliability::BestEffort;
+    const auto durability_compatible = publisher_qos->durability == Durability::TransientLocal ||
+                                       subscription_qos->durability == Durability::Volatile;
     return reliability_compatible && durability_compatible;
 }
 
 Result<QosSelection, Error> select_qos(
-    const std::optional<QosOptions>& options,
+    const QosOptions& options,
     const std::vector<QosOptions>& publisher_profiles,
     std::size_t publisher_count,
-    bool publisher_profiles_truncated) {
+    bool profiles_truncated) {
     const auto normalized = normalize_qos(options);
     if (!normalized) {
         return Result<QosSelection, Error>(unexpect, normalized.error());
     }
-    const auto compatible_count = [&publisher_profiles](const QosOptions& candidate) {
-        std::size_t count = 0;
+
+    if (std::holds_alternative<QosOptions::Explicit>(options.mode)) {
+        std::size_t compatible = 0;
         for (const auto& publisher : publisher_profiles) {
-            if (qos_compatible(publisher, candidate)) {
-                ++count;
+            if (qos_compatible(publisher, normalized.value())) {
+                ++compatible;
             }
         }
-        return count;
-    };
-    if (options && options->mode == QosMode::Explicit) {
-        const auto compatible = compatible_count(normalized.value());
         return Result<QosSelection, Error>(QosSelection{
             normalized.value(),
             compatible,
-            !publisher_profiles_truncated && publisher_profiles.size() == publisher_count &&
+            !profiles_truncated && publisher_profiles.size() == publisher_count &&
                 compatible == publisher_count});
     }
 
-    const auto runtime_default = runtime_default_qos();
-    QosOptions selected = auto_candidates().front();
+    QosOptions selected;
     std::size_t selected_count = 0;
     bool selected_is_runtime_default = false;
-    for (const auto& candidate : auto_candidates()) {
-        const auto compatible = compatible_count(candidate);
-        const auto is_runtime_default = same_qos(candidate, runtime_default);
-        if (compatible > selected_count ||
-            (compatible == selected_count && is_runtime_default && !selected_is_runtime_default)) {
-            selected = candidate;
-            selected_count = compatible;
-            selected_is_runtime_default = is_runtime_default;
+
+    for (const auto reliability : {Reliability::Reliable, Reliability::BestEffort}) {
+        for (const auto durability : {Durability::TransientLocal, Durability::Volatile}) {
+            for (const auto history : {History::KeepLast, History::KeepAll}) {
+                QosOptions::Explicit explicit_qos;
+                explicit_qos.reliability = reliability;
+                explicit_qos.durability = durability;
+                explicit_qos.history = history;
+                explicit_qos.depth = 0;
+                if (history == History::KeepLast) {
+                    explicit_qos.depth = 10;
+                }
+
+                QosOptions candidate;
+                candidate.mode = explicit_qos;
+
+                std::size_t compatible = 0;
+                for (const auto& publisher : publisher_profiles) {
+                    if (qos_compatible(publisher, candidate)) {
+                        ++compatible;
+                    }
+                }
+
+                const bool runtime_default =
+                    reliability == Reliability::Reliable && durability == Durability::Volatile &&
+                    history == History::KeepLast && explicit_qos.depth == 10;
+                if (compatible > selected_count) {
+                    selected = std::move(candidate);
+                    selected_count = compatible;
+                    selected_is_runtime_default = runtime_default;
+                    continue;
+                }
+                if (compatible == selected_count && runtime_default &&
+                    !selected_is_runtime_default) {
+                    selected = std::move(candidate);
+                    selected_is_runtime_default = true;
+                }
+            }
         }
     }
+
     return Result<QosSelection, Error>(QosSelection{
         selected,
         selected_count,
-        !publisher_profiles_truncated && publisher_profiles.size() == publisher_count &&
+        !profiles_truncated && publisher_profiles.size() == publisher_count &&
             selected_count == publisher_count});
 }
 
@@ -158,8 +136,11 @@ Result<void, Error> validate_topic_options(const TopicOptions& options) {
                 Effects::None,
                 "expected_hz must be finite and positive"});
     }
+
     const auto qos = normalize_qos(options.qos);
-    if (!qos) return Result<void, Error>(unexpect, qos.error());
+    if (!qos) {
+        return Result<void, Error>(unexpect, qos.error());
+    }
     return Result<void, Error>();
 }
 

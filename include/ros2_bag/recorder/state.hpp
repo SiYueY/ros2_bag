@@ -20,14 +20,22 @@ struct PauseState {
     bool user_paused = false;
     DiskPauseReason disk = DiskPauseReason::None;
 
-    bool paused() const noexcept { return user_paused || disk != DiskPauseReason::None; }
+    bool paused() const noexcept;
 };
 
 struct QueueState {
-    std::size_t used_messages = 0;
-    std::size_t max_messages = 0;
-    std::size_t used_bytes = 0;
-    std::size_t max_bytes = 0;
+    struct Messages {
+        std::size_t used = 0;
+        std::size_t max = 0;
+    };
+
+    struct Bytes {
+        std::size_t used = 0;
+        std::size_t max = 0;
+    };
+
+    Messages messages;
+    Bytes bytes;
 };
 
 struct PoolState {
@@ -39,16 +47,31 @@ struct PoolState {
 enum class TopicRuntimeState { Adding, Armed, Active, Removing, Removed, Failed };
 
 struct TopicState {
+    enum class Compatibility { Unknown, Compatible, Incompatible };
+    enum class Gap { Unknown, Normal, Detected };
+
+    struct Publishers {
+        std::size_t count = 0;
+        Compatibility compatibility = Compatibility::Unknown;
+        bool fresh = false;
+    };
+
+    struct Frequency {
+        double actual_hz = 0.0;
+        Gap gap = Gap::Unknown;
+    };
+
+    struct Messages {
+        std::uint64_t received = 0;
+        std::uint64_t written = 0;
+        std::uint64_t dropped = 0;
+    };
+
     TopicInfo info;
     TopicRuntimeState state = TopicRuntimeState::Adding;
-    std::size_t publisher_count = 0;
-    std::optional<bool> qos_compatible;
-    bool publisher_visibility_fresh = false;
-    std::optional<double> actual_hz;
-    std::optional<bool> gap;
-    std::uint64_t received_messages = 0;
-    std::uint64_t written_messages = 0;
-    std::uint64_t dropped_messages = 0;
+    Publishers publishers;
+    Frequency frequency;
+    Messages messages;
 };
 
 struct SegmentState {
@@ -61,64 +84,106 @@ struct SegmentState {
 };
 
 struct CleanupState {
-    std::size_t queued_count = 0;
-    std::size_t pending_total = 0;
-    std::optional<std::uint64_t> active_segment_id;
-    std::optional<std::chrono::milliseconds> active_for;
-    bool warning_active = false;
-    std::uint64_t queue_full_count = 0;
-    std::uint64_t total_removed = 0;
+    struct Active {
+        std::uint64_t segment_id = 0;
+        std::chrono::milliseconds elapsed{0};
+    };
+
+    std::size_t queued = 0;
+    std::size_t pending = 0;
+    std::optional<Active> active;
+    bool warning = false;
+    std::uint64_t queue_full = 0;
+    std::uint64_t removed = 0;
     std::optional<Error> last_error;
 };
 
 struct DropCounters {
-    std::uint64_t stale_identity = 0;
-    std::uint64_t not_accepting = 0;
-    std::uint64_t timed_deadline = 0;
-    std::uint64_t disk_unsafe = 0;
-    std::uint64_t disk_snapshot_busy = 0;
-    std::uint64_t queue_full = 0;
-    std::uint64_t pool_exhausted = 0;
-    std::uint64_t enqueue_failure = 0;
+    struct Admission {
+        std::uint64_t stale_identity = 0;
+        std::uint64_t not_accepting = 0;
+        std::uint64_t timed_deadline = 0;
+        std::uint64_t disk_unsafe = 0;
+        std::uint64_t disk_snapshot_busy = 0;
+    };
+
+    struct Queue {
+        std::uint64_t full = 0;
+    };
+
+    struct Pool {
+        std::uint64_t exhausted = 0;
+    };
+
+    struct Writer {
+        std::uint64_t write_failure = 0;
+    };
+
+    Admission admission;
+    Queue queue;
+    Pool pool;
+    Writer writer;
 };
 
 struct DiskSample {
     DiskSafetyState state = DiskSafetyState::Unknown;
     std::int64_t sampled_at_ns = 0;
-    bool valid = false;
     std::uint64_t available_bytes = 0;
     double used_percent = 0.0;
     std::uint32_t consecutive_failures = 0;
 };
 
 struct ProcessSample {
+    struct Cpu {
+        double percent = 0.0;
+    };
+
+    struct Memory {
+        std::uint64_t rss_bytes = 0;
+    };
+
+    struct Threads {
+        std::uint32_t count = 0;
+    };
+
+    struct FileDescriptors {
+        std::uint32_t count = 0;
+    };
+
     std::int64_t sampled_at_ns = 0;
-    bool valid = false;
-    std::optional<double> cpu_percent_single_core;
-    std::optional<std::uint64_t> rss_bytes;
-    std::optional<std::uint32_t> thread_count;
-    std::optional<std::uint32_t> fd_count;
+    Cpu cpu;
+    Memory memory;
+    Threads threads;
+    FileDescriptors file_descriptors;
 };
 
 struct State {
+    struct Task {
+        std::string recording_id;
+        std::uint64_t generation = 0;
+        TaskConfig config;
+    };
+
+    struct Segments {
+        std::optional<SegmentState> current;
+        std::optional<SegmentState> last_completed;
+        std::chrono::milliseconds rotation_lag{0};
+    };
+
     RecorderState recorder_state = RecorderState::Idle;
     bool shutting_down = false;
-    std::optional<std::string> recording_id;
-    std::optional<std::uint64_t> generation;
-    std::optional<TaskConfig> task_config;
+    std::optional<Task> task;
     PauseState pause;
     QueueState queue;
     PoolState pool;
     DropCounters dropped;
-    std::optional<DiskSample> disk;
-    std::optional<ProcessSample> process;
+    DiskSample disk;
+    ProcessSample process;
     CleanupState cleanup;
     std::vector<TopicState> topics;
     std::vector<TopicInfo> topics_removed_recent;
     std::uint64_t topics_removed_total = 0;
-    std::optional<SegmentState> current_segment;
-    std::optional<SegmentState> last_completed_segment;
-    std::optional<std::chrono::milliseconds> rotation_lag;
+    Segments segments;
     std::optional<Error> last_error;
 };
 

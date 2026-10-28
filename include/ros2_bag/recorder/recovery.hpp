@@ -23,6 +23,13 @@ struct RecoveryReport {
 class Recovery {
 public:
     static Result<RecoveryReport, Error> run(const std::filesystem::path& output_root);
+
+private:
+    static bool safe_relative_path(const std::string& path);
+    static Result<void, Error> write_evidence(
+        const std::filesystem::path& directory,
+        const std::string& recording_id,
+        const std::vector<RecoveryFinding>& findings);
 };
 
 }  // namespace ros2_bag::recorder

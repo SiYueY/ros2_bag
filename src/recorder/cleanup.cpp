@@ -16,13 +16,15 @@ Cleanup::Cleanup(
 
 Cleanup::~Cleanup() {
     stop();
-    if (thread_.joinable()) thread_.join();
+    if (thread_.joinable()) {
+        thread_.join();
+    }
 }
 
 bool Cleanup::enqueue(DeleteWork work) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (stopping_ || queue_.size() >= queue_capacity_) {
-        ++queue_full_count_;
+        ++queue_full_;
         return false;
     }
     queue_.push(std::move(work));
@@ -39,16 +41,20 @@ void Cleanup::stop() {
 CleanupState Cleanup::state() const {
     std::lock_guard<std::mutex> lock(mutex_);
     CleanupState result;
-    result.queued_count = queue_.size();
-    result.pending_total = result.queued_count + (active_ ? 1U : 0U);
+    result.queued = queue_.size();
+    result.pending = result.queued;
     if (active_) {
-        result.active_segment_id = active_->segment_id;
-        result.active_for = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - *active_since_);
-        result.warning_active = *result.active_for >= warning_after_;
+        ++result.pending;
     }
-    result.queue_full_count = queue_full_count_;
-    result.total_removed = total_removed_;
+    if (active_) {
+        result.active = CleanupState::Active{
+            active_->work.segment_id,
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - active_->since)};
+        result.warning = result.active->elapsed >= warning_after_;
+    }
+    result.queue_full = queue_full_;
+    result.removed = removed_;
     result.last_error = last_error_;
     return result;
 }
@@ -59,29 +65,32 @@ void Cleanup::run() {
         {
             std::unique_lock<std::mutex> lock(mutex_);
             condition_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
-            if (queue_.empty() && stopping_) return;
+            if (queue_.empty() && stopping_) {
+                return;
+            }
             work = std::move(queue_.front());
             queue_.pop();
-            active_ = work;
-            active_since_ = std::chrono::steady_clock::now();
+            active_ = Active{work, std::chrono::steady_clock::now()};
         }
         std::error_code filesystem_error;
         std::filesystem::remove_all(work.path, filesystem_error);
-        DeleteResult result{work, std::nullopt};
+        DeleteResult result{work, Result<void, Error>()};
         if (filesystem_error) {
-            result.error = Error{
-                ErrorCode::StorageError,
-                Effects::ConfirmedPartial,
-                filesystem_error.message()};
+            result.result = Result<void, Error>(
+                unexpect,
+                Error{
+                    ErrorCode::StorageError,
+                    Effects::ConfirmedPartial,
+                    filesystem_error.message()});
         }
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (result.error)
-                last_error_ = result.error;
-            else
-                ++total_removed_;
+            if (!result.result) {
+                last_error_ = result.result.error();
+            } else {
+                ++removed_;
+            }
             active_.reset();
-            active_since_.reset();
         }
         try {
             callback_(std::move(result));

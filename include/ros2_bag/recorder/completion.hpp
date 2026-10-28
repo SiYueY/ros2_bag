@@ -103,19 +103,11 @@ private:
 template <>
 class CompletionSource<void> {
 public:
-    CompletionSource() {
-        auto pair = Completion<void>::make_pair();
-        completion_ = std::move(pair.first);
-        producer_ = std::move(pair.second);
-    }
+    CompletionSource();
 
-    Completion<void> completion() const { return completion_; }
-
-    void set_value() const { producer_.complete(Result<void, Error>()); }
-
-    void set_error(Error error) const {
-        producer_.complete(Result<void, Error>(unexpect, std::move(error)));
-    }
+    Completion<void> completion() const;
+    void set_value() const;
+    void set_error(Error error) const;
 
 private:
     Completion<void> completion_;

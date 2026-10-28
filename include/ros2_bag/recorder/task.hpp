@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <variant>
 #include <vector>
 
 #include "ros2_bag/recorder/error.hpp"
@@ -19,33 +20,51 @@ enum class TimestampPolicy { Receive };
 enum class SegmentLifecycleState { Writing, Finalizing, Complete, Deleting, Removed, Incomplete };
 
 struct StartOptions {
+    struct Normal {};
+
+    struct Timed {
+        std::chrono::milliseconds duration{0};
+    };
+
+    struct Rolling {
+        std::optional<std::chrono::seconds> segment_duration;
+        std::optional<std::chrono::seconds> retention_duration;
+    };
+
+    using Mode = std::variant<Normal, Timed, Rolling>;
+
     std::string recording_id;
-    TaskMode mode = TaskMode::Normal;
-    std::optional<std::chrono::milliseconds> duration;
-    std::optional<std::chrono::seconds> segment_duration;
-    std::optional<std::chrono::seconds> retention_duration;
+    Mode mode = Normal{};
 };
 
 struct TaskConfig {
+    struct Timed {
+        std::chrono::milliseconds duration{0};
+    };
+
+    struct Rolling {
+        std::chrono::seconds segment_duration{0};
+        std::chrono::seconds retention_duration{0};
+    };
+
     TaskMode mode = TaskMode::Normal;
-    std::optional<std::chrono::milliseconds> duration;
-    std::optional<std::chrono::seconds> segment_duration;
-    std::optional<std::chrono::seconds> retention_duration;
+    Timed timed;
+    Rolling rolling;
     CompressionMode compression = CompressionMode::Lz4;
     TimestampPolicy timestamp_policy = TimestampPolicy::Receive;
 };
 
 struct SegmentHistorySummary {
-    std::uint64_t compacted_removed_count = 0;
-    std::uint64_t compacted_removed_bytes = 0;
+    std::uint64_t removed_count = 0;
+    std::uint64_t removed_bytes = 0;
 };
 
 struct SegmentInfo {
     std::uint64_t segment_id = 0;
     SegmentLifecycleState state = SegmentLifecycleState::Writing;
     std::string relative_path;
-    std::optional<std::int64_t> started_at_ns;
-    std::optional<std::int64_t> completed_at_ns;
+    std::int64_t started_at_ns = 0;
+    std::int64_t completed_at_ns = 0;
     std::optional<std::uint64_t> message_count;
     std::optional<std::uint64_t> size_bytes;
 };
@@ -55,23 +74,31 @@ struct TaskInfo {
     std::uint64_t generation = 0;
     TaskState state = TaskState::Initializing;
     TaskConfig config;
-    std::optional<std::int64_t> start_time_ns;
-    std::optional<std::int64_t> terminal_time_ns;
-    SegmentHistorySummary segment_history_summary;
+    std::int64_t start_time_ns = 0;
+    std::int64_t terminal_time_ns = 0;
+    SegmentHistorySummary segment_history;
     std::optional<Error> error;
 };
 
 struct TaskDetail {
+    struct Segments {
+        std::vector<SegmentInfo> items;
+        std::size_t offset = 0;
+        std::size_t available = 0;
+        std::uint64_t total = 0;
+        bool has_more = false;
+    };
+
+    struct Recovery {
+        bool recovered = false;
+        bool has_findings = false;
+        std::uint32_t incomplete_segments = 0;
+        std::uint32_t uncertain_operations = 0;
+    };
+
     TaskInfo task;
-    std::vector<SegmentInfo> segments;
-    std::size_t segment_offset = 0;
-    std::size_t detail_segment_count = 0;
-    bool segment_has_more = false;
-    std::uint64_t total_segment_count = 0;
-    bool recovered = false;
-    bool recovery_findings_available = false;
-    std::uint32_t incomplete_segment_count = 0;
-    std::uint32_t uncertain_topic_operation_count = 0;
+    Segments segments;
+    Recovery recovery;
 };
 
 struct TaskList {

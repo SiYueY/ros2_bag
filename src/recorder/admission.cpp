@@ -1,24 +1,15 @@
 #include "ros2_bag/recorder/admission.hpp"
 
 namespace ros2_bag::recorder {
-namespace {
-
-std::int64_t steady_ns(std::chrono::steady_clock::time_point value) noexcept {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(value.time_since_epoch()).count();
-}
-
-}  // namespace
-
 void AdmissionGate::open(
     std::uint64_t generation,
     std::uint64_t topic_epoch,
-    std::optional<std::chrono::steady_clock::time_point> deadline) noexcept {
+    std::int64_t deadline_steady_ns) noexcept {
     generation_.store(generation, std::memory_order_release);
     topic_epoch_.store(topic_epoch, std::memory_order_release);
-    deadline_steady_ns_.store(deadline ? steady_ns(*deadline) : 0, std::memory_order_release);
+    deadline_steady_ns_.store(deadline_steady_ns, std::memory_order_release);
     accepting_.store(true, std::memory_order_release);
 }
-
 void AdmissionGate::close() noexcept { accepting_.store(false, std::memory_order_release); }
 
 AdmissionResult AdmissionGate::admit(
@@ -35,7 +26,8 @@ AdmissionResult AdmissionGate::admit(
         not_accepting_.fetch_add(1, std::memory_order_relaxed);
         return AdmissionResult::NotAccepting;
     }
-    const auto now_ns = steady_ns(now);
+    const auto now_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
     const auto deadline = deadline_steady_ns_.load(std::memory_order_acquire);
     if (deadline != 0 && now_ns >= deadline) {
         accepting_.store(false, std::memory_order_release);
@@ -58,11 +50,11 @@ AdmissionResult AdmissionGate::admit(
 
 DropCounters AdmissionGate::counters() const noexcept {
     DropCounters result;
-    result.stale_identity = stale_identity_.load(std::memory_order_relaxed);
-    result.not_accepting = not_accepting_.load(std::memory_order_relaxed);
-    result.timed_deadline = timed_deadline_.load(std::memory_order_relaxed);
-    result.disk_unsafe = disk_unsafe_.load(std::memory_order_relaxed);
-    result.disk_snapshot_busy = disk_snapshot_busy_.load(std::memory_order_relaxed);
+    result.admission.stale_identity = stale_identity_.load(std::memory_order_relaxed);
+    result.admission.not_accepting = not_accepting_.load(std::memory_order_relaxed);
+    result.admission.timed_deadline = timed_deadline_.load(std::memory_order_relaxed);
+    result.admission.disk_unsafe = disk_unsafe_.load(std::memory_order_relaxed);
+    result.admission.disk_snapshot_busy = disk_snapshot_busy_.load(std::memory_order_relaxed);
     return result;
 }
 
