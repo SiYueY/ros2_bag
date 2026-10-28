@@ -12,9 +12,11 @@ include(CTest)
 
 find_package(rclcpp QUIET)
 find_package(rosbag2_cpp QUIET)
+find_package(ament_index_cpp QUIET)
+find_package(mcap_vendor QUIET)
 find_package(OpenSSL REQUIRED)
 
-if(rclcpp_FOUND AND rosbag2_cpp_FOUND)
+if(rclcpp_FOUND AND rosbag2_cpp_FOUND AND ament_index_cpp_FOUND AND mcap_vendor_FOUND)
   add_library(ros2_bag_recorder
     src/recorder/config.cpp
     src/recorder/message_pool.cpp
@@ -32,7 +34,7 @@ if(rclcpp_FOUND AND rosbag2_cpp_FOUND)
     src/recorder/schema.cpp)
   target_include_directories(ros2_bag_recorder PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_compile_features(ros2_bag_recorder PUBLIC cxx_std_17)
-  target_link_libraries(ros2_bag_recorder PUBLIC rclcpp::rclcpp rosbag2_cpp::rosbag2_cpp OpenSSL::Crypto)
+  target_link_libraries(ros2_bag_recorder PUBLIC rclcpp::rclcpp rosbag2_cpp::rosbag2_cpp ament_index_cpp::ament_index_cpp mcap_vendor::mcap OpenSSL::Crypto)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(ros2_bag_recorder PRIVATE -Wall -Wextra -Wpedantic -Werror)
   endif()

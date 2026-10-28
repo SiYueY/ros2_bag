@@ -3,9 +3,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <mutex>
 #include <thread>
 #include <optional>
 
@@ -59,6 +61,8 @@ private:
     DiskAdmissionState& admission_;
     SampleCallback callback_;
     std::atomic<bool> stopping_{false};
+    std::mutex stop_mutex_;
+    std::condition_variable stop_condition_;
     std::thread thread_;
     std::uint32_t consecutive_failures_ = 0;
 };

@@ -17,6 +17,7 @@ struct ResolvedSchema {
 
 std::string schema_sha256(const std::string& definition);
 Result<void, Error> validate_type_support(const std::string& type);
+Result<ResolvedSchema, Error> resolve_schema(const std::string& type);
 
 }  // namespace ros2_bag::recorder
 

@@ -19,6 +19,9 @@ struct RecordedMessage {
     std::size_t payload_bytes = 0;
     std::int64_t receive_timestamp_ns = 0;
     bool replayed = false;
+
+    // Keeps the frozen topic identity alive after Remove while queued data drains.
+    std::shared_ptr<const TopicInfo> topic;
 };
 
 }  // namespace ros2_bag::recorder

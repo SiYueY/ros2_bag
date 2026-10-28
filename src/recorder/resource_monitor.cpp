@@ -51,7 +51,10 @@ ResourceMonitor::~ResourceMonitor() {
     if (thread_.joinable()) thread_.join();
 }
 
-void ResourceMonitor::stop() { stopping_.store(true); }
+void ResourceMonitor::stop() {
+    stopping_.store(true);
+    stop_condition_.notify_all();
+}
 
 void ResourceMonitor::run() {
     while (!stopping_.load()) {
@@ -66,7 +69,8 @@ void ResourceMonitor::run() {
             callback_(value);
         } catch (...) {
         }
-        std::this_thread::sleep_for(config_.interval);
+        std::unique_lock<std::mutex> lock(stop_mutex_);
+        stop_condition_.wait_for(lock, config_.interval, [this] { return stopping_.load(); });
     }
 }
 

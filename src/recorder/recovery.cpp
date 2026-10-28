@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "ros2_bag/recorder/manifest.hpp"
+#include "ros2_bag/recorder/topic_events.hpp"
 
 namespace ros2_bag::recorder {
 namespace {
@@ -15,6 +16,15 @@ bool terminal(TaskState state) {
 
 Error storage_error(std::string message) {
     return {ErrorCode::StorageError, Effects::None, std::move(message)};
+}
+
+bool safe_relative_path(const std::string& path) {
+    const std::filesystem::path value(path);
+    if (value.empty() || value.is_absolute()) return false;
+    for (const auto& component : value) {
+        if (component == "..") return false;
+    }
+    return true;
 }
 
 }  // namespace
@@ -33,21 +43,45 @@ Result<RecoveryReport, Error> Recovery::run(const std::filesystem::path& output_
             continue;
         }
         Manifest manifest = loaded.value();
-        if (terminal(manifest.data().task.state)) continue;
-        if (manifest.data().manifest_revision == std::numeric_limits<std::uint64_t>::max()) {
-            report.findings.push_back({manifest.data().task.recording_id, "manifest_revision_exhausted", "manifest is read-only"});
+        const auto& data = manifest.data();
+        if (data.task.recording_id != entry.path().filename().string()) {
+            report.findings.push_back({data.task.recording_id, "manifest_directory_identity_mismatch",
+                                       "manifest recording id does not match task directory"});
             continue;
         }
-        ManifestData incomplete = manifest.data();
+        const auto events = TopicEvents::open(entry.path(), data.task.recording_id, data.task.generation);
+        if (!events) {
+            report.findings.push_back({data.task.recording_id, "topic_events_corrupt", events.error().message});
+        }
+        bool invalid_segment_path = false;
+        for (const auto& segment : data.segments) {
+            if (!safe_relative_path(segment.relative_path)) {
+                invalid_segment_path = true;
+                report.findings.push_back({data.task.recording_id, "segment_path_invalid", segment.relative_path});
+            }
+        }
+        if (terminal(data.task.state)) continue;
+        if (data.manifest_revision == std::numeric_limits<std::uint64_t>::max()) {
+            report.findings.push_back({data.task.recording_id, "manifest_revision_exhausted", "manifest is read-only"});
+            continue;
+        }
+        ManifestData incomplete = data;
         ++incomplete.manifest_revision;
         incomplete.task.state = TaskState::Incomplete;
         incomplete.task.error = Error{ErrorCode::StorageError, Effects::ConfirmedPartial, "recovery interrupted active task"};
+        for (auto& segment : incomplete.segments) {
+            if (segment.state == SegmentLifecycleState::Writing || segment.state == SegmentLifecycleState::Finalizing) {
+                segment.state = SegmentLifecycleState::Incomplete;
+            }
+        }
         const auto committed = manifest.commit(incomplete);
         if (!committed) {
             report.findings.push_back({incomplete.task.recording_id, "incomplete_commit_failed", committed.error().message});
             continue;
         }
-        report.findings.push_back({incomplete.task.recording_id, "task_marked_incomplete", "recovery did not resume prior recording"});
+        report.findings.push_back({incomplete.task.recording_id, "task_marked_incomplete",
+                                   invalid_segment_path ? "recovery did not resume prior recording; invalid segment path retained" :
+                                                          "recovery did not resume prior recording"});
     }
     return Result<RecoveryReport, Error>(std::move(report));
 }

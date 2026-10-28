@@ -9,6 +9,7 @@
 #include <limits>
 #include <nlohmann/json.hpp>
 #include <sstream>
+#include <unordered_map>
 
 namespace ros2_bag::recorder {
 namespace {
@@ -73,6 +74,36 @@ bool terminal_matches(TopicEventType prepared, TopicEventType terminal) {
             (terminal == TopicEventType::TopicRemoved || terminal == TopicEventType::RemoveFailed));
 }
 
+Result<void, Error> validate_chain(const std::vector<TopicEvent>& events) {
+    struct Operation {
+        TopicEventType prepared;
+        TopicId topic_id;
+        std::uint64_t topic_epoch;
+        bool terminal = false;
+    };
+    std::unordered_map<OperationId, Operation> operations;
+    for (const auto& event : events) {
+        if (event.operation_id.empty() || event.topic_id == 0 || event.topic_epoch == 0) {
+            return Result<void, Error>(unexpect, storage_error("invalid topic event identity"));
+        }
+        if (is_prepared(event.type)) {
+            if (operations.find(event.operation_id) != operations.end()) {
+                return Result<void, Error>(unexpect, storage_error("duplicate topic operation prepared event"));
+            }
+            operations.emplace(event.operation_id, Operation{event.type, event.topic_id, event.topic_epoch, false});
+            continue;
+        }
+        const auto operation = operations.find(event.operation_id);
+        if (operation == operations.end() || operation->second.terminal ||
+            !terminal_matches(operation->second.prepared, event.type) ||
+            operation->second.topic_id != event.topic_id || operation->second.topic_epoch != event.topic_epoch) {
+            return Result<void, Error>(unexpect, storage_error("invalid topic event transition"));
+        }
+        operation->second.terminal = true;
+    }
+    return Result<void, Error>();
+}
+
 Result<std::vector<TopicEvent>, Error> read_events(const std::filesystem::path& path) {
     std::ifstream input(path);
     if (!input) return Result<std::vector<TopicEvent>, Error>(unexpect, storage_error("cannot open topic event file"));
@@ -96,6 +127,20 @@ Result<std::vector<TopicEvent>, Error> read_events(const std::filesystem::path& 
     return Result<std::vector<TopicEvent>, Error>(std::move(events));
 }
 
+bool write_all(const int file, const char* bytes, std::size_t remaining) {
+    while (remaining != 0) {
+        const auto written = ::write(file, bytes, remaining);
+        if (written > 0) {
+            bytes += written;
+            remaining -= static_cast<std::size_t>(written);
+            continue;
+        }
+        if (written < 0 && errno == EINTR) continue;
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 Result<TopicEvents, Error> TopicEvents::open(
@@ -111,6 +156,8 @@ Result<TopicEvents, Error> TopicEvents::open(
             return Result<TopicEvents, Error>(unexpect, storage_error("topic event identity mismatch"));
         }
     }
+    const auto chain = validate_chain(events.value());
+    if (!chain) return Result<TopicEvents, Error>(unexpect, chain.error());
     const auto next = events->empty() ? 1 : events->back().event_seq + 1;
     if (next == 0) return Result<TopicEvents, Error>(unexpect, storage_error("topic event sequence exhausted"));
     return Result<TopicEvents, Error>(TopicEvents(path, std::move(recording_id), generation, next));
@@ -130,8 +177,7 @@ Result<std::uint64_t, Error> TopicEvents::append(TopicEvent event) {
     const std::string line = encode_event(event).dump() + "\n";
     const int file = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
     if (file < 0) return Result<std::uint64_t, Error>(unexpect, storage_error(std::strerror(errno)));
-    const auto written = ::write(file, line.data(), line.size());
-    const bool durable = written == static_cast<ssize_t>(line.size()) && ::fsync(file) == 0;
+    const bool durable = write_all(file, line.data(), line.size()) && ::fsync(file) == 0;
     const int saved_errno = errno;
     ::close(file);
     if (!durable) {
@@ -144,6 +190,9 @@ Result<std::uint64_t, Error> TopicEvents::append(TopicEvent event) {
 }
 
 Result<TopicOperationState, Error> TopicEvents::operation_state(const OperationId& operation_id) const {
+    if (!std::filesystem::exists(path_)) {
+        return Result<TopicOperationState, Error>(TopicOperationState::NotFound);
+    }
     const auto events = read_events(path_);
     if (!events) return Result<TopicOperationState, Error>(unexpect, events.error());
     std::optional<TopicEvent> prepared;

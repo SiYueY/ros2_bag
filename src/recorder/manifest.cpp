@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -17,6 +18,39 @@ using nlohmann::json;
 
 Error storage_error(std::string message, Effects effects = Effects::None) {
     return Error{ErrorCode::StorageError, effects, std::move(message)};
+}
+
+std::string manifest_message(std::string message) {
+    constexpr std::size_t maximum = 512;
+    constexpr std::size_t prefix_maximum = maximum - 3;
+    if (message.size() <= maximum) return message;
+    std::size_t offset = 0;
+    while (offset < message.size() && offset < prefix_maximum) {
+        const auto lead = static_cast<unsigned char>(message[offset]);
+        std::size_t width = 1;
+        if ((lead & 0x80U) == 0U) {
+            width = 1;
+        } else if ((lead & 0xe0U) == 0xc0U) {
+            width = 2;
+        } else if ((lead & 0xf0U) == 0xe0U) {
+            width = 3;
+        } else if ((lead & 0xf8U) == 0xf0U) {
+            width = 4;
+        } else {
+            break;
+        }
+        if (offset + width > prefix_maximum || offset + width > message.size()) break;
+        bool valid = true;
+        for (std::size_t index = 1; index < width; ++index) {
+            if ((static_cast<unsigned char>(message[offset + index]) & 0xc0U) != 0x80U) {
+                valid = false;
+                break;
+            }
+        }
+        if (!valid) break;
+        offset += width;
+    }
+    return message.substr(0, offset) + "...";
 }
 
 template <class T>
@@ -33,7 +67,8 @@ std::optional<T> optional_from_json(const json& value, const char* name) {
 }
 
 json encode_error(const Error& error) {
-    return {{"code", static_cast<int>(error.code)}, {"effects", static_cast<int>(error.effects)}, {"message", error.message}};
+    return {{"code", static_cast<int>(error.code)}, {"effects", static_cast<int>(error.effects)},
+            {"message", manifest_message(error.message)}};
 }
 
 Error decode_error(const json& value) {
@@ -103,7 +138,10 @@ json encode(const ManifestData& data) {
     optional_to_json(value, "terminal_time_ns", data.task.terminal_time_ns);
     value["error"] = data.task.error ? encode_error(*data.task.error) : json(nullptr);
     value["secondary_errors"] = json::array();
-    for (const auto& error : data.secondary_errors) value["secondary_errors"].push_back(encode_error(error));
+    const auto secondary_count = std::min<std::size_t>(data.secondary_errors.size(), 8);
+    for (std::size_t index = 0; index < secondary_count; ++index) {
+        value["secondary_errors"].push_back(encode_error(data.secondary_errors[index]));
+    }
     value["segments"] = json::array();
     for (const auto& segment : data.segments) value["segments"].push_back(encode_segment(segment));
     return value;
@@ -137,9 +175,11 @@ Result<void, Error> write_durable(const std::filesystem::path& path, const json&
     std::size_t offset = 0;
     while (offset < serialized.size()) {
         const auto written = ::write(file, serialized.data() + offset, serialized.size() - offset);
+        if (written < 0 && errno == EINTR) continue;
         if (written <= 0) {
             const auto message = std::strerror(errno);
             ::close(file);
+            ::unlink(temporary.c_str());
             return Result<void, Error>(unexpect, storage_error(message));
         }
         offset += static_cast<std::size_t>(written);
@@ -147,12 +187,18 @@ Result<void, Error> write_durable(const std::filesystem::path& path, const json&
     if (::fsync(file) != 0) {
         const auto message = std::strerror(errno);
         ::close(file);
+        ::unlink(temporary.c_str());
         return Result<void, Error>(unexpect, storage_error(message));
     }
     if (::close(file) != 0) {
+        ::unlink(temporary.c_str());
         return Result<void, Error>(unexpect, storage_error(std::strerror(errno)));
     }
-    if (::rename(temporary.c_str(), path.c_str()) != 0) return Result<void, Error>(unexpect, storage_error(std::strerror(errno)));
+    if (::rename(temporary.c_str(), path.c_str()) != 0) {
+        const auto message = std::strerror(errno);
+        ::unlink(temporary.c_str());
+        return Result<void, Error>(unexpect, storage_error(message));
+    }
     const int directory = ::open(path.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (directory < 0 || ::fsync(directory) != 0) {
         if (directory >= 0) ::close(directory);
