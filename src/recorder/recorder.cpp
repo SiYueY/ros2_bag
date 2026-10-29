@@ -772,6 +772,8 @@ public:
 
     template <class T>
     void handle_operation_exception(const CompletionSource<T>& source, ErrorCode code) {
+        unsigned owned = 1;
+        start_commit_authority_.compare_exchange_strong(owned, 0);
         // Empty messages make the bad_alloc boundary itself allocation-free.
         Error failure{code, operation_effects_, {}};
         if (manifest_ && manifest_->poisoned()) {
@@ -1031,10 +1033,9 @@ public:
             return;
         }
         const auto now = std::chrono::steady_clock::now();
-        ManifestData updated = manifest_->data();
-        std::vector<DeleteWork> work;
         std::optional<std::chrono::steady_clock::time_point> next_due;
-        for (auto& segment : updated.segments) {
+        const auto candidates = manifest_->data().segments;
+        for (const auto& segment : candidates) {
             const auto completed = completed_segment_steady_.find(segment.segment_id);
             if (segment.state != SegmentLifecycleState::Complete ||
                 completed == completed_segment_steady_.end()) {
@@ -1047,22 +1048,29 @@ public:
                 }
                 continue;
             }
-            segment.state = SegmentLifecycleState::Deleting;
-            work.push_back(DeleteWork{
-                updated.task.recording_id, segment.segment_id,
-                manifest_->task_directory() / segment.relative_path,
-                updated.manifest_revision + 1});
-        }
-        if (!work.empty() &&
-            updated.manifest_revision == std::numeric_limits<std::uint64_t>::max()) {
-            state_.recorder_state = RecorderState::Failed;
-            state_.last_error = error(
-                ErrorCode::StorageError, "manifest revision exhausted", Effects::ConfirmedPartial);
-            poisoned_ = persistence_poisoned();
-            return;
-        }
-        if (!work.empty()) {
+            ManifestData updated = manifest_->data();
+            if (updated.manifest_revision == std::numeric_limits<std::uint64_t>::max()) {
+                state_.recorder_state = RecorderState::Failed;
+                state_.last_error = error(
+                    ErrorCode::StorageError, "manifest revision exhausted",
+                    Effects::ConfirmedPartial);
+                poisoned_ = persistence_poisoned();
+                return;
+            }
+            auto entry = std::find_if(
+                updated.segments.begin(), updated.segments.end(),
+                [&segment](const SegmentInfo& candidate) {
+                    return candidate.segment_id == segment.segment_id;
+                });
+            if (entry == updated.segments.end() ||
+                entry->state != SegmentLifecycleState::Complete) {
+                continue;
+            }
+            entry->state = SegmentLifecycleState::Deleting;
             ++updated.manifest_revision;
+            DeleteWork work{
+                updated.task.recording_id, entry->segment_id,
+                manifest_->task_directory() / entry->relative_path, updated.manifest_revision};
             const auto committed = manifest_->commit(std::move(updated));
             if (!committed) {
                 state_.recorder_state = RecorderState::Failed;
@@ -1070,17 +1078,15 @@ public:
                 poisoned_ = persistence_poisoned();
                 return;
             }
-        }
-        while (!cleanup_retry_.empty() && enqueue_cleanup(cleanup_retry_.front())) {
-            cleanup_retry_.pop_front();
-        }
-        for (const auto& item : work) {
-            if (!enqueue_cleanup(item)) {
-                cleanup_retry_.push_back(item);
+            if (!enqueue_cleanup(work)) {
+                cleanup_retry_.push_back(std::move(work));
                 state_.cleanup.queue_full++;
                 state_.cleanup.last_error =
                     error(ErrorCode::ResourceExhausted, "cleanup queue is full");
             }
+        }
+        while (!cleanup_retry_.empty() && enqueue_cleanup(cleanup_retry_.front())) {
+            cleanup_retry_.pop_front();
         }
         if (!cleanup_retry_.empty()) {
             const auto retry_due = now + config_.cleanup.retry_interval;
@@ -1489,6 +1495,7 @@ public:
         if (!shutdown_requested_.compare_exchange_strong(expected, true)) {
             return;
         }
+        start_commit_authority_.exchange(2);
         std::lock_guard<std::mutex> lock(queue_mutex_);
         shutdown_event_ = [this] {
             std::shared_ptr<Writer> writer;
@@ -1791,6 +1798,8 @@ public:
     std::uint64_t next_generation_ = 1;
     bool poisoned_ = false;
     std::atomic<bool> shutdown_requested_{false};
+    // 0: available, 1: Start owns its final commit, 2: shutdown owns the barrier.
+    std::atomic<unsigned> start_commit_authority_{0};
     std::atomic<std::uint64_t> initializing_generation_{0};
     std::atomic<std::int64_t> timed_deadline_steady_ns_{0};
     std::atomic<std::int64_t> rolling_deadline_steady_ns_{0};
@@ -1918,7 +1927,7 @@ Completion<TaskInfo> Recorder::start(const StartOptions& options) {
                 implementation->operation_effects_ = Effects::ConfirmedPartial;
                 lock.unlock();
                 const auto events =
-                    TopicEvents::open(directory, data.task.recording_id, data.task.generation);
+                    TopicEvents::create(directory, data.task.recording_id, data.task.generation);
                 lock.lock();
                 if (!events) {
                     auto failure = events.error();
@@ -2103,7 +2112,10 @@ Completion<TaskInfo> Recorder::start(const StartOptions& options) {
                         (void)implementation->submit_critical(
                             Implementation::SystemEvent::DiskSample, std::move(apply_sample));
                     });
-                if (implementation->shutdown_requested_.load()) {
+                unsigned available = 0;
+                if (implementation->shutdown_requested_.load() ||
+                    !implementation->start_commit_authority_.compare_exchange_strong(
+                        available, 1)) {
                     implementation->state_.recorder_state = RecorderState::Failed;
                     auto failure = error(
                         ErrorCode::InvalidState, "shutdown interrupted Start",
@@ -2119,6 +2131,8 @@ Completion<TaskInfo> Recorder::start(const StartOptions& options) {
                 const auto committed = implementation->manifest_->commit(recording);
                 lock.lock();
                 if (!committed) {
+                    unsigned owned = 1;
+                    implementation->start_commit_authority_.compare_exchange_strong(owned, 0);
                     implementation->state_.recorder_state = RecorderState::Failed;
                     implementation->state_.last_error = committed.error();
                     implementation->poisoned_ = implementation->persistence_poisoned();
@@ -2147,6 +2161,8 @@ Completion<TaskInfo> Recorder::start(const StartOptions& options) {
                     implementation->apply_disk_safety();
                 }
                 source.set_value(recording.task);
+                unsigned owned = 1;
+                implementation->start_commit_authority_.compare_exchange_strong(owned, 0);
             })) {
         source.set_error(error(ErrorCode::ResourceExhausted, "recorder mutation queue is full"));
     }
@@ -2448,9 +2464,10 @@ Completion<TopicInfo> Recorder::add_topic(
                     source.set_error(error(ErrorCode::Unavailable, "ROS node is not available"));
                     return;
                 }
-                if (implementation->state_.recorder_state != RecorderState::Recording) {
+                if (implementation->state_.recorder_state != RecorderState::Recording &&
+                    implementation->state_.recorder_state != RecorderState::Paused) {
                     source.set_error(
-                        error(ErrorCode::InvalidState, "topics can only be added while recording"));
+                        error(ErrorCode::InvalidState, "topics require an active task"));
                     return;
                 }
                 if (operation_id.empty()) {

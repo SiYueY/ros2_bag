@@ -169,8 +169,7 @@ void test_manifest_commit() {
     next.manifest_revision = 2;
     next.task.state = ros2_bag::recorder::TaskState::Recording;
     next.task.error = ros2_bag::recorder::Error{
-        ros2_bag::recorder::ErrorCode::StorageError,
-        ros2_bag::recorder::Effects::None,
+        ros2_bag::recorder::ErrorCode::StorageError, ros2_bag::recorder::Effects::None,
         std::string(600, 'x')};
     auto manifest = std::move(created).value();
     CHECK(manifest.commit(next).has_value());
@@ -277,8 +276,7 @@ void test_recovery_rejects_task_root_deletion() {
     CHECK(report.has_value());
     CHECK(std::filesystem::exists(directory / "manifest.json"));
     CHECK(std::any_of(
-        report->findings.begin(),
-        report->findings.end(),
+        report->findings.begin(), report->findings.end(),
         [](const ros2_bag::recorder::RecoveryFinding& finding) {
             return finding.recording_id == "unsafe-delete" &&
                    finding.code == "segment_path_invalid";
@@ -301,8 +299,7 @@ void test_recovery_ignores_task_directory_symlink() {
     CHECK(ros2_bag::recorder::Manifest::create(outside / data.task.recording_id, data).has_value());
     std::filesystem::create_directories(root);
     std::filesystem::create_directory_symlink(
-        outside / data.task.recording_id,
-        root / "linked-task");
+        outside / data.task.recording_id, root / "linked-task");
     const auto report = ros2_bag::recorder::Recovery::run(root);
     CHECK(report.has_value());
     const auto untouched = ros2_bag::recorder::Manifest::load(outside / data.task.recording_id);
@@ -370,7 +367,7 @@ void test_topic_events() {
     std::error_code ignored;
     std::filesystem::remove_all(root, ignored);
     std::filesystem::create_directories(root);
-    auto events = ros2_bag::recorder::TopicEvents::open(root, "events-test", 1).value();
+    auto events = ros2_bag::recorder::TopicEvents::create(root, "events-test", 1).value();
     ros2_bag::recorder::TopicEvent prepared;
     prepared.operation_id = "operation-1";
     prepared.topic_id = 4;
@@ -463,9 +460,7 @@ void test_cleanup() {
     std::atomic<bool> called{false};
     std::atomic<bool> succeeded{false};
     ros2_bag::recorder::Cleanup cleanup(
-        1,
-        std::chrono::seconds(1),
-        [&](ros2_bag::recorder::DeleteResult result) {
+        1, std::chrono::seconds(1), [&](ros2_bag::recorder::DeleteResult result) {
             succeeded.store(result.result.has_value());
             called.store(true);
         });
@@ -595,8 +590,7 @@ void test_admission_gate() {
     CHECK(gate.admit(3, 4, disk, now) == ros2_bag::recorder::AdmissionResult::Accepted);
     CHECK(gate.admit(2, 4, disk, now) == ros2_bag::recorder::AdmissionResult::StaleIdentity);
     gate.open(
-        3,
-        4,
+        3, 4,
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             (now + std::chrono::milliseconds(1)).time_since_epoch())
             .count());
@@ -618,9 +612,7 @@ void test_resource_monitor() {
     std::atomic<bool> sampled{false};
     {
         ros2_bag::recorder::ResourceMonitor monitor(
-            config,
-            admission,
-            [&](ros2_bag::recorder::DiskSample sample) {
+            config, admission, [&](ros2_bag::recorder::DiskSample sample) {
                 sampled.store(sample.state != ros2_bag::recorder::DiskSafetyState::Unknown);
             });
         for (int attempt = 0; attempt < 100 && !sampled.load(); ++attempt) {
@@ -713,8 +705,7 @@ void test_writer_mcap_smoke() {
     CHECK(!schema->data.empty());
     CHECK(!reader.chunkIndexes().empty());
     CHECK(std::any_of(
-        reader.chunkIndexes().begin(),
-        reader.chunkIndexes().end(),
+        reader.chunkIndexes().begin(), reader.chunkIndexes().end(),
         [](const mcap::ChunkIndex& chunk) { return chunk.compression == "lz4"; }));
 
     std::size_t message_count = 0;
@@ -738,9 +729,7 @@ void test_recorder_ros_integration() {
     executor.add_node(node);
     std::thread spinning([&executor] { executor.spin(); });
     auto publisher = node->create_generic_publisher(
-        "/recorder_foundation",
-        "std_msgs/msg/String",
-        rclcpp::QoS(10));
+        "/recorder_foundation", "std_msgs/msg/String", rclcpp::QoS(10));
     {
         ros2_bag::recorder::RecorderConfig config;
         config.output_root = root;
@@ -761,8 +750,7 @@ void test_recorder_ros_integration() {
         const auto discovered = recorder.discover_topics();
         CHECK(discovered.has_value());
         const auto discovered_topic = std::find_if(
-            discovered->begin(),
-            discovered->end(),
+            discovered->begin(), discovered->end(),
             [](const ros2_bag::recorder::DiscoveredTopic& candidate) {
                 return candidate.name == "/recorder_foundation";
             });
@@ -800,10 +788,7 @@ void test_recorder_ros_integration() {
         ros2_bag::recorder::TopicOptions duplicate_operation = topic;
         duplicate_operation.name = "/recorder_foundation_other";
         const auto duplicate = recorder.add_topic(
-            task.recording_id,
-            task.generation,
-            duplicate_operation,
-            "integration-add");
+            task.recording_id, task.generation, duplicate_operation, "integration-add");
         CHECK(duplicate.wait_for(std::chrono::seconds(5)));
         CHECK(!duplicate.result()->has_value());
         CHECK(duplicate.result()->error().code == ros2_bag::recorder::ErrorCode::InvalidArgument);
@@ -817,20 +802,14 @@ void test_recorder_ros_integration() {
         }
         CHECK(recorder.state().topics.front().messages.written != 0);
         const auto removed = recorder.remove_topic(
-            task.recording_id,
-            task.generation,
-            first_topic.topic_id,
-            first_topic.topic_epoch,
+            task.recording_id, task.generation, first_topic.topic_id, first_topic.topic_epoch,
             "integration-remove");
         CHECK(removed.wait_for(std::chrono::seconds(5)));
         CHECK(removed.result()->has_value());
         ros2_bag::recorder::TopicOptions conflicting_topic = topic;
         conflicting_topic.type = "std_msgs/msg/UInt32";
         const auto conflicting = recorder.add_topic(
-            task.recording_id,
-            task.generation,
-            conflicting_topic,
-            "integration-type-conflict");
+            task.recording_id, task.generation, conflicting_topic, "integration-type-conflict");
         CHECK(conflicting.wait_for(std::chrono::seconds(5)));
         CHECK(!conflicting.result()->has_value());
         CHECK(

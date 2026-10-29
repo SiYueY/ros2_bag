@@ -1667,6 +1667,11 @@ RecorderState::Initializing -> RecorderState::Recording
 → Start Completion Success
 ```
 
+Start 在提交 Recording Manifest 前与 Shutdown 竞争一次最终提交权：Shutdown 先取得权时，
+Start 不提交 Recording 并以失败收尾；Start 先取得权时，它完成该持久化提交并返回其结果，
+随后 Shutdown 作为下一次生命周期 mutation 收尾。提交权的竞争是原子顺序，不依赖调用的
+墙钟先后；一旦提交权已经属于 Start，Shutdown 不取消已开始的 Manifest 工作。
+
 Initializing 期间 Pause/Resume/Add/Remove 均 `InvalidState / None`。Runtime Shutdown 可直接接管该 Task 的失败/关闭收尾，不要求用户先 Stop。
 
 ### Stop

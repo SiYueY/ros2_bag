@@ -167,7 +167,7 @@ Result<void, Error> TopicEvents::validate_chain(const std::vector<TopicEvent>& e
     return Result<void, Error>();
 }
 
-Result<TopicEvents, Error> TopicEvents::open(
+Result<TopicEvents, Error> TopicEvents::create(
     const std::filesystem::path& task_directory, std::string recording_id,
     std::uint64_t generation) {
     const auto path = task_directory / "topic_events.jsonl";
@@ -175,8 +175,8 @@ Result<TopicEvents, Error> TopicEvents::open(
     if (!std::filesystem::is_directory(status)) {
         return Result<TopicEvents, Error>(unexpect, storage_error("unsafe task directory"));
     }
-    const int file =
-        ::open(path.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0644);
+    const int file = ::open(
+        path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0644);
     if (file < 0) {
         return Result<TopicEvents, Error>(unexpect, storage_error("cannot open topic events"));
     }
@@ -193,6 +193,18 @@ Result<TopicEvents, Error> TopicEvents::open(
     if (!durable) {
         return Result<TopicEvents, Error>(
             unexpect, storage_error("topic event file durability is uncertain", Effects::Possible));
+    }
+
+    return Result<TopicEvents, Error>(TopicEvents(path, std::move(recording_id), generation, 1));
+}
+
+Result<TopicEvents, Error> TopicEvents::open(
+    const std::filesystem::path& task_directory, std::string recording_id,
+    std::uint64_t generation) {
+    const auto path = task_directory / "topic_events.jsonl";
+    const auto status = std::filesystem::symlink_status(task_directory);
+    if (!std::filesystem::is_directory(status)) {
+        return Result<TopicEvents, Error>(unexpect, storage_error("unsafe task directory"));
     }
 
     const auto events = read_events(path);
@@ -284,7 +296,8 @@ Result<std::uint64_t, Error> TopicEvents::append(TopicEvent event) {
 Result<TopicOperationState, Error> TopicEvents::operation_state(
     const OperationId& operation_id) const {
     if (!std::filesystem::exists(path_)) {
-        return Result<TopicOperationState, Error>(TopicOperationState::NotFound);
+        return Result<TopicOperationState, Error>(
+            unexpect, storage_error("topic event file is missing"));
     }
 
     const auto events = read_events(path_);

@@ -24,6 +24,7 @@
 
 #include "ros2_bag/recorder/manifest.hpp"
 #include "ros2_bag/recorder/message_pool.hpp"
+#include "ros2_bag/recorder/recovery.hpp"
 #include "ros2_bag/recorder/topic_events.hpp"
 #include "ros2_bag/recorder/writer.hpp"
 #include <rclcpp/executors/single_threaded_executor.hpp>
@@ -64,6 +65,8 @@ enum class Fault {
     ManifestSync,
     EventsSync,
     EventsBlock,
+    RecordingCommitBlock,
+    SecondManifestSync,
     ThreadCreation,
     SampleAllocation,
     EventsTerminalSync,
@@ -82,6 +85,7 @@ std::atomic<int> writer_opens{0};
 std::atomic<bool> secondary_close_failure{false};
 std::atomic<int> thread_fail_after{0};
 std::atomic<int> task_directory_syncs{0};
+std::atomic<int> manifest_file_syncs{0};
 
 bool ends_with(const char* value, const char* suffix) {
     const auto size = std::strlen(value);
@@ -223,6 +227,34 @@ void test_initializing_and_shutdown_saturation() {
     fault.store(Fault::None);
 }
 
+void test_start_commit_authority_before_shutdown() {
+    auto config = config_for("start_commit_shutdown");
+    rec::Recorder recorder(config);
+    {
+        std::lock_guard<std::mutex> lock(barrier_mutex);
+        blocked = false;
+        released = false;
+    }
+    manifest_file_syncs.store(0);
+    fault.store(Fault::RecordingCommitBlock);
+    const auto start = recorder.start(options_for());
+    {
+        std::unique_lock<std::mutex> lock(barrier_mutex);
+        CHECK(barrier_condition.wait_for(lock, 3s, [] { return blocked; }));
+    }
+    const auto shutdown = recorder.shutdown();
+    CHECK(!start.done());
+    CHECK(!shutdown.done());
+    {
+        std::lock_guard<std::mutex> lock(barrier_mutex);
+        released = true;
+    }
+    barrier_condition.notify_all();
+    CHECK(await(start));
+    CHECK(await(shutdown));
+    fault.store(Fault::None);
+}
+
 void test_initialization_failure_can_restart() {
     for (const auto kind : {Fault::EventsSync, Fault::ThreadCreation, Fault::ManifestSync}) {
         auto config = config_for("init_failure");
@@ -289,8 +321,9 @@ void test_topic_events_durable_and_safe() {
     std::filesystem::create_directories(config.output_root / "task");
     event_file_syncs.store(0);
     task_directory_syncs.store(0);
-    auto events = rec::TopicEvents::open(config.output_root / "task", "task", 1);
+    auto events = rec::TopicEvents::create(config.output_root / "task", "task", 1);
     CHECK(events);
+    CHECK(!rec::TopicEvents::create(config.output_root / "task", "task", 1));
     CHECK(event_file_syncs.load() == 1);
     CHECK(task_directory_syncs.load() == 1);
     rec::TopicEvent prepared;
@@ -307,6 +340,66 @@ void test_topic_events_durable_and_safe() {
     std::filesystem::rename(config.output_root / "task/topic_events.jsonl", external);
     std::filesystem::create_symlink(external, config.output_root / "task/topic_events.jsonl");
     CHECK(!rec::TopicEvents::open(config.output_root / "task", "task", 1));
+}
+
+void test_missing_event_evidence_is_not_created() {
+    auto config = config_for("missing_events");
+    rec::ManifestData data;
+    data.manifest_revision = 1;
+    data.task.recording_id = "task";
+    data.task.generation = 1;
+    data.task.state = rec::TaskState::Completed;
+    const auto directory = config.output_root / "task";
+    CHECK(rec::Manifest::create(directory, data));
+    CHECK(!rec::TopicEvents::open(directory, "task", 1));
+    {
+        rec::Recorder recorder(config);
+        CHECK(!recorder.topic_operation_state("task", "operation"));
+        CHECK(await(recorder.shutdown()));
+    }
+    const auto recovery = rec::Recovery::run(config.output_root);
+    CHECK(recovery);
+    CHECK(std::any_of(
+        recovery->findings.begin(), recovery->findings.end(),
+        [](const auto& finding) { return finding.code == "topic_events_corrupt"; }));
+    CHECK(!std::filesystem::exists(directory / "topic_events.jsonl"));
+}
+
+void test_add_while_paused() {
+    auto config = config_for("paused_add");
+    auto node = std::make_shared<rclcpp::Node>("paused_add");
+    rec::Recorder recorder(config, node);
+    const auto task = await(recorder.start(options_for()));
+    CHECK(task);
+    CHECK(await(recorder.pause("task", task->generation)));
+    rec::TopicOptions topic;
+    topic.name = "/paused_add";
+    topic.type = "std_msgs/msg/String";
+    CHECK(await(recorder.add_topic("task", task->generation, topic, "add")));
+    CHECK(recorder.state().topics.front().state == rec::TopicRuntimeState::Armed);
+    CHECK(await(recorder.resume("task", task->generation)));
+    CHECK(recorder.state().topics.front().state == rec::TopicRuntimeState::Active);
+    CHECK(await(recorder.stop("task", task->generation)));
+    CHECK(await(recorder.shutdown()));
+}
+
+void test_add_while_disk_paused() {
+    auto config = config_for("disk_paused_add");
+    auto node = std::make_shared<rclcpp::Node>("disk_paused_add");
+    rec::Recorder recorder(config, node);
+    const auto task = await(recorder.start(options_for()));
+    CHECK(task);
+    fault.store(Fault::DiskCritical);
+    CHECK(
+        eventually([&] { return recorder.state().pause.disk == rec::DiskPauseReason::Critical; }));
+    rec::TopicOptions topic;
+    topic.name = "/disk_paused_add";
+    topic.type = "std_msgs/msg/String";
+    CHECK(await(recorder.add_topic("task", task->generation, topic, "add")));
+    CHECK(recorder.state().topics.front().state == rec::TopicRuntimeState::Armed);
+    fault.store(Fault::None);
+    CHECK(await(recorder.stop("task", task->generation)));
+    CHECK(await(recorder.shutdown()));
 }
 
 void test_mutation_exception_boundary() {
@@ -546,6 +639,77 @@ void test_rolling_and_cleanup_under_pressure() {
     executor.remove_node(node);
 }
 
+void test_retention_commits_each_authorization() {
+    auto config = config_for("retention_partial");
+    auto node = std::make_shared<rclcpp::Node>("retention_partial");
+    rclcpp::executors::SingleThreadedExecutor executor;
+    executor.add_node(node);
+    std::thread spinning([&] { executor.spin(); });
+    auto publisher = node->create_generic_publisher(
+        "/retention_partial", "std_msgs/msg/String", rclcpp::QoS(10));
+    {
+        rec::Recorder recorder(config, node);
+        auto options = options_for();
+        options.mode = rec::StartOptions::Rolling{};
+        std::get<rec::StartOptions::Rolling>(options.mode).segment_duration = 1s;
+        std::get<rec::StartOptions::Rolling>(options.mode).retention_duration = 4s;
+        const auto task = await(recorder.start(options));
+        rec::TopicOptions topic;
+        topic.name = "/retention_partial";
+        topic.type = "std_msgs/msg/String";
+        CHECK(await(recorder.add_topic("task", task->generation, topic, "add")));
+        rclcpp::SerializedMessage serialized(4);
+        auto& bytes = serialized.get_rcl_serialized_message();
+        bytes.buffer[0] = 0;
+        bytes.buffer[1] = 1;
+        bytes.buffer[2] = 0;
+        bytes.buffer[3] = 0;
+        bytes.buffer_length = 4;
+        CHECK(eventually([&] {
+            publisher->publish(serialized);
+            const auto state = recorder.state();
+            return state.segments.current && state.segments.current->segment_id >= 3;
+        }));
+        CHECK(await(recorder.pause("task", task->generation)));
+        {
+            std::lock_guard<std::mutex> lock(barrier_mutex);
+            blocked = false;
+            released = false;
+        }
+        topic.name = "/retention_partial_second";
+        fault.store(Fault::EventsBlock);
+        const auto add = recorder.add_topic("task", task->generation, topic, "second");
+        {
+            std::unique_lock<std::mutex> lock(barrier_mutex);
+            CHECK(barrier_condition.wait_for(lock, 3s, [] { return blocked; }));
+        }
+        std::this_thread::sleep_for(4200ms);
+        manifest_file_syncs.store(0);
+        fault.store(Fault::SecondManifestSync);
+        {
+            std::lock_guard<std::mutex> lock(barrier_mutex);
+            released = true;
+        }
+        barrier_condition.notify_all();
+        CHECK(await(add));
+        CHECK(eventually(
+            [&] { return recorder.state().recorder_state == rec::RecorderState::Idle; }));
+        fault.store(Fault::None);
+        CHECK(await(recorder.shutdown()));
+        const auto manifest = rec::Manifest::load(config.output_root / "task");
+        CHECK(manifest);
+        CHECK(manifest->data().segments.size() >= 3);
+        CHECK(
+            manifest->data().segments[0].state == rec::SegmentLifecycleState::Removed ||
+            manifest->data().segments[0].state == rec::SegmentLifecycleState::Deleting);
+        CHECK(manifest->data().segments[1].state == rec::SegmentLifecycleState::Complete);
+        CHECK(std::filesystem::exists(config.output_root / "task/segment_000002"));
+    }
+    executor.cancel();
+    spinning.join();
+    executor.remove_node(node);
+}
+
 void test_topic_barriers_and_effects() {
     for (const bool removing : {false, true}) {
         for (const bool terminal : {false, true}) {
@@ -692,6 +856,7 @@ extern "C" int __wrap_fsync(int file) {
     }
     path[size] = 0;
     const bool events = ends_with(path, "/topic_events.jsonl");
+    const bool manifest = ends_with(path, "/manifest.json.tmp");
     const bool directory = ends_with(path, "/task");
     int event_index = 0;
     if (events) {
@@ -701,6 +866,13 @@ extern "C" int __wrap_fsync(int file) {
         ++task_directory_syncs;
     }
     auto kind = fault.load();
+    const int manifest_index = manifest ? ++manifest_file_syncs : 0;
+    if (manifest && kind == Fault::RecordingCommitBlock && manifest_index == 2) {
+        std::unique_lock<std::mutex> lock(barrier_mutex);
+        blocked = true;
+        barrier_condition.notify_all();
+        barrier_condition.wait(lock, [] { return released; });
+    }
     if (events && kind == Fault::EventsBlock) {
         std::unique_lock<std::mutex> lock(barrier_mutex);
         blocked = true;
@@ -710,7 +882,8 @@ extern "C" int __wrap_fsync(int file) {
     if ((directory && kind == Fault::InitialDirectorySync) ||
         (events &&
          (kind == Fault::EventsSync || (kind == Fault::EventsTerminalSync && event_index == 2))) ||
-        (ends_with(path, "/manifest.json.tmp") && kind == Fault::ManifestSync)) {
+        (manifest && (kind == Fault::ManifestSync ||
+                      (kind == Fault::SecondManifestSync && manifest_index == 2)))) {
         fault.store(Fault::None);
         errno = EIO;
         return -1;
@@ -819,9 +992,13 @@ int main(int argc, char** argv) {
     test_start_disk();
     test_initial_uncertainty();
     test_initializing_and_shutdown_saturation();
+    test_start_commit_authority_before_shutdown();
     test_initialization_failure_can_restart();
     test_partial_thread_initialization();
     test_topic_events_durable_and_safe();
+    test_missing_event_evidence_is_not_created();
+    test_add_while_paused();
+    test_add_while_disk_paused();
     test_mutation_exception_boundary();
     test_timed_under_mutation_pressure();
     test_timed_failure_can_restart();
@@ -831,6 +1008,7 @@ int main(int argc, char** argv) {
     test_writer_open_and_register_failure();
     test_ros_safety_and_failure();
     test_rolling_and_cleanup_under_pressure();
+    test_retention_commits_each_authorization();
     rclcpp::shutdown();
     return failures.load() == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

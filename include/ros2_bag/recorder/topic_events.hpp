@@ -38,9 +38,12 @@ struct TopicEvent {
 
 class TopicEvents {
 public:
+    static Result<TopicEvents, Error> create(
+        const std::filesystem::path& task_directory, std::string recording_id,
+        std::uint64_t generation);
+
     static Result<TopicEvents, Error> open(
-        const std::filesystem::path& task_directory,
-        std::string recording_id,
+        const std::filesystem::path& task_directory, std::string recording_id,
         std::uint64_t generation);
 
     Result<std::uint64_t, Error> append(TopicEvent event);
@@ -49,9 +52,7 @@ public:
 
 private:
     TopicEvents(
-        std::filesystem::path path,
-        std::string recording_id,
-        std::uint64_t generation,
+        std::filesystem::path path, std::string recording_id, std::uint64_t generation,
         std::uint64_t next_sequence);
 
     static bool terminal_matches(TopicEventType prepared, TopicEventType terminal) noexcept;
