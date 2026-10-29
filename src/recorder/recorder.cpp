@@ -488,6 +488,21 @@ public:
         std::terminate();  // A full result channel would violate credit conservation.
     }
 
+    // Mutation domain only, after the cleanup worker has joined.
+    void drain_cleanup_results() {
+        for (auto& slot : cleanup_results_) {
+            std::optional<DeleteResult> result;
+            {
+                std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+                result = std::move(slot);
+                slot.reset();
+            }
+            if (result) {
+                apply_cleanup_result(std::move(*result));
+            }
+        }
+    }
+
     void apply_cleanup_result(DeleteResult result) {
         --cleanup_outstanding_;
         std::unique_lock<std::mutex> lock(state_mutex_);
@@ -675,7 +690,7 @@ public:
         close_ingress_locked();
         auto topics = std::move(active_topics_);
         const auto writer = writer_;
-        auto cleanup = std::move(cleanup_);
+        auto* cleanup = cleanup_.get();
         lock.unlock();
         for (auto& entry : topics) {
             std::unique_lock<std::mutex> ingress_lock(entry.second.ingress->mutex);
@@ -692,7 +707,11 @@ public:
                 secondary = closed.error();
             }
         }
-        cleanup.reset();
+        if (cleanup) {
+            cleanup->stop();
+            cleanup->join();
+            drain_cleanup_results();
+        }
         lock.lock();
         poisoned_ = poisoned_ || (manifest_ && manifest_->poisoned());
         bool terminal = false;
@@ -731,6 +750,7 @@ public:
         snapshot_.reset();
         message_queue_.reset();
         message_pool_.reset();
+        cleanup_.reset();
         cleanup_retry_.clear();
         timed_deadline_steady_ns_.store(0);
         rolling_deadline_steady_ns_.store(0);
@@ -1199,13 +1219,20 @@ public:
         }
         rolling_due_steady_ = std::chrono::steady_clock::time_point{};
         state_.recorder_state = RecorderState::Stopping;
+        std::vector<std::shared_ptr<Ingress>> ingress_barriers;
+        ingress_barriers.reserve(active_topics_.size());
         for (auto& entry : active_topics_) {
             entry.second.admission->close();
-            std::unique_lock<std::mutex> ingress_lock(entry.second.ingress->mutex);
+            std::lock_guard<std::mutex> ingress_lock(entry.second.ingress->mutex);
             entry.second.ingress->open = false;
-            entry.second.ingress->condition.wait(
-                ingress_lock, [&entry] { return entry.second.ingress->producers == 0; });
+            ingress_barriers.push_back(entry.second.ingress);
         }
+        lock.unlock();
+        for (const auto& ingress : ingress_barriers) {
+            std::unique_lock<std::mutex> ingress_lock(ingress->mutex);
+            ingress->condition.wait(ingress_lock, [&ingress] { return ingress->producers == 0; });
+        }
+        lock.lock();
         auto previous = *state_.segments.current;
         const auto generation = state_.task->generation;
         const auto writer = writer_;
@@ -1416,16 +1443,20 @@ public:
         state_.recorder_state = RecorderState::Stopping;
         for (auto& entry : active_topics_) {
             entry.second.admission->close();
-            std::unique_lock<std::mutex> ingress_lock(entry.second.ingress->mutex);
+            std::lock_guard<std::mutex> ingress_lock(entry.second.ingress->mutex);
             entry.second.ingress->open = false;
-            entry.second.ingress->condition.wait(
-                ingress_lock, [&entry] { return entry.second.ingress->producers == 0; });
         }
-        active_topics_.clear();
+        auto topics = std::move(active_topics_);
         state_.topics.clear();
         const auto writer = writer_;
         const bool writer_open = writer_open_;
         lock.unlock();
+        for (auto& entry : topics) {
+            std::unique_lock<std::mutex> ingress_lock(entry.second.ingress->mutex);
+            entry.second.ingress->condition.wait(
+                ingress_lock, [&entry] { return entry.second.ingress->producers == 0; });
+        }
+        topics.clear();
         resource_monitor_.reset();
         stop_dispatch_thread();
         if (writer_open) {
@@ -1440,6 +1471,11 @@ public:
                 timed_deadline_steady_ns_.store(0, std::memory_order_release);
                 return;
             }
+        }
+        if (cleanup_) {
+            cleanup_->stop();
+            cleanup_->join();
+            drain_cleanup_results();
         }
         lock.lock();
         if (state_.recorder_state == RecorderState::Failed) {
@@ -1536,17 +1572,7 @@ public:
             }
             // The worker has joined; consume every result while the manifest
             // and cleanup ownership are still available to the mutation domain.
-            for (auto& slot : cleanup_results_) {
-                std::optional<DeleteResult> result;
-                {
-                    std::lock_guard<std::mutex> queue_lock(queue_mutex_);
-                    result = std::move(slot);
-                    slot.reset();
-                }
-                if (result) {
-                    apply_cleanup_result(std::move(*result));
-                }
-            }
+            drain_cleanup_results();
             {
                 std::lock_guard<std::mutex> state_lock(state_mutex_);
                 if (manifest_) {
@@ -2209,16 +2235,20 @@ Completion<void> Recorder::stop(std::string_view recording_id, std::uint64_t gen
                 implementation->state_.recorder_state = RecorderState::Stopping;
                 for (auto& entry : implementation->active_topics_) {
                     entry.second.admission->close();
-                    std::unique_lock<std::mutex> ingress_lock(entry.second.ingress->mutex);
+                    std::lock_guard<std::mutex> ingress_lock(entry.second.ingress->mutex);
                     entry.second.ingress->open = false;
-                    entry.second.ingress->condition.wait(
-                        ingress_lock, [&entry] { return entry.second.ingress->producers == 0; });
                 }
-                implementation->active_topics_.clear();
+                auto topics = std::move(implementation->active_topics_);
                 implementation->state_.topics.clear();
                 const auto writer = implementation->writer_;
                 const bool writer_open = implementation->writer_open_;
                 lock.unlock();
+                for (auto& entry : topics) {
+                    std::unique_lock<std::mutex> ingress_lock(entry.second.ingress->mutex);
+                    entry.second.ingress->condition.wait(
+                        ingress_lock, [&entry] { return entry.second.ingress->producers == 0; });
+                }
+                topics.clear();
                 implementation->resource_monitor_.reset();
                 implementation->stop_dispatch_thread();
                 if (writer_open) {
@@ -2233,6 +2263,11 @@ Completion<void> Recorder::stop(std::string_view recording_id, std::uint64_t gen
                         source.set_error(*implementation->state_.last_error);
                         return;
                     }
+                }
+                if (implementation->cleanup_) {
+                    implementation->cleanup_->stop();
+                    implementation->cleanup_->join();
+                    implementation->drain_cleanup_results();
                 }
                 lock.lock();
                 if (implementation->state_.recorder_state == RecorderState::Failed) {
@@ -2742,6 +2777,20 @@ Completion<TopicInfo> Recorder::add_topic(
                          queue_full = &implementation->queue_full_, counters, generation,
                          topic_id = info.topic_id, topic_epoch = info.topic_epoch](
                             std::shared_ptr<rclcpp::SerializedMessage> message) {
+                            // Acquire the producer lease before touching any
+                            // Recorder-owned state. An executor may retain a
+                            // callback after the subscription is detached.
+                            std::shared_ptr<MessageQueue> queue;
+                            {
+                                std::lock_guard<std::mutex> ingress_lock(ingress->mutex);
+                                if (!ingress->open) {
+                                    counters->dropped.fetch_add(1, std::memory_order_relaxed);
+                                    return;
+                                }
+                                ++ingress->producers;
+                                queue = ingress->queue;
+                            }
+                            Implementation::Ingress::Producer producer(*ingress);
                             const auto admitted = admission->admit(generation, topic_epoch, *disk);
                             if (admitted != AdmissionResult::Accepted) {
                                 if (admitted == AdmissionResult::DiskUnsafe) {
@@ -2759,17 +2808,6 @@ Completion<TopicInfo> Recorder::add_topic(
                                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                                     std::chrono::steady_clock::now().time_since_epoch())
                                     .count());
-                            std::shared_ptr<MessageQueue> queue;
-                            {
-                                std::lock_guard<std::mutex> ingress_lock(ingress->mutex);
-                                if (!ingress->open) {
-                                    counters->dropped.fetch_add(1, std::memory_order_relaxed);
-                                    return;
-                                }
-                                ++ingress->producers;
-                                queue = ingress->queue;
-                            }
-                            Implementation::Ingress::Producer producer(*ingress);
                             try {
                                 if (!queue) {
                                     counters->dropped.fetch_add(1, std::memory_order_relaxed);
@@ -2983,12 +3021,17 @@ Completion<void> Recorder::remove_topic(
                 implementation->active_topics_.erase(found);
                 active.admission->close();
                 {
-                    std::unique_lock<std::mutex> ingress_lock(active.ingress->mutex);
+                    std::lock_guard<std::mutex> ingress_lock(active.ingress->mutex);
                     active.ingress->open = false;
+                }
+                lock.unlock();
+                {
+                    std::unique_lock<std::mutex> ingress_lock(active.ingress->mutex);
                     active.ingress->condition.wait(
                         ingress_lock, [&active] { return active.ingress->producers == 0; });
                 }
                 active.subscription.reset();
+                lock.lock();
                 {
                     std::lock_guard<std::mutex> snapshot_lock(implementation->snapshot_mutex_);
                     if (implementation->snapshot_) {

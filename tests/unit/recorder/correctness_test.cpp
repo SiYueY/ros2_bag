@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "ros2_bag/recorder/manifest.hpp"
+#include "ros2_bag/recorder/admission.hpp"
 #include "ros2_bag/recorder/message_pool.hpp"
 #include "ros2_bag/recorder/recovery.hpp"
 #include "ros2_bag/recorder/topic_events.hpp"
@@ -66,6 +67,7 @@ enum class Fault {
     EventsSync,
     EventsBlock,
     CleanupBlock,
+    AdmissionBlock,
     RecordingCommitBlock,
     SecondManifestSync,
     ThreadCreation,
@@ -640,8 +642,8 @@ void test_rolling_and_cleanup_under_pressure() {
     executor.remove_node(node);
 }
 
-void test_shutdown_waits_for_cleanup_without_blocking_state() {
-    auto config = config_for("shutdown_cleanup");
+void test_shutdown_waits_for_cleanup_without_blocking_state(bool stop_first) {
+    auto config = config_for(stop_first ? "stop_shutdown_cleanup" : "shutdown_cleanup");
     auto node = std::make_shared<rclcpp::Node>("shutdown_cleanup");
     rclcpp::executors::SingleThreadedExecutor executor;
     executor.add_node(node);
@@ -678,6 +680,11 @@ void test_shutdown_waits_for_cleanup_without_blocking_state() {
             std::lock_guard<std::mutex> lock(barrier_mutex);
             return blocked;
         }));
+        rec::Completion<void> stop;
+        if (stop_first) {
+            stop = recorder.stop("task", task->generation);
+            CHECK(!stop.wait_for(100ms));
+        }
         const auto shutdown = recorder.shutdown();
         CHECK(!shutdown.wait_for(100ms));
         // The watchdog makes an accidental state-lock regression fail instead
@@ -701,9 +708,81 @@ void test_shutdown_waits_for_cleanup_without_blocking_state() {
             released = true;
         }
         barrier_condition.notify_all();
+        if (stop_first) {
+            CHECK(await(stop));
+        }
         CHECK(await(shutdown));
         watchdog.join();
         fault.store(Fault::None);
+    }
+    executor.cancel();
+    spinning.join();
+    executor.remove_node(node);
+}
+
+void test_lifecycle_waits_for_callback_before_admission(bool shutdown_requested) {
+    auto config = config_for(shutdown_requested ? "shutdown_admission" : "stop_admission");
+    auto node = std::make_shared<rclcpp::Node>("shutdown_admission");
+    rclcpp::executors::SingleThreadedExecutor executor;
+    executor.add_node(node);
+    std::thread spinning([&] { executor.spin(); });
+    auto publisher = node->create_generic_publisher(
+        "/shutdown_admission", "std_msgs/msg/String", rclcpp::QoS(10));
+    {
+        rec::Recorder recorder(config, node);
+        const auto task = await(recorder.start(options_for()));
+        CHECK(task);
+        rec::TopicOptions topic;
+        topic.name = "/shutdown_admission";
+        topic.type = "std_msgs/msg/String";
+        CHECK(await(recorder.add_topic("task", task->generation, topic, "add")));
+        {
+            std::lock_guard<std::mutex> lock(barrier_mutex);
+            blocked = false;
+            released = false;
+        }
+        fault.store(Fault::AdmissionBlock);
+        rclcpp::SerializedMessage serialized(4);
+        auto& bytes = serialized.get_rcl_serialized_message();
+        bytes.buffer[0] = 0;
+        bytes.buffer[1] = 1;
+        bytes.buffer[2] = 0;
+        bytes.buffer[3] = 0;
+        bytes.buffer_length = 4;
+        CHECK(eventually([&] {
+            publisher->publish(serialized);
+            std::lock_guard<std::mutex> lock(barrier_mutex);
+            return blocked;
+        }));
+        const auto completion =
+            shutdown_requested ? recorder.shutdown() : recorder.stop("task", task->generation);
+        CHECK(!completion.wait_for(100ms));
+        std::thread watchdog([] {
+            std::this_thread::sleep_for(1s);
+            {
+                std::lock_guard<std::mutex> lock(barrier_mutex);
+                released = true;
+            }
+            barrier_condition.notify_all();
+        });
+        const auto before = std::chrono::steady_clock::now();
+        const auto snapshot = recorder.state();
+        CHECK(std::chrono::steady_clock::now() - before < 500ms);
+        CHECK(
+            shutdown_requested ? snapshot.shutting_down
+                               : snapshot.recorder_state == rec::RecorderState::Stopping);
+        CHECK(!completion.done());
+        {
+            std::lock_guard<std::mutex> lock(barrier_mutex);
+            released = true;
+        }
+        barrier_condition.notify_all();
+        CHECK(await(completion));
+        watchdog.join();
+        fault.store(Fault::None);
+        if (!shutdown_requested) {
+            CHECK(await(recorder.shutdown()));
+        }
     }
     executor.cancel();
     spinning.join();
@@ -993,6 +1072,29 @@ std::uintmax_t wrap_remove_all(const std::filesystem::path& path, std::error_cod
     return real_remove_all(path, ec);
 }
 
+using AdmissionTime = std::chrono::steady_clock::time_point;
+rec::AdmissionResult
+real_admit(rec::AdmissionGate*, std::uint64_t, std::uint64_t, const rec::DiskAdmissionState&, AdmissionTime) asm(
+    "__real__ZN8ros2_bag8recorder13AdmissionGate5admitEmmRKNS0_"
+    "18DiskAdmissionStateENSt6chrono10time_pointINS5_3_V212steady_clock"
+    "ENS5_8durationIlSt5ratioILl1ELl1000000000EEEEEE");
+rec::AdmissionResult
+wrap_admit(rec::AdmissionGate*, std::uint64_t, std::uint64_t, const rec::DiskAdmissionState&, AdmissionTime) asm(
+    "__wrap__ZN8ros2_bag8recorder13AdmissionGate5admitEmmRKNS0_"
+    "18DiskAdmissionStateENSt6chrono10time_pointINS5_3_V212steady_clock"
+    "ENS5_8durationIlSt5ratioILl1ELl1000000000EEEEEE");
+rec::AdmissionResult wrap_admit(
+    rec::AdmissionGate* gate, std::uint64_t generation, std::uint64_t epoch,
+    const rec::DiskAdmissionState& disk, AdmissionTime now) {
+    if (fault.load() == Fault::AdmissionBlock) {
+        std::unique_lock<std::mutex> lock(barrier_mutex);
+        blocked = true;
+        barrier_condition.notify_all();
+        barrier_condition.wait(lock, [] { return released; });
+    }
+    return real_admit(gate, generation, epoch, disk, now);
+}
+
 // Wrap the C++ thread-start boundary: pthread_create inside libstdc++ is
 // dynamically linked and would bypass a link-time pthread wrapper.
 void real_thread_start(std::thread*, std::unique_ptr<std::thread::_State>, void (*)()) asm(
@@ -1093,7 +1195,10 @@ int main(int argc, char** argv) {
     test_writer_open_and_register_failure();
     test_ros_safety_and_failure();
     test_rolling_and_cleanup_under_pressure();
-    test_shutdown_waits_for_cleanup_without_blocking_state();
+    test_shutdown_waits_for_cleanup_without_blocking_state(false);
+    test_shutdown_waits_for_cleanup_without_blocking_state(true);
+    test_lifecycle_waits_for_callback_before_admission(true);
+    test_lifecycle_waits_for_callback_before_admission(false);
     test_retention_commits_each_authorization();
     rclcpp::shutdown();
     return failures.load() == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
