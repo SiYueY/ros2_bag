@@ -72,6 +72,7 @@ if(BUILD_TESTING)
     target_compile_options(recorder_correctness_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
     target_link_options(recorder_correctness_test PRIVATE
       -Wl,--wrap=fsync -Wl,--wrap=statvfs
+      -Wl,--wrap=_ZNSt10filesystem10remove_allERKNS_7__cxx114pathERSt10error_code
       -Wl,--wrap=_ZN8ros2_bag8recorder6Writer4openERKNSt10filesystem7__cxx114pathE
       -Wl,--wrap=_ZN8ros2_bag8recorder6Writer14register_topicERKNS0_9TopicInfoE
       -Wl,--wrap=_ZN8ros2_bag8recorder6Writer11write_batchERKSt6vectorINS0_15RecordedMessageESaIS3_EE

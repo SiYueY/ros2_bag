@@ -1500,20 +1500,27 @@ public:
         shutdown_event_ = [this] {
             std::shared_ptr<Writer> writer;
             bool writer_open = false;
+            decltype(active_topics_) topics;
+            Cleanup* cleanup = nullptr;
             {
                 std::lock_guard<std::mutex> state_lock(state_mutex_);
                 for (auto& entry : active_topics_) {
                     entry.second.admission->close();
-                    std::unique_lock<std::mutex> ingress_lock(entry.second.ingress->mutex);
+                    std::lock_guard<std::mutex> ingress_lock(entry.second.ingress->mutex);
                     entry.second.ingress->open = false;
-                    entry.second.ingress->condition.wait(
-                        ingress_lock, [&entry] { return entry.second.ingress->producers == 0; });
                 }
-                active_topics_.clear();
+                topics = std::move(active_topics_);
                 state_.topics.clear();
                 writer = writer_;
                 writer_open = writer_open_;
+                cleanup = cleanup_.get();
             }
+            for (auto& entry : topics) {
+                std::unique_lock<std::mutex> ingress_lock(entry.second.ingress->mutex);
+                entry.second.ingress->condition.wait(
+                    ingress_lock, [&entry] { return entry.second.ingress->producers == 0; });
+            }
+            topics.clear();
             resource_monitor_.reset();
             stop_dispatch_thread();
             std::optional<Error> close_error;
@@ -1521,6 +1528,23 @@ public:
                 const auto closed = writer->close();
                 if (!closed) {
                     close_error = closed.error();
+                }
+            }
+            if (cleanup) {
+                cleanup->stop();
+                cleanup->join();
+            }
+            // The worker has joined; consume every result while the manifest
+            // and cleanup ownership are still available to the mutation domain.
+            for (auto& slot : cleanup_results_) {
+                std::optional<DeleteResult> result;
+                {
+                    std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+                    result = std::move(slot);
+                    slot.reset();
+                }
+                if (result) {
+                    apply_cleanup_result(std::move(*result));
                 }
             }
             {
@@ -1562,19 +1586,6 @@ public:
                 writer_open_ = false;
                 state_ = State{};
                 state_.shutting_down = true;
-            }
-            // Cleanup has really joined, so no further result can arrive. Consume
-            // its bounded channel before exposing shutdown completion.
-            for (auto& slot : cleanup_results_) {
-                std::optional<DeleteResult> result;
-                {
-                    std::lock_guard<std::mutex> queue_lock(queue_mutex_);
-                    result = std::move(slot);
-                    slot.reset();
-                }
-                if (result) {
-                    apply_cleanup_result(std::move(*result));
-                }
             }
             std::deque<std::function<void()>> rejected;
             {

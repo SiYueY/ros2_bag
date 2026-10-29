@@ -65,6 +65,7 @@ enum class Fault {
     ManifestSync,
     EventsSync,
     EventsBlock,
+    CleanupBlock,
     RecordingCommitBlock,
     SecondManifestSync,
     ThreadCreation,
@@ -639,6 +640,76 @@ void test_rolling_and_cleanup_under_pressure() {
     executor.remove_node(node);
 }
 
+void test_shutdown_waits_for_cleanup_without_blocking_state() {
+    auto config = config_for("shutdown_cleanup");
+    auto node = std::make_shared<rclcpp::Node>("shutdown_cleanup");
+    rclcpp::executors::SingleThreadedExecutor executor;
+    executor.add_node(node);
+    std::thread spinning([&] { executor.spin(); });
+    auto publisher =
+        node->create_generic_publisher("/shutdown_cleanup", "std_msgs/msg/String", rclcpp::QoS(10));
+    {
+        rec::Recorder recorder(config, node);
+        auto options = options_for();
+        options.mode = rec::StartOptions::Rolling{};
+        std::get<rec::StartOptions::Rolling>(options.mode).segment_duration = 1s;
+        std::get<rec::StartOptions::Rolling>(options.mode).retention_duration = 1s;
+        const auto task = await(recorder.start(options));
+        CHECK(task);
+        rec::TopicOptions topic;
+        topic.name = "/shutdown_cleanup";
+        topic.type = "std_msgs/msg/String";
+        CHECK(await(recorder.add_topic("task", task->generation, topic, "add")));
+        {
+            std::lock_guard<std::mutex> lock(barrier_mutex);
+            blocked = false;
+            released = false;
+        }
+        fault.store(Fault::CleanupBlock);
+        rclcpp::SerializedMessage serialized(4);
+        auto& bytes = serialized.get_rcl_serialized_message();
+        bytes.buffer[0] = 0;
+        bytes.buffer[1] = 1;
+        bytes.buffer[2] = 0;
+        bytes.buffer[3] = 0;
+        bytes.buffer_length = 4;
+        CHECK(eventually([&] {
+            publisher->publish(serialized);
+            std::lock_guard<std::mutex> lock(barrier_mutex);
+            return blocked;
+        }));
+        const auto shutdown = recorder.shutdown();
+        CHECK(!shutdown.wait_for(100ms));
+        // The watchdog makes an accidental state-lock regression fail instead
+        // of hanging the entire test process.
+        std::thread watchdog([] {
+            std::this_thread::sleep_for(1s);
+            {
+                std::lock_guard<std::mutex> lock(barrier_mutex);
+                released = true;
+            }
+            barrier_condition.notify_all();
+        });
+        const auto before = std::chrono::steady_clock::now();
+        const auto snapshot = recorder.state();
+        CHECK(std::chrono::steady_clock::now() - before < 500ms);
+        CHECK(snapshot.shutting_down);
+        CHECK(snapshot.cleanup.active.has_value());
+        CHECK(!shutdown.done());
+        {
+            std::lock_guard<std::mutex> lock(barrier_mutex);
+            released = true;
+        }
+        barrier_condition.notify_all();
+        CHECK(await(shutdown));
+        watchdog.join();
+        fault.store(Fault::None);
+    }
+    executor.cancel();
+    spinning.join();
+    executor.remove_node(node);
+}
+
 void test_retention_commits_each_authorization() {
     auto config = config_for("retention_partial");
     auto node = std::make_shared<rclcpp::Node>("retention_partial");
@@ -908,6 +979,20 @@ extern "C" int __wrap_statvfs(const char* path, struct statvfs* value) {
     return result;
 }
 
+std::uintmax_t real_remove_all(const std::filesystem::path&, std::error_code&) asm(
+    "__real__ZNSt10filesystem10remove_allERKNS_7__cxx114pathERSt10error_code");
+std::uintmax_t wrap_remove_all(const std::filesystem::path&, std::error_code&) asm(
+    "__wrap__ZNSt10filesystem10remove_allERKNS_7__cxx114pathERSt10error_code");
+std::uintmax_t wrap_remove_all(const std::filesystem::path& path, std::error_code& ec) {
+    if (fault.load() == Fault::CleanupBlock) {
+        std::unique_lock<std::mutex> lock(barrier_mutex);
+        blocked = true;
+        barrier_condition.notify_all();
+        barrier_condition.wait(lock, [] { return released; });
+    }
+    return real_remove_all(path, ec);
+}
+
 // Wrap the C++ thread-start boundary: pthread_create inside libstdc++ is
 // dynamically linked and would bypass a link-time pthread wrapper.
 void real_thread_start(std::thread*, std::unique_ptr<std::thread::_State>, void (*)()) asm(
@@ -1008,6 +1093,7 @@ int main(int argc, char** argv) {
     test_writer_open_and_register_failure();
     test_ros_safety_and_failure();
     test_rolling_and_cleanup_under_pressure();
+    test_shutdown_waits_for_cleanup_without_blocking_state();
     test_retention_commits_each_authorization();
     rclcpp::shutdown();
     return failures.load() == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

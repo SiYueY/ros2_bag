@@ -36,9 +36,7 @@ public:
     using ResultCallback = std::function<void(DeleteResult)>;
 
     Cleanup(
-        std::size_t queue_capacity,
-        std::chrono::seconds warning_after,
-        ResultCallback callback);
+        std::size_t queue_capacity, std::chrono::seconds warning_after, ResultCallback callback);
     ~Cleanup();
 
     Cleanup(const Cleanup&) = delete;
@@ -46,6 +44,8 @@ public:
 
     bool enqueue(DeleteWork work);
     void stop();
+    // Called by the owner outside its state lock; waits for native deletion.
+    void join();
     CleanupState state() const;
 
 private:

@@ -6,9 +6,7 @@
 namespace ros2_bag::recorder {
 
 Cleanup::Cleanup(
-    std::size_t queue_capacity,
-    std::chrono::seconds warning_after,
-    ResultCallback callback)
+    std::size_t queue_capacity, std::chrono::seconds warning_after, ResultCallback callback)
 : queue_capacity_(queue_capacity),
   warning_after_(warning_after),
   callback_(std::move(callback)),
@@ -16,6 +14,10 @@ Cleanup::Cleanup(
 
 Cleanup::~Cleanup() {
     stop();
+    join();
+}
+
+void Cleanup::join() {
     if (thread_.joinable()) {
         thread_.join();
     }
@@ -48,9 +50,8 @@ CleanupState Cleanup::state() const {
     }
     if (active_) {
         result.active = CleanupState::Active{
-            active_->work.segment_id,
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - active_->since)};
+            active_->work.segment_id, std::chrono::duration_cast<std::chrono::milliseconds>(
+                                          std::chrono::steady_clock::now() - active_->since)};
         result.warning = result.active->elapsed >= warning_after_;
     }
     result.queue_full = queue_full_;
@@ -77,11 +78,9 @@ void Cleanup::run() {
         DeleteResult result{work, Result<void, Error>()};
         if (filesystem_error) {
             result.result = Result<void, Error>(
-                unexpect,
-                Error{
-                    ErrorCode::StorageError,
-                    Effects::ConfirmedPartial,
-                    filesystem_error.message()});
+                unexpect, Error{
+                              ErrorCode::StorageError, Effects::ConfirmedPartial,
+                              filesystem_error.message()});
         }
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -97,8 +96,7 @@ void Cleanup::run() {
         } catch (...) {
             std::lock_guard<std::mutex> lock(mutex_);
             last_error_ = Error{
-                ErrorCode::InternalError,
-                Effects::ConfirmedPartial,
+                ErrorCode::InternalError, Effects::ConfirmedPartial,
                 "cleanup result callback threw"};
         }
     }
