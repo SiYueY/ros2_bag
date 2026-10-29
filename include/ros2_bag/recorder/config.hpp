@@ -37,9 +37,15 @@ struct RecorderConfig {
     };
 
     struct Discovery {
+        std::chrono::milliseconds timeout{2000};
         std::size_t max_results = 4096;
         std::size_t max_profiles = 64;
         std::chrono::milliseconds visibility_max_age{5000};
+    };
+
+    struct Resource {
+        bool enabled = true;
+        std::chrono::milliseconds sample_interval{2000};
     };
 
     struct Cleanup {
@@ -49,6 +55,7 @@ struct RecorderConfig {
     };
 
     struct Disk {
+        std::chrono::milliseconds check_interval{2000};
         std::chrono::milliseconds max_age{10000};
         std::uint32_t failure_threshold = 3;
         double warning_percent = 80.0;
@@ -71,6 +78,7 @@ struct RecorderConfig {
     std::size_t operation_queue_capacity = 64;
     std::chrono::milliseconds native_wait_warning{30000};
     std::size_t max_active_topics = 64;
+    std::size_t max_distinct_topics = 256;
     std::size_t recent_removed_instances = 32;
 
     Rolling rolling;
@@ -78,6 +86,7 @@ struct RecorderConfig {
     Pool pool;
     Snapshot snapshot;
     Discovery discovery;
+    Resource resource;
     Cleanup cleanup;
     Disk disk;
     History history;
@@ -86,8 +95,7 @@ struct RecorderConfig {
 Result<void, Error> validate_config(const RecorderConfig& config);
 Result<std::size_t, Error> message_pool_capacity(const RecorderConfig& config);
 Result<TaskConfig, Error> make_task_config(
-    const RecorderConfig& config,
-    const StartOptions& options);
+    const RecorderConfig& config, const StartOptions& options);
 
 }  // namespace ros2_bag::recorder
 

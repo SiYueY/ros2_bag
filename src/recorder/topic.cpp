@@ -1,8 +1,15 @@
 #include "ros2_bag/recorder/topic.hpp"
 
 #include <cmath>
+#include <memory>
+
+#include <rclcpp/generic_subscription.hpp>
 
 namespace ros2_bag::recorder {
+
+void detach_subscription_native(std::shared_ptr<rclcpp::GenericSubscription>& subscription) {
+    subscription.reset();
+}
 
 Result<QosOptions, Error> normalize_qos(const QosOptions& options) {
     if (std::holds_alternative<QosOptions::Auto>(options.mode)) {
@@ -15,11 +22,9 @@ Result<QosOptions, Error> normalize_qos(const QosOptions& options) {
     if (explicit_qos.history == History::KeepLast &&
         (explicit_qos.depth == 0 || explicit_qos.depth > kMaxQosDepth)) {
         return Result<QosOptions, Error>(
-            unexpect,
-            Error{
-                ErrorCode::UnsupportedQos,
-                Effects::None,
-                "keep-last QoS requires depth in [1, 10000]"});
+            unexpect, Error{
+                          ErrorCode::UnsupportedQos, Effects::None,
+                          "keep-last QoS requires depth in [1, 10000]"});
     }
     if (explicit_qos.history == History::KeepAll && explicit_qos.depth != 0) {
         return Result<QosOptions, Error>(
@@ -44,10 +49,8 @@ bool qos_compatible(const QosOptions& publisher, const QosOptions& subscription)
 }
 
 Result<QosSelection, Error> select_qos(
-    const QosOptions& options,
-    const std::vector<QosOptions>& publisher_profiles,
-    std::size_t publisher_count,
-    bool profiles_truncated) {
+    const QosOptions& options, const std::vector<QosOptions>& publisher_profiles,
+    std::size_t publisher_count, bool profiles_truncated) {
     const auto normalized = normalize_qos(options);
     if (!normalized) {
         return Result<QosSelection, Error>(unexpect, normalized.error());
@@ -61,8 +64,7 @@ Result<QosSelection, Error> select_qos(
             }
         }
         return Result<QosSelection, Error>(QosSelection{
-            normalized.value(),
-            compatible,
+            normalized.value(), compatible,
             !profiles_truncated && publisher_profiles.size() == publisher_count &&
                 compatible == publisher_count});
     }
@@ -112,8 +114,7 @@ Result<QosSelection, Error> select_qos(
     }
 
     return Result<QosSelection, Error>(QosSelection{
-        selected,
-        selected_count,
+        selected, selected_count,
         !profiles_truncated && publisher_profiles.size() == publisher_count &&
             selected_count == publisher_count});
 }
@@ -121,20 +122,16 @@ Result<QosSelection, Error> select_qos(
 Result<void, Error> validate_topic_options(const TopicOptions& options) {
     if (options.name.empty() || options.name.front() != '/' || options.type.empty()) {
         return Result<void, Error>(
-            unexpect,
-            Error{
-                ErrorCode::InvalidArgument,
-                Effects::None,
-                "topic name must be absolute and type must not be empty"});
+            unexpect, Error{
+                          ErrorCode::InvalidArgument, Effects::None,
+                          "topic name must be absolute and type must not be empty"});
     }
     if (options.expected_hz &&
         (!std::isfinite(*options.expected_hz) || *options.expected_hz <= 0.0)) {
         return Result<void, Error>(
-            unexpect,
-            Error{
-                ErrorCode::InvalidArgument,
-                Effects::None,
-                "expected_hz must be finite and positive"});
+            unexpect, Error{
+                          ErrorCode::InvalidArgument, Effects::None,
+                          "expected_hz must be finite and positive"});
     }
 
     const auto qos = normalize_qos(options.qos);

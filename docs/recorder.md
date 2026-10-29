@@ -1858,6 +1858,13 @@ Subscription create/remove 跨线程时：
 - 调用数据必须独立拥有生命周期；
 - Runtime Shutdown 必须保持 Executor/Context 可运行直到 Recorder 不再依赖。
 
+Recorder 为订阅控制操作使用独立 callback group 和单线程 Executor；订阅消息回调仍由
+节点所属的 Executor 执行。mutation 域最多持有一个订阅原生操作及其专用结果槽，普通
+mutation 队列不能占用该槽。等待结果期间继续处理 Writer Failure 和生产者报告的磁盘
+安全事件；需要改变 Task 生命周期的普通 mutation 保留在队列中，直到当前原生操作返回。
+Executor callback 只执行原生操作并发布结果，Topic Event 的提交和身份复核仍由 mutation
+域完成。Shutdown 取消尚未开始的操作，已开始的操作必须真实返回后才释放其资源。
+
 内部实现必须能区分至少：
 
 ```text
@@ -4362,7 +4369,7 @@ storage
 | snapshot | max_messages_per_topic=1024, max_bytes_per_topic=8MiB, max_total_bytes=16MiB |
 | cleanup | queue=16, warning=30s, retry=2s |
 | resource | enabled=true, sample=2s |
-| disk | check=2s, initial=2000ms, max_age=10s, failures=3, warning=80, pause=90, resume=85, min_free=2GiB, auto_resume=false, stable=10s |
+| disk | check=2s, max_age=10s, failures=3, warning=80, pause=90, resume=85, min_free=2GiB, auto_resume=false, stable=10s |
 | tasks | max_segment_records=4096, detail=100/200, max_scan_entries=4096 |
 | storage | mcap, LZ4, FASTEST, chunk=786432, max_cache_size=0 |
 
@@ -4371,6 +4378,8 @@ storage
 ```text
 Pool fallback 配置已删除。
 ```
+
+Start 的初次磁盘采样直接等待 `statvfs` 实际返回，不设置会伪造原生调用完成的独立 initial timeout。Discovery timeout 在每次原生 Graph 查询返回后检查；已经开始的查询仍持有调用所需资源直到真实返回。
 
 必须验证：
 

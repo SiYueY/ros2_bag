@@ -74,6 +74,8 @@ if(BUILD_TESTING)
       -Wl,--wrap=fsync -Wl,--wrap=statvfs
       -Wl,--wrap=_ZNSt10filesystem10remove_allERKNS_7__cxx114pathERSt10error_code
       -Wl,--wrap=_ZN8ros2_bag8recorder13AdmissionGate5admitEmmRKNS0_18DiskAdmissionStateENSt6chrono10time_pointINS5_3_V212steady_clockENS5_8durationIlSt5ratioILl1ELl1000000000EEEEEE
+      -Wl,--wrap=_ZN6rclcpp16SubscriptionBaseC2EPNS_15node_interfaces17NodeBaseInterfaceERK29rosidl_message_type_support_tRKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEERK26rcl_subscription_options_sb
+      -Wl,--wrap=_ZN8ros2_bag8recorder26detach_subscription_nativeERSt10shared_ptrIN6rclcpp19GenericSubscriptionEE
       -Wl,--wrap=_ZN8ros2_bag8recorder6Writer4openERKNSt10filesystem7__cxx114pathE
       -Wl,--wrap=_ZN8ros2_bag8recorder6Writer14register_topicERKNS0_9TopicInfoE
       -Wl,--wrap=_ZN8ros2_bag8recorder6Writer11write_batchERKSt6vectorINS0_15RecordedMessageESaIS3_EE

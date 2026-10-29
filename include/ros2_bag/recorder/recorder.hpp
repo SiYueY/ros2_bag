@@ -23,6 +23,7 @@ class Recorder {
 public:
     explicit Recorder(RecorderConfig config);
     Recorder(RecorderConfig config, rclcpp::Node::SharedPtr node);
+    // The owner must await successful shutdown() before destroying Recorder.
     ~Recorder();
 
     Recorder(const Recorder&) = delete;
@@ -33,26 +34,19 @@ public:
     Completion<void> pause(std::string_view recording_id, std::uint64_t generation);
     Completion<void> resume(std::string_view recording_id, std::uint64_t generation);
     Completion<TopicInfo> add_topic(
-        std::string_view recording_id,
-        std::uint64_t generation,
-        const TopicOptions& options,
+        std::string_view recording_id, std::uint64_t generation, const TopicOptions& options,
         const OperationId& operation_id);
     Completion<void> remove_topic(
-        std::string_view recording_id,
-        std::uint64_t generation,
-        TopicId topic_id,
-        std::uint64_t topic_epoch,
-        const OperationId& operation_id);
+        std::string_view recording_id, std::uint64_t generation, TopicId topic_id,
+        std::uint64_t topic_epoch, const OperationId& operation_id);
     State state() const;
     Result<std::vector<DiscoveredTopic>, Error> discover_topics() const;
     Result<TaskDetail, Error> get_task(
-        std::string_view recording_id,
-        std::size_t segment_offset = 0,
+        std::string_view recording_id, std::size_t segment_offset = 0,
         std::size_t segment_limit = 100) const;
     Result<TaskList, Error> list_tasks(std::size_t offset, std::size_t limit) const;
     Result<TopicOperationState, Error> topic_operation_state(
-        std::string_view recording_id,
-        const OperationId& operation_id) const;
+        std::string_view recording_id, const OperationId& operation_id) const;
     Completion<void> shutdown();
 
 private:

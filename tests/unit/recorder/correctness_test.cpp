@@ -12,7 +12,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <new>
 #include <optional>
@@ -62,12 +64,18 @@ enum class Fault {
     None,
     DiskCritical,
     DiskUnknown,
+    DiskBetweenThresholds,
+    DiskRecovered,
     InitialDirectorySync,
     ManifestSync,
     EventsSync,
     EventsBlock,
     CleanupBlock,
     AdmissionBlock,
+    ExecutorCreateBlock,
+    ExecutorNotStarted,
+    ExecutorRemoveBlock,
+    WriterCloseBlock,
     RecordingCommitBlock,
     SecondManifestSync,
     ThreadCreation,
@@ -89,6 +97,7 @@ std::atomic<bool> secondary_close_failure{false};
 std::atomic<int> thread_fail_after{0};
 std::atomic<int> task_directory_syncs{0};
 std::atomic<int> manifest_file_syncs{0};
+std::atomic<int> native_subscription_creates{0};
 
 bool ends_with(const char* value, const char* suffix) {
     const auto size = std::strlen(value);
@@ -789,6 +798,360 @@ void test_lifecycle_waits_for_callback_before_admission(bool shutdown_requested)
     executor.remove_node(node);
 }
 
+void test_executor_create_shutdown(bool before_start) {
+    auto config = config_for(before_start ? "executor_queued" : "executor_started");
+    auto node = std::make_shared<rclcpp::Node>("executor_create_shutdown");
+    rec::Recorder recorder(config, node);
+    const auto task = await(recorder.start(options_for()));
+    CHECK(task);
+    rec::TopicOptions topic;
+    topic.name = "/executor_create_shutdown";
+    topic.type = "std_msgs/msg/String";
+    {
+        std::lock_guard<std::mutex> lock(barrier_mutex);
+        blocked = false;
+        released = false;
+    }
+    fault.store(before_start ? Fault::ExecutorNotStarted : Fault::ExecutorCreateBlock);
+    const auto creates_before = native_subscription_creates.load();
+    const auto add = recorder.add_topic("task", task->generation, topic, "add");
+    {
+        std::unique_lock<std::mutex> lock(barrier_mutex);
+        CHECK(barrier_condition.wait_for(lock, 3s, [] { return blocked; }));
+    }
+    const auto shutdown = recorder.shutdown();
+    CHECK(!shutdown.wait_for(100ms));
+    CHECK(!add.done());
+    CHECK(recorder.state().shutting_down);
+    {
+        std::lock_guard<std::mutex> lock(barrier_mutex);
+        released = true;
+    }
+    barrier_condition.notify_all();
+    const auto result = await(add);
+    CHECK(!result && result.error().effects == rec::Effects::ConfirmedPartial);
+    CHECK(await(shutdown));
+    CHECK(native_subscription_creates.load() == creates_before + (before_start ? 0 : 1));
+    fault.store(Fault::None);
+    const auto events =
+        rec::TopicEvents::open(config.output_root / "task", "task", task->generation);
+    CHECK(events);
+    CHECK(events->operation_state("add").value() == rec::TopicOperationState::ConfirmedFailure);
+}
+
+void test_shutdown_observable_during_topic_event_sync() {
+    auto config = config_for("shutdown_event_sync");
+    auto node = std::make_shared<rclcpp::Node>("shutdown_event_sync");
+    rec::Recorder recorder(config, node);
+    const auto task = await(recorder.start(options_for()));
+    CHECK(task);
+    rec::TopicOptions topic;
+    topic.name = "/shutdown_event_sync";
+    topic.type = "std_msgs/msg/String";
+    {
+        std::lock_guard<std::mutex> lock(barrier_mutex);
+        blocked = false;
+        released = false;
+    }
+    fault.store(Fault::EventsBlock);
+    const auto add = recorder.add_topic("task", task->generation, topic, "add");
+    {
+        std::unique_lock<std::mutex> lock(barrier_mutex);
+        CHECK(barrier_condition.wait_for(lock, 3s, [] { return blocked; }));
+    }
+    const auto shutdown = recorder.shutdown();
+    CHECK(!shutdown.wait_for(100ms));
+    std::thread watchdog([] {
+        std::this_thread::sleep_for(1s);
+        {
+            std::lock_guard<std::mutex> lock(barrier_mutex);
+            released = true;
+        }
+        barrier_condition.notify_all();
+    });
+    const auto before = std::chrono::steady_clock::now();
+    CHECK(recorder.state().shutting_down);
+    CHECK(std::chrono::steady_clock::now() - before < 500ms);
+    {
+        std::lock_guard<std::mutex> lock(barrier_mutex);
+        released = true;
+    }
+    barrier_condition.notify_all();
+    CHECK(!await(add));
+    CHECK(await(shutdown));
+    watchdog.join();
+    fault.store(Fault::None);
+}
+
+void test_executor_remove_shutdown() {
+    auto config = config_for("executor_remove");
+    auto node = std::make_shared<rclcpp::Node>("executor_remove_shutdown");
+    rec::Recorder recorder(config, node);
+    const auto task = await(recorder.start(options_for()));
+    CHECK(task);
+    rec::TopicOptions topic;
+    topic.name = "/executor_remove_shutdown";
+    topic.type = "std_msgs/msg/String";
+    const auto added = await(recorder.add_topic("task", task->generation, topic, "add"));
+    CHECK(added);
+    {
+        std::lock_guard<std::mutex> lock(barrier_mutex);
+        blocked = false;
+        released = false;
+    }
+    fault.store(Fault::ExecutorRemoveBlock);
+    const auto removal = recorder.remove_topic(
+        "task", task->generation, added->topic_id, added->topic_epoch, "remove");
+    {
+        std::unique_lock<std::mutex> lock(barrier_mutex);
+        CHECK(barrier_condition.wait_for(lock, 3s, [] { return blocked; }));
+    }
+    const auto shutdown = recorder.shutdown();
+    CHECK(!shutdown.wait_for(100ms));
+    CHECK(!removal.done());
+    CHECK(recorder.state().shutting_down);
+    {
+        std::lock_guard<std::mutex> lock(barrier_mutex);
+        released = true;
+    }
+    barrier_condition.notify_all();
+    const auto result = await(removal);
+    CHECK(!result && result.error().effects == rec::Effects::ConfirmedPartial);
+    CHECK(await(shutdown));
+    fault.store(Fault::None);
+    const auto events =
+        rec::TopicEvents::open(config.output_root / "task", "task", task->generation);
+    CHECK(events);
+    CHECK(events->operation_state("remove").value() == rec::TopicOperationState::ConfirmedFailure);
+}
+
+void test_state_snapshot_concurrent_generations() {
+    auto config = config_for("snapshot_generations");
+    auto node = std::make_shared<rclcpp::Node>("snapshot_generations");
+    rec::Recorder recorder(config, node);
+    std::atomic<bool> done{false};
+    std::thread reader([&] {
+        while (!done.load()) {
+            const auto snapshot = recorder.state();
+            if (!snapshot.task) {
+                CHECK(snapshot.topics.empty());
+                continue;
+            }
+            for (const auto& topic : snapshot.topics) {
+                CHECK(topic.info.name == "/" + snapshot.task->recording_id);
+            }
+        }
+    });
+    for (int index = 0; index < 12; ++index) {
+        const auto id = "task_" + std::to_string(index);
+        const auto task = await(recorder.start(options_for(id.c_str())));
+        CHECK(task);
+        rec::TopicOptions topic;
+        topic.name = "/" + id;
+        topic.type = "std_msgs/msg/String";
+        CHECK(await(recorder.add_topic(id, task->generation, topic, "add")));
+        CHECK(await(recorder.stop(id, task->generation)));
+    }
+    done.store(true);
+    reader.join();
+    CHECK(await(recorder.shutdown()));
+}
+
+void test_distinct_topic_limit() {
+    auto config = config_for("distinct_topics");
+    config.max_distinct_topics = 1;
+    auto node = std::make_shared<rclcpp::Node>("distinct_topics");
+    rec::Recorder recorder(config, node);
+    const auto task = await(recorder.start(options_for()));
+    CHECK(task);
+    rec::TopicOptions topic;
+    topic.name = "/distinct_first";
+    topic.type = "std_msgs/msg/String";
+    const auto added = await(recorder.add_topic("task", task->generation, topic, "add_first"));
+    CHECK(added);
+    CHECK(await(recorder.remove_topic(
+        "task", task->generation, added->topic_id, added->topic_epoch, "remove_first")));
+    topic.name = "/distinct_second";
+    const auto rejected = await(recorder.add_topic("task", task->generation, topic, "add_second"));
+    CHECK(
+        !rejected && rejected.error().code == rec::ErrorCode::ResourceExhausted &&
+        rejected.error().effects == rec::Effects::None);
+    CHECK(await(recorder.stop("task", task->generation)));
+    CHECK(await(recorder.shutdown()));
+}
+
+void test_disk_resume_hysteresis() {
+    auto config = config_for("disk_hysteresis");
+    config.disk.auto_resume = true;
+    config.disk.stable = 1s;
+    rec::Recorder recorder(config);
+    const auto task = await(recorder.start(options_for()));
+    CHECK(task);
+    fault.store(Fault::DiskCritical);
+    CHECK(
+        eventually([&] { return recorder.state().pause.disk == rec::DiskPauseReason::Critical; }));
+    fault.store(Fault::DiskBetweenThresholds);
+    CHECK(eventually([&] {
+        const auto state = recorder.state();
+        return state.disk.used_percent > config.disk.resume_percent &&
+               state.disk.used_percent < config.disk.pause_percent;
+    }));
+    std::this_thread::sleep_for(2200ms);
+    CHECK(recorder.state().recorder_state == rec::RecorderState::Paused);
+    fault.store(Fault::DiskRecovered);
+    CHECK(eventually(
+        [&] { return recorder.state().recorder_state == rec::RecorderState::Recording; }));
+    fault.store(Fault::None);
+    CHECK(await(recorder.stop("task", task->generation)));
+    CHECK(await(recorder.shutdown()));
+}
+
+void test_optional_resource_sampling() {
+    auto config = config_for("resource_disabled");
+    config.resource.enabled = false;
+    config.disk.check_interval = 20ms;
+    rec::Recorder recorder(config);
+    CHECK(await(recorder.start(options_for())));
+    CHECK(eventually([&] { return recorder.state().disk.sampled_at_ns != 0; }));
+    CHECK(recorder.state().process.sampled_at_ns == 0);
+    CHECK(await(recorder.shutdown()));
+}
+
+void test_revision_exhausted_historical_view() {
+    auto config = config_for("revision_exhausted");
+    const auto directory = config.output_root / "task";
+    rec::ManifestData data;
+    data.manifest_revision = 1;
+    data.task.recording_id = "task";
+    data.task.generation = 1;
+    data.task.state = rec::TaskState::Recording;
+    rec::SegmentInfo segment;
+    segment.segment_id = 1;
+    segment.relative_path = "segment_000001";
+    segment.state = rec::SegmentLifecycleState::Writing;
+    data.segments.push_back(segment);
+    CHECK(rec::Manifest::create(directory, data));
+    CHECK(rec::TopicEvents::create(directory, "task", 1));
+    const auto manifest_path = directory / "manifest.json";
+    std::ifstream input(manifest_path);
+    std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    input.close();
+    const std::string old_revision = "\"manifest_revision\": 1";
+    const auto position = bytes.find(old_revision);
+    CHECK(position != std::string::npos);
+    if (position != std::string::npos) {
+        bytes.replace(position, old_revision.size(), "\"manifest_revision\":18446744073709551615");
+        std::ofstream output(manifest_path, std::ios::trunc);
+        output << bytes;
+    }
+    const auto report = rec::Recovery::run(config.output_root);
+    CHECK(report);
+    CHECK(std::any_of(report->findings.begin(), report->findings.end(), [](const auto& finding) {
+        return finding.code == "manifest_revision_exhausted";
+    }));
+    rec::Recorder recorder(config);
+    const auto detail = recorder.get_task("task");
+    CHECK(detail && detail->task.state == rec::TaskState::Incomplete);
+    CHECK(detail->recovery.manifest_revision_exhausted && detail->recovery.has_findings);
+    CHECK(detail->segments.items.front().state == rec::SegmentLifecycleState::Incomplete);
+    const auto list = recorder.list_tasks(0, 10);
+    CHECK(list && list->items.front().state == rec::TaskState::Incomplete);
+    const auto unchanged = rec::Manifest::load(directory);
+    CHECK(
+        unchanged &&
+        unchanged->data().manifest_revision == std::numeric_limits<std::uint64_t>::max());
+    CHECK(unchanged->data().task.state == rec::TaskState::Recording);
+    CHECK(await(recorder.shutdown()));
+}
+
+void test_finalizing_recovery(bool rolling) {
+    auto config = config_for(rolling ? "finalizing_rotation" : "finalizing_stop");
+    auto node = std::make_shared<rclcpp::Node>("finalizing_recovery");
+    rclcpp::executors::SingleThreadedExecutor executor;
+    executor.add_node(node);
+    std::thread spinning([&] { executor.spin(); });
+    auto publisher = node->create_generic_publisher(
+        "/finalizing_recovery", "std_msgs/msg/String", rclcpp::QoS(10));
+    {
+        rec::Recorder recorder(config, node);
+        auto options = options_for();
+        if (rolling) {
+            options.mode = rec::StartOptions::Rolling{};
+            std::get<rec::StartOptions::Rolling>(options.mode).segment_duration = 1s;
+            std::get<rec::StartOptions::Rolling>(options.mode).retention_duration = 10s;
+        }
+        const auto task = await(recorder.start(options));
+        CHECK(task);
+        rec::TopicOptions topic;
+        topic.name = "/finalizing_recovery";
+        topic.type = "std_msgs/msg/String";
+        CHECK(await(recorder.add_topic("task", task->generation, topic, "add")));
+        {
+            std::lock_guard<std::mutex> lock(barrier_mutex);
+            blocked = false;
+            released = false;
+        }
+        fault.store(Fault::WriterCloseBlock);
+        rec::Completion<void> stop;
+        if (!rolling) {
+            stop = recorder.stop("task", task->generation);
+        } else {
+            rclcpp::SerializedMessage serialized(4);
+            auto& bytes = serialized.get_rcl_serialized_message();
+            bytes.buffer[0] = 0;
+            bytes.buffer[1] = 1;
+            bytes.buffer[2] = 0;
+            bytes.buffer[3] = 0;
+            bytes.buffer_length = 4;
+            CHECK(eventually([&] {
+                publisher->publish(serialized);
+                std::lock_guard<std::mutex> lock(barrier_mutex);
+                return blocked;
+            }));
+        }
+        {
+            std::unique_lock<std::mutex> lock(barrier_mutex);
+            CHECK(barrier_condition.wait_for(lock, 5s, [] { return blocked; }));
+        }
+        const auto manifest = rec::Manifest::load(config.output_root / "task");
+        CHECK(manifest);
+        CHECK(
+            manifest->data().task.state ==
+            (rolling ? rec::TaskState::Recording : rec::TaskState::Finalizing));
+        CHECK(manifest->data().segments.back().state == rec::SegmentLifecycleState::Finalizing);
+        const auto recovery_root = config.output_root.string() + "_crash";
+        std::filesystem::remove_all(recovery_root);
+        std::filesystem::create_directories(recovery_root);
+        std::filesystem::copy(
+            config.output_root / "task", std::filesystem::path(recovery_root) / "task",
+            std::filesystem::copy_options::recursive);
+        CHECK(rec::Recovery::run(recovery_root));
+        const auto recovered = rec::Manifest::load(std::filesystem::path(recovery_root) / "task");
+        CHECK(recovered && recovered->data().task.state == rec::TaskState::Incomplete);
+        CHECK(recovered->data().segments.back().state == rec::SegmentLifecycleState::Incomplete);
+        {
+            std::lock_guard<std::mutex> lock(barrier_mutex);
+            released = true;
+        }
+        barrier_condition.notify_all();
+        fault.store(Fault::None);
+        if (rolling) {
+            CHECK(eventually([&] {
+                const auto state = recorder.state();
+                return state.segments.current && state.segments.current->segment_id >= 2;
+            }));
+            CHECK(await(recorder.stop("task", task->generation)));
+        } else {
+            CHECK(await(stop));
+        }
+        CHECK(await(recorder.shutdown()));
+        std::filesystem::remove_all(recovery_root);
+    }
+    executor.cancel();
+    spinning.join();
+    executor.remove_node(node);
+}
+
 void test_retention_commits_each_authorization() {
     auto config = config_for("retention_partial");
     auto node = std::make_shared<rclcpp::Node>("retention_partial");
@@ -1055,6 +1418,12 @@ extern "C" int __wrap_statvfs(const char* path, struct statvfs* value) {
     if (result == 0 && kind == Fault::DiskCritical) {
         value->f_bavail = 0;
     }
+    if (result == 0 && kind == Fault::DiskBetweenThresholds) {
+        value->f_bavail = value->f_blocks * 13 / 100;
+    }
+    if (result == 0 && kind == Fault::DiskRecovered) {
+        value->f_bavail = value->f_blocks * 30 / 100;
+    }
     return result;
 }
 
@@ -1107,7 +1476,51 @@ void wrap_thread_start(
         fault.store(Fault::None);
         throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again));
     }
+    if (fault.load() == Fault::ExecutorNotStarted) {
+        std::unique_lock<std::mutex> lock(barrier_mutex);
+        blocked = true;
+        barrier_condition.notify_all();
+        barrier_condition.wait(lock, [] { return released; });
+    }
     real_thread_start(thread, std::move(state), entry);
+}
+
+void real_subscription_base_constructor(rclcpp::SubscriptionBase*, rclcpp::node_interfaces::NodeBaseInterface*, const rosidl_message_type_support_t&, const std::string&, const rcl_subscription_options_t&, bool) asm(
+    "__real__ZN6rclcpp16SubscriptionBaseC2EPNS_15node_interfaces17NodeBaseInterfaceERK29"
+    "rosidl_message_type_support_tRKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE"
+    "RK26rcl_subscription_options_sb");
+void wrap_subscription_base_constructor(rclcpp::SubscriptionBase*, rclcpp::node_interfaces::NodeBaseInterface*, const rosidl_message_type_support_t&, const std::string&, const rcl_subscription_options_t&, bool) asm(
+    "__wrap__ZN6rclcpp16SubscriptionBaseC2EPNS_15node_interfaces17NodeBaseInterfaceERK29"
+    "rosidl_message_type_support_tRKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE"
+    "RK26rcl_subscription_options_sb");
+void wrap_subscription_base_constructor(
+    rclcpp::SubscriptionBase* self, rclcpp::node_interfaces::NodeBaseInterface* node,
+    const rosidl_message_type_support_t& type, const std::string& name,
+    const rcl_subscription_options_t& options, bool generic) {
+    native_subscription_creates.fetch_add(1);
+    if (fault.load() == Fault::ExecutorCreateBlock) {
+        std::unique_lock<std::mutex> lock(barrier_mutex);
+        blocked = true;
+        barrier_condition.notify_all();
+        barrier_condition.wait(lock, [] { return released; });
+    }
+    real_subscription_base_constructor(self, node, type, name, options, generic);
+}
+
+void real_detach_subscription(std::shared_ptr<rclcpp::GenericSubscription>&) asm(
+    "__real__ZN8ros2_bag8recorder26detach_subscription_nativeERSt10shared_"
+    "ptrIN6rclcpp19GenericSubscriptionEE");
+void wrap_detach_subscription(std::shared_ptr<rclcpp::GenericSubscription>&) asm(
+    "__wrap__ZN8ros2_bag8recorder26detach_subscription_nativeERSt10shared_"
+    "ptrIN6rclcpp19GenericSubscriptionEE");
+void wrap_detach_subscription(std::shared_ptr<rclcpp::GenericSubscription>& subscription) {
+    if (fault.load() == Fault::ExecutorRemoveBlock) {
+        std::unique_lock<std::mutex> lock(barrier_mutex);
+        blocked = true;
+        barrier_condition.notify_all();
+        barrier_condition.wait(lock, [] { return released; });
+    }
+    real_detach_subscription(subscription);
 }
 
 ros2_bag::Result<void, rec::Error>
@@ -1164,6 +1577,12 @@ ros2_bag::Result<void, rec::Error> real_close(rec::Writer* writer) asm(
 ros2_bag::Result<void, rec::Error> wrap_close(rec::Writer* writer) asm(
     "__wrap__ZN8ros2_bag8recorder6Writer5closeEv");
 ros2_bag::Result<void, rec::Error> wrap_close(rec::Writer* writer) {
+    if (fault.load() == Fault::WriterCloseBlock) {
+        std::unique_lock<std::mutex> lock(barrier_mutex);
+        blocked = true;
+        barrier_condition.notify_all();
+        barrier_condition.wait(lock, [] { return released; });
+    }
     if (fault.load() == Fault::WriterClose) {
         fault.store(Fault::None);
         (void)real_close(writer);
@@ -1199,6 +1618,17 @@ int main(int argc, char** argv) {
     test_shutdown_waits_for_cleanup_without_blocking_state(true);
     test_lifecycle_waits_for_callback_before_admission(true);
     test_lifecycle_waits_for_callback_before_admission(false);
+    test_executor_create_shutdown(true);
+    test_executor_create_shutdown(false);
+    test_shutdown_observable_during_topic_event_sync();
+    test_executor_remove_shutdown();
+    test_state_snapshot_concurrent_generations();
+    test_distinct_topic_limit();
+    test_disk_resume_hysteresis();
+    test_optional_resource_sampling();
+    test_revision_exhausted_historical_view();
+    test_finalizing_recovery(false);
+    test_finalizing_recovery(true);
     test_retention_commits_each_authorization();
     rclcpp::shutdown();
     return failures.load() == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

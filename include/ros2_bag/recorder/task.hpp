@@ -92,6 +92,7 @@ struct TaskDetail {
     struct Recovery {
         bool recovered = false;
         bool has_findings = false;
+        bool manifest_revision_exhausted = false;
         std::uint32_t incomplete_segments = 0;
         std::uint32_t uncertain_operations = 0;
     };

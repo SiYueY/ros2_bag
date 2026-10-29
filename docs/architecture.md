@@ -259,6 +259,8 @@ Application 职责如下：
 
 Runtime 发起 Shutdown 必须是**非阻塞提交 + 独立完成观察**：Recorder 提供幂等的 Shutdown 请求/共享 Completion，真正的 Stop、Writer/Cleanup/Monitor 退出由 Recorder 自身执行域推进。Runtime 的关闭管理线程只等待 Completion 并施加 deadline；若超时则保持对象图和依赖存活并进入 UNSAFE_TO_DESTROY，不能让一个永久 `join()` 卡住唯一的超时判定线程。
 
+Recorder 的订阅控制使用其持有的独立 ROS callback group 和 Executor 线程；消息回调仍由节点所属 Executor 执行。Runtime 必须等待 `shutdown()` Completion 成功后再销毁 Recorder；析构只连接已经 quiescent 的 worker，违反该所有权约定会终止进程，不会在析构中重新执行业务 Shutdown。
+
 具体的线程协调、超时和失败退出策略由 `server.md` 决定，并通过并发 Stop/Shutdown、信号打断和部分启动失败测试验证。
 
 Client/TUI/Web 退出或网络连接断开，**默认不触发 Recorder Stop 或 Shutdown**；显式停止命令另行处理。

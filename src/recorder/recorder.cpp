@@ -26,6 +26,7 @@
 
 #include <rclcpp/qos.hpp>
 #include <rclcpp/generic_subscription.hpp>
+#include <rclcpp/executors/single_threaded_executor.hpp>
 
 #include "ros2_bag/recorder/manifest.hpp"
 #include "ros2_bag/recorder/admission.hpp"
@@ -38,6 +39,9 @@
 #include "ros2_bag/recorder/writer.hpp"
 
 namespace ros2_bag::recorder {
+
+void detach_subscription_native(std::shared_ptr<rclcpp::GenericSubscription>& subscription);
+
 namespace {
 
 Error error(ErrorCode code, std::string message, Effects effects = Effects::None) {
@@ -404,6 +408,10 @@ public:
     DiskMonitorConfig disk_config() const {
         DiskMonitorConfig result;
         result.path = config_.output_root;
+        result.interval = config_.disk.check_interval;
+        if (config_.resource.enabled) {
+            result.interval = std::min(result.interval, config_.resource.sample_interval);
+        }
         result.max_age = config_.disk.max_age;
         result.failure_threshold = config_.disk.failure_threshold;
         result.warning_percent = config_.disk.warning_percent;
@@ -417,6 +425,10 @@ public:
             return false;
         }
         if (!disk_state_is_safe(sample.state)) {
+            return false;
+        }
+        if (sample.used_percent > config_.disk.resume_percent ||
+            sample.available_bytes < config_.disk.min_free_bytes) {
             return false;
         }
         if (!snapshot_fresh_and_safe) {
@@ -443,7 +455,11 @@ public:
     }
 
     ~Implementation() {
-        request_shutdown();
+        // Runtime owns the shutdown protocol; destroying live native work would
+        // invalidate its backing state, so a contract violation is fatal.
+        if (!shutdown_completion_.done()) {
+            std::terminate();
+        }
         if (worker_.joinable()) {
             worker_.join();
         }
@@ -461,6 +477,193 @@ public:
     }
 
     enum class SystemEvent : std::size_t { WriterFailure, FirstLive, DiskSample };
+
+    enum class ExecutorOperationState { Queued, Started, Finished, CancelledBeforeStart };
+
+    struct ExecutorOperation {
+        std::mutex mutex;
+        std::condition_variable condition;
+        ExecutorOperationState state = ExecutorOperationState::Queued;
+        std::chrono::steady_clock::time_point started_at{};
+        std::function<void()> native_work;
+        std::exception_ptr failure;
+    };
+
+    // Only mutation submits executor work. There is exactly one reserved
+    // operation/result slot; ordinary mutation queue capacity cannot consume it.
+    void ensure_operation_executor() {
+        if (operation_executor_) {
+            return;
+        }
+        auto group =
+            node_->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
+        auto executor = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
+        executor->add_callback_group(group, node_->get_node_base_interface());
+        operation_executor_stopping_.store(false);
+        operation_executor_failed_.store(false);
+        const auto context = node_->get_node_base_interface()->get_context();
+        std::thread thread([this, executor, context] {
+            try {
+                while (!operation_executor_stopping_.load(std::memory_order_acquire) &&
+                       rclcpp::ok(context)) {
+                    executor->spin_once(std::chrono::milliseconds(100));
+                }
+            } catch (...) {
+                operation_executor_failed_.store(true, std::memory_order_release);
+            }
+            if (!operation_executor_stopping_.load(std::memory_order_acquire)) {
+                operation_executor_failed_.store(true, std::memory_order_release);
+            }
+        });
+        operation_callback_group_ = std::move(group);
+        operation_executor_ = std::move(executor);
+        operation_executor_thread_ = std::move(thread);
+    }
+
+    // Cancellation is only legal before the native call starts. While awaiting
+    // the reserved result, process safety publications without terminalizing
+    // resources that the executor operation may still own.
+    bool run_executor_operation(std::function<void()> work, bool cleanup = false) {
+        ensure_operation_executor();
+        auto operation = std::make_shared<ExecutorOperation>();
+        operation->native_work = std::move(work);
+        std::weak_ptr<ExecutorOperation> weak = operation;
+        auto timer = node_->create_wall_timer(
+            std::chrono::milliseconds(1),
+            [weak, shutdown = &shutdown_requested_, cleanup] {
+                auto op = weak.lock();
+                if (!op) {
+                    return;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(op->mutex);
+                    if (op->state != ExecutorOperationState::Queued) {
+                        return;
+                    }
+                    if (!cleanup && shutdown->load(std::memory_order_acquire)) {
+                        op->state = ExecutorOperationState::CancelledBeforeStart;
+                        op->condition.notify_one();
+                        return;
+                    }
+                    op->state = ExecutorOperationState::Started;
+                    op->started_at = std::chrono::steady_clock::now();
+                }
+                try {
+                    op->native_work();
+                } catch (...) {
+                    op->failure = std::current_exception();
+                }
+                {
+                    std::lock_guard<std::mutex> lock(op->mutex);
+                    op->state = ExecutorOperationState::Finished;
+                }
+                op->condition.notify_one();
+            },
+            operation_callback_group_);
+        std::unique_lock<std::mutex> lock(operation->mutex);
+        std::exception_ptr safety_failure;
+        bool warned = false;
+        while (operation->state == ExecutorOperationState::Queued ||
+               operation->state == ExecutorOperationState::Started) {
+            if (!cleanup && (shutdown_requested_.load() || operation_executor_failed_.load()) &&
+                operation->state == ExecutorOperationState::Queued) {
+                operation->state = ExecutorOperationState::CancelledBeforeStart;
+                break;
+            }
+            const bool issue_warning = !warned &&
+                                       operation->state == ExecutorOperationState::Started &&
+                                       std::chrono::steady_clock::now() - operation->started_at >=
+                                           config_.native_wait_warning;
+            warned = warned || issue_warning;
+            operation->condition.wait_for(lock, std::chrono::milliseconds(10));
+            lock.unlock();
+            try {
+                if (issue_warning) {
+                    RCLCPP_WARN(
+                        node_->get_logger(), "Recorder ROS executor operation is still running");
+                }
+                std::function<void()> safety;
+                {
+                    std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+                    auto& event =
+                        system_events_[static_cast<std::size_t>(SystemEvent::WriterFailure)];
+                    if (event) {
+                        safety = std::move(event);
+                        event = {};
+                    }
+                }
+                if (safety) {
+                    safety();
+                }
+                const auto disk_generation = producer_disk_event_.exchange(0);
+                if (disk_generation != 0) {
+                    bool current = false;
+                    {
+                        std::lock_guard<std::mutex> state_lock(state_mutex_);
+                        current = state_.task && state_.task->generation == disk_generation;
+                    }
+                    if (current) {
+                        apply_disk_safety();
+                    }
+                }
+            } catch (...) {
+                if (!safety_failure) {
+                    safety_failure = std::current_exception();
+                }
+            }
+            lock.lock();
+        }
+        const auto state = operation->state;
+        const auto failure = operation->failure;
+        lock.unlock();
+        timer->cancel();
+        if (safety_failure) {
+            std::rethrow_exception(safety_failure);
+        }
+        if (failure) {
+            std::rethrow_exception(failure);
+        }
+        return state == ExecutorOperationState::Finished;
+    }
+
+    void stop_operation_executor() {
+        if (!operation_executor_) {
+            return;
+        }
+        operation_executor_stopping_.store(true, std::memory_order_release);
+        operation_executor_->cancel();
+        if (operation_executor_thread_.joinable()) {
+            operation_executor_thread_.join();
+        }
+        operation_executor_.reset();
+        operation_callback_group_.reset();
+    }
+
+    bool detach_subscription(
+        std::shared_ptr<rclcpp::GenericSubscription>& subscription, bool cleanup) {
+        auto owned = std::make_shared<std::shared_ptr<rclcpp::GenericSubscription>>();
+        *owned = std::move(subscription);
+        try {
+            const bool completed =
+                run_executor_operation([owned] { detach_subscription_native(*owned); }, cleanup);
+            if (!completed) {
+                subscription = std::move(*owned);
+            }
+            return completed;
+        } catch (...) {
+            subscription = std::move(*owned);
+            throw;
+        }
+    }
+
+    void detach_topics(std::unordered_map<TopicId, ActiveTopic>& topics) {
+        for (auto& entry : topics) {
+            if (entry.second.subscription) {
+                detach_subscription(entry.second.subscription, true);
+            }
+        }
+        topics.clear();
+    }
 
     // Each source has one outstanding/coalescible result. External admission
     // cannot consume these reserved slots, and publication never waits on mutation.
@@ -486,6 +689,16 @@ public:
         }
         // enqueue_cleanup holds a credit until mutation consumes its result.
         std::terminate();  // A full result channel would violate credit conservation.
+    }
+
+    Result<std::uint64_t, Error> append_topic_event(TopicEvent event) {
+        std::lock_guard<std::mutex> lock(topic_events_mutex_);
+        return topic_events_->append(std::move(event));
+    }
+
+    Result<TopicOperationState, Error> topic_event_operation_state(const OperationId& id) {
+        std::lock_guard<std::mutex> lock(topic_events_mutex_);
+        return topic_events_->operation_state(id);
     }
 
     // Mutation domain only, after the cleanup worker has joined.
@@ -697,7 +910,7 @@ public:
             entry.second.ingress->condition.wait(
                 ingress_lock, [&entry] { return entry.second.ingress->producers == 0; });
         }
-        topics.clear();
+        detach_topics(topics);
         resource_monitor_.reset();
         stop_dispatch_thread();
         std::optional<Error> secondary;
@@ -1038,7 +1251,7 @@ public:
         }
     }
 
-    void schedule_retention_locked() {
+    void schedule_retention_locked(std::unique_lock<std::mutex>& lock) {
         retention_deadline_steady_ns_.store(0, std::memory_order_release);
         if (!manifest_ || !cleanup_ || state_.recorder_state == RecorderState::Failed) {
             return;
@@ -1091,7 +1304,9 @@ public:
             DeleteWork work{
                 updated.task.recording_id, entry->segment_id,
                 manifest_->task_directory() / entry->relative_path, updated.manifest_revision};
+            lock.unlock();
             const auto committed = manifest_->commit(std::move(updated));
+            lock.lock();
             if (!committed) {
                 state_.recorder_state = RecorderState::Failed;
                 state_.last_error = committed.error();
@@ -1124,11 +1339,11 @@ public:
     }
 
     void run_retention() {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        schedule_retention_locked();
+        std::unique_lock<std::mutex> lock(state_mutex_);
+        schedule_retention_locked(lock);
     }
 
-    bool make_room_for_segment_locked() {
+    bool make_room_for_segment_locked(std::unique_lock<std::mutex>& lock) {
         if (!manifest_) {
             return false;
         }
@@ -1180,7 +1395,9 @@ public:
         updated.task.segment_history.removed_count += erase_count;
         updated.task.segment_history.removed_bytes += erased_bytes;
         ++updated.manifest_revision;
+        lock.unlock();
         const auto committed = manifest_->commit(std::move(updated));
+        lock.lock();
         if (committed) {
             return true;
         }
@@ -1188,6 +1405,39 @@ public:
         state_.last_error = committed.error();
         poisoned_ = persistence_poisoned();
         return false;
+    }
+
+    // Mutation owns manifest_; persistence occurs without state_mutex_.
+    Result<void, Error> persist_finalizing(bool finalize_task) {
+        auto finalizing = manifest_->data();
+        if (finalizing.manifest_revision == std::numeric_limits<std::uint64_t>::max()) {
+            return Result<void, Error>(
+                unexpect, error(
+                              ErrorCode::StorageError, "manifest revision exhausted",
+                              Effects::ConfirmedPartial));
+        }
+        if (finalize_task) {
+            finalizing.task.state = TaskState::Finalizing;
+        }
+        for (auto& segment : finalizing.segments) {
+            if (segment.state == SegmentLifecycleState::Writing) {
+                segment.state = SegmentLifecycleState::Finalizing;
+            }
+        }
+        ++finalizing.manifest_revision;
+        auto committed = manifest_->commit(std::move(finalizing));
+        if (!committed) {
+            auto failure = committed.error();
+            if (failure.effects == Effects::None) {
+                failure.effects = Effects::ConfirmedPartial;
+            }
+            return Result<void, Error>(unexpect, std::move(failure));
+        }
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (state_.segments.current) {
+            state_.segments.current->state = SegmentLifecycleState::Finalizing;
+        }
+        return Result<void, Error>();
     }
 
     void rotate_rolling_segment(bool for_resume = false) {
@@ -1242,6 +1492,15 @@ public:
             topics.push_back(entry.second.info);
         }
         lock.unlock();
+        const auto finalizing = persist_finalizing(false);
+        if (!finalizing) {
+            lock.lock();
+            state_.recorder_state = RecorderState::Failed;
+            state_.last_error = finalizing.error();
+            poisoned_ = persistence_poisoned();
+            rolling_deadline_steady_ns_.store(0, std::memory_order_release);
+            return;
+        }
         stop_dispatch_thread(false);
         const auto closed = writer->close();
         if (!closed) {
@@ -1271,7 +1530,7 @@ public:
         }
         for (auto& segment : complete.segments) {
             if (segment.segment_id == previous.segment_id &&
-                segment.state == SegmentLifecycleState::Writing) {
+                segment.state == SegmentLifecycleState::Finalizing) {
                 segment.state = SegmentLifecycleState::Complete;
                 segment.completed_at_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                               std::chrono::system_clock::now().time_since_epoch())
@@ -1283,7 +1542,9 @@ public:
             }
         }
         ++complete.manifest_revision;
+        lock.unlock();
         const auto committed_complete = manifest_->commit(std::move(complete));
+        lock.lock();
         if (!committed_complete) {
             state_.recorder_state = RecorderState::Failed;
             state_.last_error = committed_complete.error();
@@ -1293,7 +1554,7 @@ public:
         }
         previous.state = SegmentLifecycleState::Complete;
         state_.segments.last_completed = previous;
-        schedule_retention_locked();
+        schedule_retention_locked(lock);
         if (state_.recorder_state == RecorderState::Failed) {
             rolling_deadline_steady_ns_.store(0, std::memory_order_release);
             return;
@@ -1307,7 +1568,7 @@ public:
             rolling_deadline_steady_ns_.store(0, std::memory_order_release);
             return;
         }
-        if (!make_room_for_segment_locked()) {
+        if (!make_room_for_segment_locked(lock)) {
             rolling_deadline_steady_ns_.store(0, std::memory_order_release);
             return;
         }
@@ -1331,7 +1592,9 @@ public:
                                  .count();
         opening.segments.push_back(next);
         ++opening.manifest_revision;
+        lock.unlock();
         const auto committed_opening = manifest_->commit(std::move(opening));
+        lock.lock();
         if (!committed_opening) {
             state_.recorder_state = RecorderState::Failed;
             state_.last_error = committed_opening.error();
@@ -1456,7 +1719,16 @@ public:
             entry.second.ingress->condition.wait(
                 ingress_lock, [&entry] { return entry.second.ingress->producers == 0; });
         }
-        topics.clear();
+        detach_topics(topics);
+        const auto finalizing = persist_finalizing(true);
+        if (!finalizing) {
+            lock.lock();
+            state_.recorder_state = RecorderState::Failed;
+            state_.last_error = finalizing.error();
+            poisoned_ = persistence_poisoned();
+            timed_deadline_steady_ns_.store(0, std::memory_order_release);
+            return;
+        }
         resource_monitor_.reset();
         stop_dispatch_thread();
         if (writer_open) {
@@ -1498,14 +1770,16 @@ public:
                                               std::chrono::system_clock::now().time_since_epoch())
                                               .count();
         for (auto& segment : completed.segments) {
-            if (segment.state == SegmentLifecycleState::Writing) {
+            if (segment.state == SegmentLifecycleState::Finalizing) {
                 segment.state = SegmentLifecycleState::Complete;
                 segment.completed_at_ns = completed.task.terminal_time_ns;
                 segment.message_count = state_.segments.current->written_messages;
                 segment.size_bytes = state_.segments.current->written_bytes;
             }
         }
+        lock.unlock();
         const auto committed = manifest_->commit(completed);
+        lock.lock();
         if (!committed) {
             state_.recorder_state = RecorderState::Failed;
             state_.last_error = committed.error();
@@ -1539,7 +1813,7 @@ public:
             decltype(active_topics_) topics;
             Cleanup* cleanup = nullptr;
             {
-                std::lock_guard<std::mutex> state_lock(state_mutex_);
+                std::unique_lock<std::mutex> state_lock(state_mutex_);
                 for (auto& entry : active_topics_) {
                     entry.second.admission->close();
                     std::lock_guard<std::mutex> ingress_lock(entry.second.ingress->mutex);
@@ -1556,7 +1830,7 @@ public:
                 entry.second.ingress->condition.wait(
                     ingress_lock, [&entry] { return entry.second.ingress->producers == 0; });
             }
-            topics.clear();
+            detach_topics(topics);
             resource_monitor_.reset();
             stop_dispatch_thread();
             std::optional<Error> close_error;
@@ -1573,8 +1847,9 @@ public:
             // The worker has joined; consume every result while the manifest
             // and cleanup ownership are still available to the mutation domain.
             drain_cleanup_results();
+            stop_operation_executor();
             {
-                std::lock_guard<std::mutex> state_lock(state_mutex_);
+                std::unique_lock<std::mutex> state_lock(state_mutex_);
                 if (manifest_) {
                     ManifestData failed = manifest_->data();
                     if (!poisoned_ && !manifest_->poisoned() &&
@@ -1596,7 +1871,9 @@ public:
                                 ErrorCode::InternalError, "shutdown interrupted active task",
                                 Effects::ConfirmedPartial);
                         }
+                        state_lock.unlock();
                         const auto committed = manifest_->commit(failed);
+                        state_lock.lock();
                         if (!committed) {
                             state_.last_error = committed.error();
                         }
@@ -1635,17 +1912,23 @@ public:
 
     RecorderConfig config_;
     rclcpp::Node::SharedPtr node_;
+    rclcpp::CallbackGroup::SharedPtr operation_callback_group_;
+    std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> operation_executor_;
+    std::atomic<bool> operation_executor_stopping_{false};
+    std::atomic<bool> operation_executor_failed_{false};
+    std::thread operation_executor_thread_;
     mutable std::mutex state_mutex_;
     State state_;
     std::optional<Manifest> manifest_;
-    std::optional<TopicEvents> topic_events_;
+    std::shared_ptr<TopicEvents> topic_events_;
+    mutable std::mutex topic_events_mutex_;
     std::shared_ptr<Writer> writer_;
     std::shared_ptr<MessagePool> message_pool_;
     std::shared_ptr<MessageQueue> message_queue_;
     std::unique_ptr<Snapshot> snapshot_;
     std::mutex snapshot_mutex_;
     std::unique_ptr<ResourceMonitor> resource_monitor_;
-    std::unique_ptr<Cleanup> cleanup_;
+    std::shared_ptr<Cleanup> cleanup_;
     std::deque<DeleteWork> cleanup_retry_;
     std::thread dispatch_thread_;
     std::atomic<bool> dispatch_stopping_{false};
@@ -1918,7 +2201,14 @@ Completion<TaskInfo> Recorder::start(const StartOptions& options) {
                 implementation->failure_settled_ = false;
                 implementation->state_.last_error.reset();
                 const auto directory = implementation->config_.output_root / options.recording_id;
-                if (std::filesystem::exists(directory)) {
+                lock.unlock();
+                const bool directory_exists = std::filesystem::exists(directory);
+                lock.lock();
+                if (implementation->shutdown_requested_.load()) {
+                    source.set_error(error(ErrorCode::InvalidState, "shutdown requested"));
+                    return;
+                }
+                if (directory_exists) {
                     source.set_error(
                         error(ErrorCode::RecordingExists, "recording directory already exists"));
                     return;
@@ -1974,7 +2264,7 @@ Completion<TaskInfo> Recorder::start(const StartOptions& options) {
                     source.set_error(std::move(failure));
                     return;
                 }
-                implementation->topic_events_ = events.value();
+                implementation->topic_events_ = std::make_shared<TopicEvents>(events.value());
                 implementation->writer_ =
                     std::make_shared<Writer>(implementation->config_.compression);
                 const auto pool_capacity = message_pool_capacity(implementation->config_);
@@ -2016,7 +2306,7 @@ Completion<TaskInfo> Recorder::start(const StartOptions& options) {
                 implementation->dispatch_segment_id_.store(0, std::memory_order_relaxed);
                 implementation->process_baseline_.reset();
                 implementation->start_dispatch_thread(implementation->writer_);
-                implementation->cleanup_ = std::make_unique<Cleanup>(
+                implementation->cleanup_ = std::make_shared<Cleanup>(
                     implementation->config_.cleanup.queue_capacity,
                     implementation->config_.cleanup.warning, [implementation](DeleteResult result) {
                         implementation->submit_cleanup_result(std::move(result));
@@ -2024,7 +2314,9 @@ Completion<TaskInfo> Recorder::start(const StartOptions& options) {
                 disk_config = implementation->disk_config();
                 implementation->resource_monitor_ = std::make_unique<ResourceMonitor>(
                     disk_config, implementation->disk_admission_,
-                    [implementation, generation = data.task.generation](DiskSample sample) {
+                    [implementation, generation = data.task.generation,
+                     last_resource_sample =
+                         std::chrono::steady_clock::time_point{}](DiskSample sample) mutable {
                         bool disk_pause_required = sample.state == DiskSafetyState::Critical;
                         if (sample.state == DiskSafetyState::Unknown &&
                             sample.consecutive_failures >=
@@ -2036,7 +2328,15 @@ Completion<TaskInfo> Recorder::start(const StartOptions& options) {
                             implementation->queue_condition_.notify_one();
                         }
                         auto visibility = implementation->collect_publisher_visibility();
-                        auto process = implementation->sample_process();
+                        std::optional<ProcessSample> process;
+                        const auto now = std::chrono::steady_clock::now();
+                        if (implementation->config_.resource.enabled &&
+                            (last_resource_sample == std::chrono::steady_clock::time_point{} ||
+                             now - last_resource_sample >=
+                                 implementation->config_.resource.sample_interval)) {
+                            process = implementation->sample_process();
+                            last_resource_sample = now;
+                        }
                         auto apply_sample = [implementation, sample, generation,
                                              disk_pause_required, process = std::move(process),
                                              visibility = std::move(visibility)] {
@@ -2046,7 +2346,9 @@ Completion<TaskInfo> Recorder::start(const StartOptions& options) {
                                 return;
                             }
                             implementation->state_.disk = sample;
-                            implementation->state_.process = process;
+                            if (process) {
+                                implementation->state_.process = *process;
+                            }
                             for (const auto& observation : visibility) {
                                 const auto active =
                                     implementation->active_topics_.find(observation.topic_id);
@@ -2083,7 +2385,11 @@ Completion<TaskInfo> Recorder::start(const StartOptions& options) {
                                 }
                                 return;
                             }
-                            if (sample.state == DiskSafetyState::Unknown) {
+                            if (sample.state == DiskSafetyState::Unknown ||
+                                sample.used_percent > implementation->config_.disk.resume_percent ||
+                                sample.available_bytes <
+                                    implementation->config_.disk.min_free_bytes) {
+                                implementation->disk_safe_since_ = {};
                                 return;
                             }
                             if (implementation->state_.pause.disk == DiskPauseReason::None) {
@@ -2248,7 +2554,16 @@ Completion<void> Recorder::stop(std::string_view recording_id, std::uint64_t gen
                     entry.second.ingress->condition.wait(
                         ingress_lock, [&entry] { return entry.second.ingress->producers == 0; });
                 }
-                topics.clear();
+                implementation->detach_topics(topics);
+                const auto finalizing = implementation->persist_finalizing(true);
+                if (!finalizing) {
+                    lock.lock();
+                    implementation->state_.recorder_state = RecorderState::Failed;
+                    implementation->state_.last_error = finalizing.error();
+                    implementation->poisoned_ = implementation->persistence_poisoned();
+                    source.set_error(finalizing.error());
+                    return;
+                }
                 implementation->resource_monitor_.reset();
                 implementation->stop_dispatch_thread();
                 if (writer_open) {
@@ -2293,7 +2608,7 @@ Completion<void> Recorder::stop(std::string_view recording_id, std::uint64_t gen
                         std::chrono::system_clock::now().time_since_epoch())
                         .count();
                 for (auto& segment : completed.segments) {
-                    if (segment.state == SegmentLifecycleState::Writing) {
+                    if (segment.state == SegmentLifecycleState::Finalizing) {
                         segment.state = SegmentLifecycleState::Complete;
                         segment.completed_at_ns = completed.task.terminal_time_ns;
                         segment.message_count =
@@ -2301,7 +2616,9 @@ Completion<void> Recorder::stop(std::string_view recording_id, std::uint64_t gen
                         segment.size_bytes = implementation->state_.segments.current->written_bytes;
                     }
                 }
+                lock.unlock();
                 const auto committed = implementation->manifest_->commit(completed);
+                lock.lock();
                 if (!committed) {
                     implementation->state_.recorder_state = RecorderState::Failed;
                     implementation->state_.last_error = committed.error();
@@ -2532,12 +2849,32 @@ Completion<TopicInfo> Recorder::add_topic(
                     source.set_error(valid.error());
                     return;
                 }
+                if (implementation->topic_epochs_.find(options.name) ==
+                        implementation->topic_epochs_.end() &&
+                    implementation->topic_epochs_.size() >=
+                        implementation->config_.max_distinct_topics) {
+                    source.set_error(
+                        error(ErrorCode::ResourceExhausted, "distinct topic limit reached"));
+                    return;
+                }
                 Implementation::PublisherQosSnapshot publishers;
+                lock.unlock();
+                const auto discovery_started = std::chrono::steady_clock::now();
                 try {
                     publishers = implementation->publisher_qos_snapshot(
                         options.name, implementation->config_.discovery.max_profiles);
                 } catch (const std::exception& exception) {
                     source.set_error(error(ErrorCode::Unavailable, exception.what()));
+                    return;
+                }
+                if (std::chrono::steady_clock::now() - discovery_started >
+                    implementation->config_.discovery.timeout) {
+                    source.set_error(error(ErrorCode::Unavailable, "topic discovery timed out"));
+                    return;
+                }
+                lock.lock();
+                if (implementation->shutdown_requested_.load()) {
+                    source.set_error(error(ErrorCode::InvalidState, "shutdown requested"));
                     return;
                 }
                 const auto qos = select_qos(
@@ -2567,8 +2904,10 @@ Completion<TopicInfo> Recorder::add_topic(
                         Effects::None));
                     return;
                 }
+                lock.unlock();
                 const auto existing_operation =
-                    implementation->topic_events_->operation_state(operation_id);
+                    implementation->topic_event_operation_state(operation_id);
+                lock.lock();
                 if (!existing_operation) {
                     source.set_error(existing_operation.error());
                     return;
@@ -2578,7 +2917,13 @@ Completion<TopicInfo> Recorder::add_topic(
                         error(ErrorCode::InvalidArgument, "operation_id has already been used"));
                     return;
                 }
+                lock.unlock();
                 const auto schema = resolve_schema(options.type);
+                lock.lock();
+                if (implementation->shutdown_requested_.load()) {
+                    source.set_error(error(ErrorCode::InvalidState, "shutdown requested"));
+                    return;
+                }
                 if (!schema) {
                     source.set_error(schema.error());
                     return;
@@ -2629,7 +2974,9 @@ Completion<TopicInfo> Recorder::add_topic(
                 prepared.timestamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                             std::chrono::system_clock::now().time_since_epoch())
                                             .count();
-                const auto appended = implementation->topic_events_->append(std::move(prepared));
+                lock.unlock();
+                const auto appended = implementation->append_topic_event(std::move(prepared));
+                lock.lock();
                 if (!appended) {
                     source.set_error(appended.error());
                     return;
@@ -2695,8 +3042,10 @@ Completion<TopicInfo> Recorder::add_topic(
                                 std::chrono::system_clock::now().time_since_epoch())
                                 .count();
                         failed.error = opened.error();
+                        lock.unlock();
                         const auto failure_event =
-                            implementation->topic_events_->append(std::move(failed));
+                            implementation->append_topic_event(std::move(failed));
+                        lock.lock();
                         if (!failure_event) {
                             auto failure = failure_event.error();
                             if (failure.effects == Effects::None) {
@@ -2731,8 +3080,10 @@ Completion<TopicInfo> Recorder::add_topic(
                                               std::chrono::system_clock::now().time_since_epoch())
                                               .count();
                     failed.error = registered.error();
+                    lock.unlock();
                     const auto failure_event =
-                        implementation->topic_events_->append(std::move(failed));
+                        implementation->append_topic_event(std::move(failed));
+                    lock.lock();
                     if (!failure_event) {
                         auto failure = failure_event.error();
                         if (failure.effects == Effects::None) {
@@ -2753,6 +3104,8 @@ Completion<TopicInfo> Recorder::add_topic(
                 auto counters = std::make_shared<Implementation::ActiveTopic::Counters>();
                 const auto publisher_count = publishers.count;
                 std::shared_ptr<rclcpp::GenericSubscription> subscription;
+                auto native_result =
+                    std::make_shared<std::shared_ptr<rclcpp::GenericSubscription>>();
                 try {
                     counters->publisher_count.store(publisher_count, std::memory_order_relaxed);
                     counters->publisher_observed_steady_ns.store(
@@ -2769,78 +3122,121 @@ Completion<TopicInfo> Recorder::add_topic(
                     }
                     counters->qos_compatible.store(compatibility, std::memory_order_relaxed);
                     ingress->queue = implementation->message_queue_;
-                    subscription = implementation->node_->create_generic_subscription(
-                        info.name, info.type, implementation->make_qos(info.qos),
-                        [ingress, admission, pool = implementation->message_pool_,
+                    const bool created = implementation->run_executor_operation(
+                        [native_result, node = implementation->node_, info,
+                         native_qos = implementation->make_qos(info.qos), ingress, admission,
+                         pool = implementation->message_pool_,
                          disk = &implementation->disk_admission_, implementation, frozen_info,
                          pool_exhausted = &implementation->pool_exhausted_,
-                         queue_full = &implementation->queue_full_, counters, generation,
-                         topic_id = info.topic_id, topic_epoch = info.topic_epoch](
-                            std::shared_ptr<rclcpp::SerializedMessage> message) {
-                            // Acquire the producer lease before touching any
-                            // Recorder-owned state. An executor may retain a
-                            // callback after the subscription is detached.
-                            std::shared_ptr<MessageQueue> queue;
-                            {
-                                std::lock_guard<std::mutex> ingress_lock(ingress->mutex);
-                                if (!ingress->open) {
-                                    counters->dropped.fetch_add(1, std::memory_order_relaxed);
-                                    return;
-                                }
-                                ++ingress->producers;
-                                queue = ingress->queue;
-                            }
-                            Implementation::Ingress::Producer producer(*ingress);
-                            const auto admitted = admission->admit(generation, topic_epoch, *disk);
-                            if (admitted != AdmissionResult::Accepted) {
-                                if (admitted == AdmissionResult::DiskUnsafe) {
-                                    implementation->producer_disk_event_.store(generation);
-                                    implementation->queue_condition_.notify_one();
-                                }
-                                if (admitted == AdmissionResult::TimedDeadline) {
-                                    implementation->queue_condition_.notify_one();
-                                }
-                                counters->dropped.fetch_add(1, std::memory_order_relaxed);
-                                return;
-                            }
-                            counters->received.fetch_add(1, std::memory_order_relaxed);
-                            counters->record_arrival(
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    std::chrono::steady_clock::now().time_since_epoch())
-                                    .count());
-                            try {
-                                if (!queue) {
-                                    counters->dropped.fetch_add(1, std::memory_order_relaxed);
-                                    return;
-                                }
-                                auto owned = pool->acquire();
-                                if (!owned) {
-                                    pool_exhausted->fetch_add(1, std::memory_order_relaxed);
-                                    counters->dropped.fetch_add(1, std::memory_order_relaxed);
-                                    return;
-                                }
-                                RecordedMessage recorded;
-                                recorded.generation = generation;
-                                recorded.topic_id = topic_id;
-                                recorded.topic_epoch = topic_epoch;
-                                recorded.payload_bytes = message->size();
-                                recorded.receive_timestamp_ns =
-                                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                        std::chrono::system_clock::now().time_since_epoch())
-                                        .count();
-                                recorded.topic = frozen_info;
-                                recorded.written_counter = counters->written;
-                                *owned = *message;
-                                recorded.message = std::move(owned);
-                                if (!queue->try_push(std::move(recorded))) {
-                                    queue_full->fetch_add(1, std::memory_order_relaxed);
-                                    counters->dropped.fetch_add(1, std::memory_order_relaxed);
-                                }
-                            } catch (...) {
-                                counters->dropped.fetch_add(1, std::memory_order_relaxed);
-                            }
+                         queue_full = &implementation->queue_full_, counters, generation] {
+                            *native_result = node->create_generic_subscription(
+                                info.name, info.type, native_qos,
+                                [ingress, admission, pool, disk, implementation, frozen_info,
+                                 pool_exhausted, queue_full, counters, generation,
+                                 topic_id = info.topic_id, topic_epoch = info.topic_epoch](
+                                    std::shared_ptr<rclcpp::SerializedMessage> message) {
+                                    // Acquire the producer lease before touching any
+                                    // Recorder-owned state. An executor may retain a
+                                    // callback after the subscription is detached.
+                                    std::shared_ptr<MessageQueue> queue;
+                                    {
+                                        std::lock_guard<std::mutex> ingress_lock(ingress->mutex);
+                                        if (!ingress->open) {
+                                            counters->dropped.fetch_add(
+                                                1, std::memory_order_relaxed);
+                                            return;
+                                        }
+                                        ++ingress->producers;
+                                        queue = ingress->queue;
+                                    }
+                                    Implementation::Ingress::Producer producer(*ingress);
+                                    const auto admitted =
+                                        admission->admit(generation, topic_epoch, *disk);
+                                    if (admitted != AdmissionResult::Accepted) {
+                                        if (admitted == AdmissionResult::DiskUnsafe) {
+                                            implementation->producer_disk_event_.store(generation);
+                                            implementation->queue_condition_.notify_one();
+                                        }
+                                        if (admitted == AdmissionResult::TimedDeadline) {
+                                            implementation->queue_condition_.notify_one();
+                                        }
+                                        counters->dropped.fetch_add(1, std::memory_order_relaxed);
+                                        return;
+                                    }
+                                    counters->received.fetch_add(1, std::memory_order_relaxed);
+                                    counters->record_arrival(
+                                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now().time_since_epoch())
+                                            .count());
+                                    try {
+                                        if (!queue) {
+                                            counters->dropped.fetch_add(
+                                                1, std::memory_order_relaxed);
+                                            return;
+                                        }
+                                        auto owned = pool->acquire();
+                                        if (!owned) {
+                                            pool_exhausted->fetch_add(1, std::memory_order_relaxed);
+                                            counters->dropped.fetch_add(
+                                                1, std::memory_order_relaxed);
+                                            return;
+                                        }
+                                        RecordedMessage recorded;
+                                        recorded.generation = generation;
+                                        recorded.topic_id = topic_id;
+                                        recorded.topic_epoch = topic_epoch;
+                                        recorded.payload_bytes = message->size();
+                                        recorded.receive_timestamp_ns =
+                                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                std::chrono::system_clock::now().time_since_epoch())
+                                                .count();
+                                        recorded.topic = frozen_info;
+                                        recorded.written_counter = counters->written;
+                                        *owned = *message;
+                                        recorded.message = std::move(owned);
+                                        if (!queue->try_push(std::move(recorded))) {
+                                            queue_full->fetch_add(1, std::memory_order_relaxed);
+                                            counters->dropped.fetch_add(
+                                                1, std::memory_order_relaxed);
+                                        }
+                                    } catch (...) {
+                                        counters->dropped.fetch_add(1, std::memory_order_relaxed);
+                                    }
+                                });
                         });
+                    subscription = std::move(*native_result);
+                    if (!created) {
+                        throw std::runtime_error("subscription creation cancelled before start");
+                    }
+                    const auto operation =
+                        implementation->topic_event_operation_state(operation_id);
+                    {
+                        std::lock_guard<std::mutex> state_lock(implementation->state_mutex_);
+                        const auto epoch = implementation->topic_epochs_.find(info.name);
+                        const bool current =
+                            implementation->state_.task &&
+                            implementation->state_.task->recording_id == id &&
+                            implementation->state_.task->generation == generation &&
+                            epoch != implementation->topic_epochs_.end() &&
+                            epoch->second == info.topic_epoch &&
+                            implementation->active_topics_.find(info.topic_id) ==
+                                implementation->active_topics_.end() &&
+                            operation && operation.value() == TopicOperationState::Uncertain &&
+                            (implementation->state_.recorder_state == RecorderState::Recording ||
+                             implementation->state_.recorder_state == RecorderState::Paused) &&
+                            !implementation->shutdown_requested_.load();
+                        if (!current) {
+                            // Keep the closed subscription alive until native detach completes.
+                            throw std::runtime_error("subscription result is no longer current");
+                        }
+                    }
                 } catch (const std::exception& exception) {
+                    if (!subscription) {
+                        subscription = std::move(*native_result);
+                    }
+                    if (subscription) {
+                        implementation->detach_subscription(subscription, true);
+                    }
                     lock.lock();
                     const auto subscription_error =
                         error(ErrorCode::Unavailable, exception.what(), Effects::ConfirmedPartial);
@@ -2853,8 +3249,10 @@ Completion<TopicInfo> Recorder::add_topic(
                                               std::chrono::system_clock::now().time_since_epoch())
                                               .count();
                     failed.error = subscription_error;
+                    lock.unlock();
                     const auto failure_event =
-                        implementation->topic_events_->append(std::move(failed));
+                        implementation->append_topic_event(std::move(failed));
+                    lock.lock();
                     if (!failure_event) {
                         auto failure = failure_event.error();
                         if (failure.effects == Effects::None) {
@@ -2885,7 +3283,9 @@ Completion<TopicInfo> Recorder::add_topic(
                 added.timestamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          std::chrono::system_clock::now().time_since_epoch())
                                          .count();
-                const auto added_event = implementation->topic_events_->append(std::move(added));
+                lock.unlock();
+                const auto added_event = implementation->append_topic_event(std::move(added));
+                lock.lock();
                 if (!added_event) {
                     implementation->state_.topics.back().state = TopicRuntimeState::Failed;
                     auto failure = added_event.error();
@@ -2987,8 +3387,10 @@ Completion<void> Recorder::remove_topic(
                         Effects::None));
                     return;
                 }
+                lock.unlock();
                 const auto existing_operation =
-                    implementation->topic_events_->operation_state(operation_id);
+                    implementation->topic_event_operation_state(operation_id);
+                lock.lock();
                 if (!existing_operation) {
                     source.set_error(existing_operation.error());
                     return;
@@ -3006,7 +3408,9 @@ Completion<void> Recorder::remove_topic(
                 prepared.timestamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                             std::chrono::system_clock::now().time_since_epoch())
                                             .count();
-                const auto appended = implementation->topic_events_->append(std::move(prepared));
+                lock.unlock();
+                const auto appended = implementation->append_topic_event(std::move(prepared));
+                lock.lock();
                 if (!appended) {
                     source.set_error(appended.error());
                     return;
@@ -3030,8 +3434,82 @@ Completion<void> Recorder::remove_topic(
                     active.ingress->condition.wait(
                         ingress_lock, [&active] { return active.ingress->producers == 0; });
                 }
-                active.subscription.reset();
+                bool detached = false;
+                std::string detach_error;
+                try {
+                    detached = implementation->detach_subscription(active.subscription, false);
+                    if (!detached) {
+                        detach_error = "subscription removal cancelled before start";
+                    }
+                } catch (const std::exception& exception) {
+                    detach_error = exception.what();
+                }
+                const auto operation = implementation->topic_event_operation_state(operation_id);
                 lock.lock();
+                if (!detached) {
+                    implementation->active_topics_.emplace(topic_id, std::move(active));
+                    for (auto& topic : implementation->state_.topics) {
+                        if (topic.info.topic_id == topic_id) {
+                            topic.state = TopicRuntimeState::Armed;
+                        }
+                    }
+                    const auto failure =
+                        error(ErrorCode::Unavailable, detach_error, Effects::ConfirmedPartial);
+                    TopicEvent failed;
+                    failed.operation_id = operation_id;
+                    failed.topic_id = topic_id;
+                    failed.topic_epoch = topic_epoch;
+                    failed.type = TopicEventType::RemoveFailed;
+                    failed.timestamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::system_clock::now().time_since_epoch())
+                                              .count();
+                    failed.error = failure;
+                    lock.unlock();
+                    const auto result = implementation->append_topic_event(std::move(failed));
+                    lock.lock();
+                    source.set_error(result ? failure : result.error());
+                    return;
+                }
+                const auto topic_state = std::find_if(
+                    implementation->state_.topics.begin(), implementation->state_.topics.end(),
+                    [topic_id, topic_epoch](const TopicState& topic) {
+                        return topic.info.topic_id == topic_id &&
+                               topic.info.topic_epoch == topic_epoch &&
+                               topic.state == TopicRuntimeState::Removing;
+                    });
+                const bool current =
+                    implementation->state_.task &&
+                    implementation->state_.task->recording_id == id &&
+                    implementation->state_.task->generation == generation &&
+                    topic_state != implementation->state_.topics.end() && operation &&
+                    operation.value() == TopicOperationState::Uncertain &&
+                    (implementation->state_.recorder_state == RecorderState::Recording ||
+                     implementation->state_.recorder_state == RecorderState::Paused) &&
+                    !implementation->shutdown_requested_.load();
+                if (!current) {
+                    const auto failure = error(
+                        ErrorCode::InvalidState, "subscription removal result is no longer current",
+                        Effects::ConfirmedPartial);
+                    TopicEvent failed;
+                    failed.operation_id = operation_id;
+                    failed.topic_id = topic_id;
+                    failed.topic_epoch = topic_epoch;
+                    failed.type = TopicEventType::RemoveFailed;
+                    failed.timestamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::system_clock::now().time_since_epoch())
+                                              .count();
+                    failed.error = failure;
+                    lock.unlock();
+                    const auto result = implementation->append_topic_event(std::move(failed));
+                    lock.lock();
+                    for (auto& topic : implementation->state_.topics) {
+                        if (topic.info.topic_id == topic_id) {
+                            topic.state = TopicRuntimeState::Failed;
+                        }
+                    }
+                    source.set_error(result ? failure : result.error());
+                    return;
+                }
                 {
                     std::lock_guard<std::mutex> snapshot_lock(implementation->snapshot_mutex_);
                     if (implementation->snapshot_) {
@@ -3046,8 +3524,9 @@ Completion<void> Recorder::remove_topic(
                 removed.timestamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                            std::chrono::system_clock::now().time_since_epoch())
                                            .count();
-                const auto removed_event =
-                    implementation->topic_events_->append(std::move(removed));
+                lock.unlock();
+                const auto removed_event = implementation->append_topic_event(std::move(removed));
+                lock.lock();
                 if (!removed_event) {
                     for (auto& topic : implementation->state_.topics) {
                         if (topic.info.topic_id == topic_id) {
@@ -3083,78 +3562,147 @@ Completion<void> Recorder::remove_topic(
 }
 
 State Recorder::state() const {
-    std::lock_guard<std::mutex> lock(implementation_->state_mutex_);
-    State snapshot = implementation_->state_;
-    const auto observed_at_steady_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                           std::chrono::steady_clock::now().time_since_epoch())
-                                           .count();
-    if (implementation_->message_queue_) {
-        snapshot.queue = implementation_->message_queue_->state();
-    }
-    if (implementation_->message_pool_) {
-        snapshot.pool = implementation_->message_pool_->state();
-    }
-    if (implementation_->cleanup_) {
-        snapshot.cleanup = implementation_->cleanup_->state();
-        snapshot.cleanup.queued += implementation_->cleanup_retry_.size();
-        snapshot.cleanup.pending += implementation_->cleanup_retry_.size();
-        snapshot.cleanup.queue_full += implementation_->state_.cleanup.queue_full;
-        if (implementation_->state_.cleanup.last_error) {
-            snapshot.cleanup.last_error = implementation_->state_.cleanup.last_error;
+    struct TopicObservation {
+        TopicId id;
+        std::shared_ptr<AdmissionGate> admission;
+        std::shared_ptr<Implementation::ActiveTopic::Counters> counters;
+    };
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        State snapshot;
+        std::shared_ptr<MessageQueue> queue;
+        std::shared_ptr<MessagePool> pool;
+        std::shared_ptr<Cleanup> cleanup;
+        std::vector<TopicObservation> topics;
+        std::size_t retry_count = 0;
+        {
+            std::lock_guard<std::mutex> lock(implementation_->state_mutex_);
+            snapshot = implementation_->state_;
+            queue = implementation_->message_queue_;
+            pool = implementation_->message_pool_;
+            cleanup = implementation_->cleanup_;
+            retry_count = implementation_->cleanup_retry_.size();
+            topics.reserve(implementation_->active_topics_.size());
+            for (const auto& entry : implementation_->active_topics_) {
+                topics.push_back({entry.first, entry.second.admission, entry.second.counters});
+            }
+        }
+        const auto base_cleanup = snapshot.cleanup;
+        const auto observed_at_steady_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               std::chrono::steady_clock::now().time_since_epoch())
+                                               .count();
+        if (queue) {
+            snapshot.queue = queue->state();
+        }
+        if (pool) {
+            snapshot.pool = pool->state();
+        }
+        if (cleanup) {
+            snapshot.cleanup = cleanup->state();
+            snapshot.cleanup.queued += retry_count;
+            snapshot.cleanup.pending += retry_count;
+            snapshot.cleanup.queue_full += base_cleanup.queue_full;
+            if (base_cleanup.last_error) {
+                snapshot.cleanup.last_error = base_cleanup.last_error;
+            }
+        }
+        snapshot.dropped.pool.exhausted =
+            implementation_->pool_exhausted_.load(std::memory_order_relaxed);
+        snapshot.dropped.queue.full = implementation_->queue_full_.load(std::memory_order_relaxed);
+        snapshot.dropped.writer.write_failure =
+            implementation_->writer_write_failure_.load(std::memory_order_relaxed);
+        for (const auto& entry : topics) {
+            const auto dropped = entry.admission->counters();
+            snapshot.dropped.admission.stale_identity += dropped.admission.stale_identity;
+            snapshot.dropped.admission.not_accepting += dropped.admission.not_accepting;
+            snapshot.dropped.admission.timed_deadline += dropped.admission.timed_deadline;
+            snapshot.dropped.admission.disk_unsafe += dropped.admission.disk_unsafe;
+            snapshot.dropped.admission.disk_snapshot_busy += dropped.admission.disk_snapshot_busy;
+            for (auto& topic : snapshot.topics) {
+                if (topic.info.topic_id != entry.id) {
+                    continue;
+                }
+                topic.messages.received = entry.counters->received.load(std::memory_order_relaxed);
+                topic.messages.written = entry.counters->written->load(std::memory_order_relaxed);
+                topic.messages.dropped = entry.counters->dropped.load(std::memory_order_relaxed);
+                topic.publishers.count =
+                    entry.counters->publisher_count.load(std::memory_order_relaxed);
+                topic.publishers.compatibility =
+                    entry.counters->qos_compatible.load(std::memory_order_relaxed);
+                if (topic.publishers.count == 0) {
+                    topic.publishers.compatibility = TopicState::Compatibility::Unknown;
+                }
+                const auto observed_steady_ns =
+                    entry.counters->publisher_observed_steady_ns.load(std::memory_order_relaxed);
+                topic.publishers.fresh =
+                    observed_steady_ns != 0 &&
+                    observed_at_steady_ns - observed_steady_ns <=
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            implementation_->config_.discovery.visibility_max_age)
+                            .count();
+                const auto frequency = entry.counters->frequency(
+                    observed_at_steady_ns, topic.info.expected_hz,
+                    topic.state == TopicRuntimeState::Active &&
+                        snapshot.recorder_state == RecorderState::Recording &&
+                        topic.publishers.fresh && topic.publishers.count != 0);
+                topic.frequency.actual_hz = frequency.actual_hz;
+                topic.frequency.gap = frequency.gap;
+                break;
+            }
+        }
+        if (snapshot.segments.current) {
+            snapshot.segments.current->written_messages =
+                implementation_->segment_written_messages_.load(std::memory_order_relaxed);
+            snapshot.segments.current->written_bytes =
+                implementation_->segment_written_bytes_.load(std::memory_order_relaxed);
+            snapshot.segments.current->has_live_messages =
+                implementation_->segment_has_live_messages_.load(std::memory_order_relaxed);
+        }
+        snapshot.shutting_down = implementation_->shutdown_requested_.load();
+        {
+            std::lock_guard<std::mutex> lock(implementation_->state_mutex_);
+            const auto& current = implementation_->state_;
+            const bool same_task =
+                bool(snapshot.task) == bool(current.task) &&
+                (!snapshot.task || (snapshot.task->generation == current.task->generation &&
+                                    snapshot.task->recording_id == current.task->recording_id));
+            const bool same_segment =
+                bool(snapshot.segments.current) == bool(current.segments.current) &&
+                (!snapshot.segments.current ||
+                 snapshot.segments.current->segment_id == current.segments.current->segment_id);
+            bool same_topics = topics.size() == implementation_->active_topics_.size() &&
+                               snapshot.topics.size() == current.topics.size();
+            for (std::size_t index = 0; same_topics && index < snapshot.topics.size(); ++index) {
+                same_topics =
+                    snapshot.topics[index].info.topic_id == current.topics[index].info.topic_id &&
+                    snapshot.topics[index].info.topic_epoch ==
+                        current.topics[index].info.topic_epoch &&
+                    snapshot.topics[index].state == current.topics[index].state;
+            }
+            if (same_task && same_segment && same_topics &&
+                snapshot.recorder_state == current.recorder_state &&
+                queue == implementation_->message_queue_ &&
+                pool == implementation_->message_pool_ && cleanup == implementation_->cleanup_) {
+                return snapshot;
+            }
         }
     }
-    snapshot.dropped.pool.exhausted =
-        implementation_->pool_exhausted_.load(std::memory_order_relaxed);
-    snapshot.dropped.queue.full = implementation_->queue_full_.load(std::memory_order_relaxed);
-    snapshot.dropped.writer.write_failure =
-        implementation_->writer_write_failure_.load(std::memory_order_relaxed);
-    for (const auto& entry : implementation_->active_topics_) {
-        const auto dropped = entry.second.admission->counters();
-        snapshot.dropped.admission.stale_identity += dropped.admission.stale_identity;
-        snapshot.dropped.admission.not_accepting += dropped.admission.not_accepting;
-        snapshot.dropped.admission.timed_deadline += dropped.admission.timed_deadline;
-        snapshot.dropped.admission.disk_unsafe += dropped.admission.disk_unsafe;
-        snapshot.dropped.admission.disk_snapshot_busy += dropped.admission.disk_snapshot_busy;
-        for (auto& topic : snapshot.topics) {
-            if (topic.info.topic_id != entry.first) {
-                continue;
-            }
-            topic.messages.received =
-                entry.second.counters->received.load(std::memory_order_relaxed);
-            topic.messages.written =
-                entry.second.counters->written->load(std::memory_order_relaxed);
-            topic.messages.dropped = entry.second.counters->dropped.load(std::memory_order_relaxed);
-            topic.publishers.count =
-                entry.second.counters->publisher_count.load(std::memory_order_relaxed);
-            topic.publishers.compatibility =
-                entry.second.counters->qos_compatible.load(std::memory_order_relaxed);
-            if (topic.publishers.count == 0) {
-                topic.publishers.compatibility = TopicState::Compatibility::Unknown;
-            }
-            const auto observed_steady_ns =
-                entry.second.counters->publisher_observed_steady_ns.load(std::memory_order_relaxed);
-            topic.publishers.fresh = observed_steady_ns != 0 &&
-                                     observed_at_steady_ns - observed_steady_ns <=
-                                         std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                             implementation_->config_.discovery.visibility_max_age)
-                                             .count();
-            const auto frequency = entry.second.counters->frequency(
-                observed_at_steady_ns, topic.info.expected_hz,
-                topic.state == TopicRuntimeState::Active &&
-                    snapshot.recorder_state == RecorderState::Recording && topic.publishers.fresh &&
-                    topic.publishers.count != 0);
-            topic.frequency.actual_hz = frequency.actual_hz;
-            topic.frequency.gap = frequency.gap;
-            break;
-        }
+    // Under sustained churn return a fresh Recorder-owned snapshot without
+    // taking a component lock while holding state_mutex_.
+    State snapshot;
+    std::shared_ptr<Cleanup> cleanup;
+    {
+        std::lock_guard<std::mutex> lock(implementation_->state_mutex_);
+        snapshot = implementation_->state_;
+        cleanup = implementation_->cleanup_;
     }
-    if (snapshot.segments.current) {
-        snapshot.segments.current->written_messages =
-            implementation_->segment_written_messages_.load(std::memory_order_relaxed);
-        snapshot.segments.current->written_bytes =
-            implementation_->segment_written_bytes_.load(std::memory_order_relaxed);
-        snapshot.segments.current->has_live_messages =
-            implementation_->segment_has_live_messages_.load(std::memory_order_relaxed);
+    if (cleanup) {
+        const auto observed = cleanup->state();
+        std::lock_guard<std::mutex> lock(implementation_->state_mutex_);
+        if (cleanup == implementation_->cleanup_) {
+            snapshot.cleanup = observed;
+        } else {
+            snapshot = implementation_->state_;
+        }
     }
     snapshot.shutting_down = implementation_->shutdown_requested_.load();
     return snapshot;
@@ -3165,8 +3713,14 @@ Result<std::vector<DiscoveredTopic>, Error> Recorder::discover_topics() const {
         return Result<std::vector<DiscoveredTopic>, Error>(
             unexpect, error(ErrorCode::Unavailable, "ROS node is not available"));
     }
+    const auto deadline =
+        std::chrono::steady_clock::now() + implementation_->config_.discovery.timeout;
     try {
         const auto graph = implementation_->node_->get_topic_names_and_types();
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return Result<std::vector<DiscoveredTopic>, Error>(
+                unexpect, error(ErrorCode::Unavailable, "topic discovery timed out"));
+        }
         std::vector<DiscoveredTopic> discovered;
         discovered.reserve(std::min(graph.size(), implementation_->config_.discovery.max_results));
         for (const auto& entry : graph) {
@@ -3181,6 +3735,10 @@ Result<std::vector<DiscoveredTopic>, Error> Recorder::discover_topics() const {
                 std::unique(topic.types.begin(), topic.types.end()), topic.types.end());
             const auto publishers = implementation_->publisher_qos_snapshot(
                 topic.name, implementation_->config_.discovery.max_profiles);
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return Result<std::vector<DiscoveredTopic>, Error>(
+                    unexpect, error(ErrorCode::Unavailable, "topic discovery timed out"));
+            }
             topic.publishers.count = publishers.count;
             topic.publishers.profiles = publishers.profiles;
             topic.publishers.truncated = publishers.truncated;
@@ -3250,6 +3808,25 @@ Result<TaskDetail, Error> Recorder::get_task(
     detail.task = manifest->data().task;
     detail.recovery.recovered = recovery_evidence->present;
     detail.recovery.has_findings = recovery_evidence->findings_available;
+    bool current_task = false;
+    {
+        std::lock_guard<std::mutex> lock(implementation_->state_mutex_);
+        current_task = implementation_->manifest_ && implementation_->state_.task &&
+                       implementation_->state_.task->recording_id == detail.task.recording_id &&
+                       implementation_->state_.task->generation == detail.task.generation;
+    }
+    const bool exhausted_historical =
+        !current_task &&
+        manifest->data().manifest_revision == std::numeric_limits<std::uint64_t>::max() &&
+        (detail.task.state == TaskState::Initializing ||
+         detail.task.state == TaskState::Recording || detail.task.state == TaskState::Finalizing);
+    if (exhausted_historical) {
+        detail.task.state = TaskState::Incomplete;
+        detail.task.error = error(
+            ErrorCode::StorageError, "manifest_revision_exhausted", Effects::ConfirmedPartial);
+        detail.recovery.manifest_revision_exhausted = true;
+        detail.recovery.has_findings = true;
+    }
     detail.segments.offset = segment_offset;
     detail.segments.available = manifest->data().segments.size();
     if (detail.task.segment_history.removed_count >
@@ -3259,7 +3836,9 @@ Result<TaskDetail, Error> Recorder::get_task(
     }
     detail.segments.total = detail.segments.available + detail.task.segment_history.removed_count;
     for (const auto& segment : manifest->data().segments) {
-        if (segment.state == SegmentLifecycleState::Incomplete &&
+        if ((segment.state == SegmentLifecycleState::Incomplete ||
+             (exhausted_historical && (segment.state == SegmentLifecycleState::Writing ||
+                                       segment.state == SegmentLifecycleState::Finalizing))) &&
             detail.recovery.incomplete_segments != std::numeric_limits<std::uint32_t>::max()) {
             ++detail.recovery.incomplete_segments;
         }
@@ -3270,6 +3849,14 @@ Result<TaskDetail, Error> Recorder::get_task(
         detail.segments.items.insert(
             detail.segments.items.end(), manifest->data().segments.begin() + segment_offset,
             manifest->data().segments.begin() + end);
+        if (exhausted_historical) {
+            for (auto& segment : detail.segments.items) {
+                if (segment.state == SegmentLifecycleState::Writing ||
+                    segment.state == SegmentLifecycleState::Finalizing) {
+                    segment.state = SegmentLifecycleState::Incomplete;
+                }
+            }
+        }
         detail.segments.has_more = end < detail.segments.available;
     }
     return Result<TaskDetail, Error>(std::move(detail));
@@ -3318,7 +3905,24 @@ Result<TaskList, Error> Recorder::list_tasks(std::size_t offset, std::size_t lim
         ++list.scanned_entries;
         const auto manifest = Manifest::load(implementation_->config_.output_root / candidate_name);
         if (manifest) {
-            loaded.push_back(manifest->data().task);
+            auto task = manifest->data().task;
+            bool current_task = false;
+            {
+                std::lock_guard<std::mutex> lock(implementation_->state_mutex_);
+                current_task = implementation_->manifest_ && implementation_->state_.task &&
+                               implementation_->state_.task->recording_id == task.recording_id &&
+                               implementation_->state_.task->generation == task.generation;
+            }
+            if (!current_task &&
+                manifest->data().manifest_revision == std::numeric_limits<std::uint64_t>::max() &&
+                (task.state == TaskState::Initializing || task.state == TaskState::Recording ||
+                 task.state == TaskState::Finalizing)) {
+                task.state = TaskState::Incomplete;
+                task.error = error(
+                    ErrorCode::StorageError, "manifest_revision_exhausted",
+                    Effects::ConfirmedPartial);
+            }
+            loaded.push_back(std::move(task));
         }
     }
     candidates = std::move(loaded);
@@ -3343,13 +3947,18 @@ Result<TopicOperationState, Error> Recorder::topic_operation_state(
         return Result<TopicOperationState, Error>(
             unexpect, error(ErrorCode::InvalidArgument, "invalid recording_id"));
     }
+    std::shared_ptr<TopicEvents> active_events;
     {
         std::lock_guard<std::mutex> lock(implementation_->state_mutex_);
         if (implementation_->state_.task &&
             implementation_->state_.task->recording_id == recording_id &&
             implementation_->topic_events_) {
-            return implementation_->topic_events_->operation_state(operation_id);
+            active_events = implementation_->topic_events_;
         }
+    }
+    if (active_events) {
+        std::lock_guard<std::mutex> lock(implementation_->topic_events_mutex_);
+        return active_events->operation_state(operation_id);
     }
     const auto directory = implementation_->config_.output_root / std::string(recording_id);
     if (!std::filesystem::exists(directory)) {

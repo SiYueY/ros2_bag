@@ -11,8 +11,7 @@ namespace {
 
 Result<void, Error> invalid(std::string message) {
     return Result<void, Error>(
-        unexpect,
-        Error{ErrorCode::InvalidArgument, Effects::None, std::move(message)});
+        unexpect, Error{ErrorCode::InvalidArgument, Effects::None, std::move(message)});
 }
 
 }  // namespace
@@ -38,11 +37,23 @@ Result<void, Error> validate_config(const RecorderConfig& config) {
     if (config.discovery.max_results == 0) {
         return invalid("discovery.max_results must be positive");
     }
+    if (config.discovery.timeout.count() <= 0) {
+        return invalid("discovery.timeout must be positive");
+    }
+    if (config.resource.sample_interval.count() <= 0) {
+        return invalid("resource.sample_interval must be positive");
+    }
+    if (config.disk.check_interval.count() <= 0) {
+        return invalid("disk.check_interval must be positive");
+    }
     if (config.discovery.max_profiles == 0) {
         return invalid("discovery.max_profiles must be positive");
     }
     if (config.max_active_topics == 0) {
         return invalid("max_active_topics must be positive");
+    }
+    if (config.max_distinct_topics == 0) {
+        return invalid("max_distinct_topics must be positive");
     }
 
     if (config.queue.max_bytes == 0) {
@@ -157,9 +168,7 @@ Result<std::size_t, Error> message_pool_capacity(const RecorderConfig& config) {
         return Result<std::size_t, Error>(
             unexpect,
             Error{
-                ErrorCode::InvalidArgument,
-                Effects::None,
-                "invalid message pool capacity factor"});
+                ErrorCode::InvalidArgument, Effects::None, "invalid message pool capacity factor"});
     }
     const long double requested = std::ceil(
         static_cast<long double>(config.queue.max_messages) * config.pool.capacity_factor);
@@ -171,18 +180,15 @@ Result<std::size_t, Error> message_pool_capacity(const RecorderConfig& config) {
     const auto capacity = std::min(static_cast<std::size_t>(requested), config.pool.max_capacity);
     if (capacity == 0) {
         return Result<std::size_t, Error>(
-            unexpect,
-            Error{
-                ErrorCode::InvalidArgument,
-                Effects::None,
-                "message pool capacity must be positive"});
+            unexpect, Error{
+                          ErrorCode::InvalidArgument, Effects::None,
+                          "message pool capacity must be positive"});
     }
     return Result<std::size_t, Error>(capacity);
 }
 
 Result<TaskConfig, Error> make_task_config(
-    const RecorderConfig& config,
-    const StartOptions& options) {
+    const RecorderConfig& config, const StartOptions& options) {
     if (options.recording_id.empty()) {
         return Result<TaskConfig, Error>(
             unexpect,
@@ -200,11 +206,9 @@ Result<TaskConfig, Error> make_task_config(
     if (const auto* timed = std::get_if<StartOptions::Timed>(&options.mode)) {
         if (timed->duration.count() <= 0) {
             return Result<TaskConfig, Error>(
-                unexpect,
-                Error{
-                    ErrorCode::InvalidArgument,
-                    Effects::None,
-                    "timed mode requires a positive duration"});
+                unexpect, Error{
+                              ErrorCode::InvalidArgument, Effects::None,
+                              "timed mode requires a positive duration"});
         }
         task_config.mode = TaskMode::Timed;
         task_config.timed.duration = timed->duration;
