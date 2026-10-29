@@ -1,5 +1,6 @@
-#include <chrono>
 #include <atomic>
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -78,6 +79,35 @@ void test_pool() {
     message.reset();
     CHECK(pool.wait_stopped_for(std::chrono::milliseconds(0)));
     CHECK(pool.state().in_use == 0U);
+}
+
+void test_pool_reuses_serialized_message_capacity() {
+    constexpr std::size_t payload_bytes = 256;
+    ros2_bag::recorder::MessagePool pool(1);
+    rclcpp::SerializedMessage source(payload_bytes);
+    auto& serialized = source.get_rcl_serialized_message();
+    std::fill_n(serialized.buffer, payload_bytes, 0x5aU);
+    serialized.buffer_length = payload_bytes;
+
+    auto first = pool.acquire();
+    CHECK(first != nullptr);
+    *first = source;
+    CHECK(first->size() == payload_bytes);
+    const auto retained_capacity = first->get_rcl_serialized_message().buffer_capacity;
+    CHECK(retained_capacity >= payload_bytes);
+    first.reset();
+
+    auto second = pool.acquire();
+    CHECK(second != nullptr);
+    CHECK(second->size() == 0U);
+    CHECK(second->get_rcl_serialized_message().buffer_capacity >= retained_capacity);
+    serialized.buffer[0] = 0x17U;
+    *second = source;
+    CHECK(second->size() == payload_bytes);
+    CHECK(second->get_rcl_serialized_message().buffer[0] == 0x17U);
+    second.reset();
+    pool.begin_stop();
+    CHECK(pool.wait_stopped_for(std::chrono::milliseconds(0)));
 }
 
 void test_queue_and_disk_snapshot() {
@@ -759,6 +789,7 @@ void test_recorder_ros_integration() {
             std::filesystem::remove_all(root, ignored);
             return;
         }
+        const auto first_topic = added.result()->value();
         rclcpp::SerializedMessage serialized(4);
         auto& bytes = serialized.get_rcl_serialized_message();
         bytes.buffer[0] = 0;
@@ -785,6 +816,34 @@ void test_recorder_ros_integration() {
             }
         }
         CHECK(recorder.state().topics.front().messages.written != 0);
+        const auto removed = recorder.remove_topic(
+            task.recording_id,
+            task.generation,
+            first_topic.topic_id,
+            first_topic.topic_epoch,
+            "integration-remove");
+        CHECK(removed.wait_for(std::chrono::seconds(5)));
+        CHECK(removed.result()->has_value());
+        ros2_bag::recorder::TopicOptions conflicting_topic = topic;
+        conflicting_topic.type = "std_msgs/msg/UInt32";
+        const auto conflicting = recorder.add_topic(
+            task.recording_id,
+            task.generation,
+            conflicting_topic,
+            "integration-type-conflict");
+        CHECK(conflicting.wait_for(std::chrono::seconds(5)));
+        CHECK(!conflicting.result()->has_value());
+        CHECK(
+            conflicting.result()->error().code == ros2_bag::recorder::ErrorCode::TopicTypeConflict);
+        const auto conflict_state =
+            recorder.topic_operation_state(task.recording_id, "integration-type-conflict");
+        CHECK(conflict_state.has_value());
+        CHECK(conflict_state.value() == ros2_bag::recorder::TopicOperationState::NotFound);
+        const auto readded =
+            recorder.add_topic(task.recording_id, task.generation, topic, "integration-readd");
+        CHECK(readded.wait_for(std::chrono::seconds(5)));
+        CHECK(readded.result()->has_value());
+        CHECK(readded.result()->value().topic_epoch > first_topic.topic_epoch);
         const auto paused = recorder.pause(task.recording_id, task.generation);
         CHECK(paused.wait_for(std::chrono::seconds(5)));
         CHECK(paused.result()->has_value());
@@ -839,6 +898,7 @@ int main(int argc, char** argv) {
     test_completion();
     test_config();
     test_pool();
+    test_pool_reuses_serialized_message_capacity();
     test_queue_and_disk_snapshot();
     test_rolling_snapshot();
     test_manifest_commit();

@@ -26,24 +26,33 @@ MessagePool::~MessagePool() {
 }
 
 std::shared_ptr<rclcpp::SerializedMessage> MessagePool::acquire() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    ++active_operations_;
-    if (lifecycle_ != Lifecycle::Running || free_nodes_.empty()) {
-        ++allocation_failures_;
+    std::size_t index = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++active_operations_;
+        if (lifecycle_ != Lifecycle::Running || free_nodes_.empty()) {
+            ++allocation_failures_;
+            --active_operations_;
+            update_stopped_locked();
+            return {};
+        }
+        index = free_nodes_.back();
+        free_nodes_.pop_back();
+        auto& node = *nodes_.at(index);
+        assert(!node.in_use);
+        node.in_use = true;
+        ++in_use_;
         --active_operations_;
-        update_stopped_locked();
-        return {};
     }
-    const auto index = free_nodes_.back();
-    free_nodes_.pop_back();
-    auto& node = *nodes_.at(index);
-    assert(!node.in_use);
-    node.in_use = true;
-    ++in_use_;
-    --active_operations_;
-    return std::shared_ptr<rclcpp::SerializedMessage>(
-        std::addressof(node.message),
-        [this, index](rclcpp::SerializedMessage*) { release(index); });
+
+    try {
+        return std::shared_ptr<rclcpp::SerializedMessage>(
+            std::addressof(nodes_.at(index)->message),
+            [this, index](rclcpp::SerializedMessage*) { release(index); });
+    } catch (...) {
+        release(index);
+        throw;
+    }
 }
 
 void MessagePool::begin_stop() {
@@ -76,7 +85,7 @@ void MessagePool::release(std::size_t index) {
         std::terminate();
     }
     node.in_use = false;
-    node.message = rclcpp::SerializedMessage();
+    node.message.get_rcl_serialized_message().buffer_length = 0;
     free_nodes_.push_back(index);
     --in_use_;
     update_stopped_locked();

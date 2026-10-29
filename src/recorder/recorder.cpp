@@ -97,6 +97,8 @@ public:
             static constexpr std::size_t kFrequencyBucketCount = 202;
 
             std::atomic<std::uint64_t> received{0};
+            std::shared_ptr<std::atomic<std::uint64_t>> written{
+                std::make_shared<std::atomic<std::uint64_t>>(0)};
             std::atomic<std::uint64_t> dropped{0};
             std::atomic<std::size_t> publisher_count{0};
             std::atomic<std::int64_t> publisher_observed_steady_ns{0};
@@ -196,6 +198,26 @@ public:
         std::size_t count = 0;
         std::vector<QosOptions> profiles;
         bool truncated = false;
+    };
+
+    struct TopicSignature {
+        std::string type;
+        std::string serialization_format;
+        std::string schema_encoding;
+        std::string schema_sha256;
+
+        bool matches(const TopicSignature& other) const noexcept {
+            if (type != other.type) {
+                return false;
+            }
+            if (serialization_format != other.serialization_format) {
+                return false;
+            }
+            if (schema_encoding != other.schema_encoding) {
+                return false;
+            }
+            return schema_sha256 == other.schema_sha256;
+        }
     };
 
     struct RecoveryEvidence {
@@ -807,7 +829,7 @@ public:
                 return entry.second.ingress->producers == 0;
             });
         }
-        const auto previous = *state_.segments.current;
+        auto previous = *state_.segments.current;
         const auto generation = state_.task->generation;
         const auto writer = writer_;
         std::vector<TopicInfo> topics;
@@ -827,6 +849,8 @@ public:
             return;
         }
         lock.lock();
+        synchronize_segment_counters_locked();
+        previous = *state_.segments.current;
         ManifestData complete = manifest_->data();
         if (complete.manifest_revision == std::numeric_limits<std::uint64_t>::max()) {
             state_.recorder_state = RecorderState::Failed;
@@ -964,6 +988,10 @@ public:
         for (const auto& message : replay) {
             current.written_bytes += message.payload_bytes;
         }
+        segment_written_messages_.store(current.written_messages, std::memory_order_relaxed);
+        segment_written_bytes_.store(current.written_bytes, std::memory_order_relaxed);
+        segment_has_live_messages_.store(false, std::memory_order_relaxed);
+        dispatch_segment_id_.store(next_segment_id, std::memory_order_release);
         state_.segments.current = current;
         state_.segments.last_completed = previous;
         state_.recorder_state = RecorderState::Recording;
@@ -1016,6 +1044,7 @@ public:
             }
         }
         lock.lock();
+        synchronize_segment_counters_locked();
         writer_open_ = false;
         ManifestData completed = manifest_->data();
         if (completed.manifest_revision == std::numeric_limits<std::uint64_t>::max()) {
@@ -1034,6 +1063,8 @@ public:
             if (segment.state == SegmentLifecycleState::Writing) {
                 segment.state = SegmentLifecycleState::Complete;
                 segment.completed_at_ns = completed.task.terminal_time_ns;
+                segment.message_count = state_.segments.current->written_messages;
+                segment.size_bytes = state_.segments.current->written_bytes;
             }
         }
         const auto committed = manifest_->commit(completed);
@@ -1156,12 +1187,17 @@ public:
     bool writer_open_ = false;
     std::unordered_map<TopicId, ActiveTopic> active_topics_;
     std::unordered_map<std::string, std::uint64_t> topic_epochs_;
+    std::unordered_map<std::string, TopicSignature> task_topic_signatures_;
     std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point>
         completed_segment_steady_;
     std::uint64_t next_topic_id_ = 1;
     std::atomic<std::uint64_t> pool_exhausted_{0};
     std::atomic<std::uint64_t> queue_full_{0};
     std::atomic<std::uint64_t> writer_write_failure_{0};
+    std::atomic<std::uint64_t> segment_written_messages_{0};
+    std::atomic<std::uint64_t> segment_written_bytes_{0};
+    std::atomic<bool> segment_has_live_messages_{false};
+    std::atomic<std::uint64_t> dispatch_segment_id_{0};
     std::chrono::steady_clock::time_point disk_safe_since_{};
     std::optional<ProcessBaseline> process_baseline_;
     std::chrono::steady_clock::time_point rolling_due_steady_{};
@@ -1213,57 +1249,51 @@ public:
                 }
 
                 const auto generation = batch.front().generation;
-                std::unordered_map<TopicId, std::uint64_t> topic_counts;
-                std::uint64_t written_messages = 0;
-                std::uint64_t written_bytes = 0;
                 bool has_live_messages = false;
                 for (const auto& message : batch) {
-                    ++topic_counts[message.topic_id];
-                    ++written_messages;
-                    written_bytes += message.payload_bytes;
+                    if (message.written_counter) {
+                        message.written_counter->fetch_add(1, std::memory_order_relaxed);
+                    }
+                    segment_written_messages_.fetch_add(1, std::memory_order_relaxed);
+                    segment_written_bytes_.fetch_add(
+                        message.payload_bytes,
+                        std::memory_order_relaxed);
                     if (!message.replayed) {
                         has_live_messages = true;
                     }
                 }
 
-                (void)submit([this,
-                              generation,
-                              topic_counts = std::move(topic_counts),
-                              written_messages,
-                              written_bytes,
-                              has_live_messages] {
+                if (!has_live_messages ||
+                    segment_has_live_messages_.exchange(true, std::memory_order_acq_rel)) {
+                    continue;
+                }
+
+                const auto segment_id = dispatch_segment_id_.load(std::memory_order_acquire);
+                const auto submitted = submit_critical([this, generation, segment_id] {
                     std::lock_guard<std::mutex> state_lock(state_mutex_);
                     if (!state_.task || state_.task->generation != generation) {
                         return;
                     }
-
-                    for (auto& topic : state_.topics) {
-                        const auto count = topic_counts.find(topic.info.topic_id);
-                        if (count != topic_counts.end()) {
-                            topic.messages.written += count->second;
-                        }
-                    }
-
-                    if (!state_.segments.current) {
+                    if (!state_.segments.current ||
+                        state_.segments.current->segment_id != segment_id) {
                         return;
                     }
-                    state_.segments.current->written_messages += written_messages;
-                    state_.segments.current->written_bytes += written_bytes;
-                    if (has_live_messages && !state_.segments.current->has_live_messages) {
-                        state_.segments.current->has_live_messages = true;
-                        if (state_.task->config.mode == TaskMode::Rolling) {
-                            const auto deadline = std::chrono::steady_clock::now() +
-                                                  state_.task->config.rolling.segment_duration;
-                            rolling_due_steady_ = deadline;
-                            rolling_deadline_steady_ns_.store(
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    deadline.time_since_epoch())
-                                    .count(),
-                                std::memory_order_release);
-                            queue_condition_.notify_one();
-                        }
+                    state_.segments.current->has_live_messages = true;
+                    if (state_.task->config.mode == TaskMode::Rolling) {
+                        const auto deadline = std::chrono::steady_clock::now() +
+                                              state_.task->config.rolling.segment_duration;
+                        rolling_due_steady_ = deadline;
+                        rolling_deadline_steady_ns_.store(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                deadline.time_since_epoch())
+                                .count(),
+                            std::memory_order_release);
+                        queue_condition_.notify_one();
                     }
                 });
+                if (!submitted && !shutdown_requested_.load(std::memory_order_acquire)) {
+                    segment_has_live_messages_.store(false, std::memory_order_release);
+                }
             }
         });
     }
@@ -1279,6 +1309,18 @@ public:
         if (stop_pool && message_pool_) {
             message_pool_->begin_stop();
         }
+    }
+
+    void synchronize_segment_counters_locked() {
+        if (!state_.segments.current) {
+            return;
+        }
+        state_.segments.current->written_messages =
+            segment_written_messages_.load(std::memory_order_relaxed);
+        state_.segments.current->written_bytes =
+            segment_written_bytes_.load(std::memory_order_relaxed);
+        state_.segments.current->has_live_messages =
+            segment_has_live_messages_.load(std::memory_order_relaxed);
     }
     std::uint64_t next_generation_ = 1;
     bool poisoned_ = false;
@@ -1315,6 +1357,7 @@ Completion<TaskInfo> Recorder::start(const StartOptions& options) {
                 return;
             }
             implementation->completed_segment_steady_.clear();
+            implementation->task_topic_signatures_.clear();
             if (!implementation->valid_recording_id(options.recording_id)) {
                 source.set_error(error(ErrorCode::InvalidArgument, "invalid recording_id"));
                 return;
@@ -1397,6 +1440,10 @@ Completion<TaskInfo> Recorder::start(const StartOptions& options) {
                 implementation->pool_exhausted_.store(0, std::memory_order_relaxed);
                 implementation->queue_full_.store(0, std::memory_order_relaxed);
                 implementation->writer_write_failure_.store(0, std::memory_order_relaxed);
+                implementation->segment_written_messages_.store(0, std::memory_order_relaxed);
+                implementation->segment_written_bytes_.store(0, std::memory_order_relaxed);
+                implementation->segment_has_live_messages_.store(false, std::memory_order_relaxed);
+                implementation->dispatch_segment_id_.store(0, std::memory_order_relaxed);
                 implementation->process_baseline_.reset();
                 implementation->start_dispatch_thread(implementation->writer_);
                 implementation->cleanup_ = std::make_unique<Cleanup>(
@@ -1698,6 +1745,7 @@ Completion<void> Recorder::stop(std::string_view recording_id, std::uint64_t gen
                 }
             }
             lock.lock();
+            implementation->synchronize_segment_counters_locked();
             implementation->writer_open_ = false;
             ManifestData completed = implementation->manifest_->data();
             if (completed.manifest_revision == std::numeric_limits<std::uint64_t>::max()) {
@@ -1718,6 +1766,9 @@ Completion<void> Recorder::stop(std::string_view recording_id, std::uint64_t gen
                 if (segment.state == SegmentLifecycleState::Writing) {
                     segment.state = SegmentLifecycleState::Complete;
                     segment.completed_at_ns = completed.task.terminal_time_ns;
+                    segment.message_count =
+                        implementation->state_.segments.current->written_messages;
+                    segment.size_bytes = implementation->state_.segments.current->written_bytes;
                 }
             }
             const auto committed = implementation->manifest_->commit(completed);
@@ -1992,6 +2043,29 @@ Completion<TopicInfo> Recorder::add_topic(
                 source.set_error(schema.error());
                 return;
             }
+            Implementation::TopicSignature signature;
+            signature.type = options.type;
+            signature.serialization_format = "cdr";
+            signature.schema_encoding = schema->encoding;
+            signature.schema_sha256 = schema->sha256;
+            const auto frozen_signature = implementation->task_topic_signatures_.find(options.name);
+            if (frozen_signature != implementation->task_topic_signatures_.end() &&
+                !frozen_signature->second.matches(signature)) {
+                source.set_error(error(
+                    ErrorCode::TopicTypeConflict,
+                    "topic name has a different task-local storage signature"));
+                return;
+            }
+            if (frozen_signature == implementation->task_topic_signatures_.end()) {
+                try {
+                    implementation->task_topic_signatures_.emplace(
+                        options.name,
+                        std::move(signature));
+                } catch (const std::exception& exception) {
+                    source.set_error(error(ErrorCode::ResourceExhausted, exception.what()));
+                    return;
+                }
+            }
             if (implementation->next_topic_id_ == std::numeric_limits<TopicId>::max()) {
                 source.set_error(error(ErrorCode::ResourceExhausted, "topic id space exhausted"));
                 return;
@@ -2089,6 +2163,7 @@ Completion<TopicInfo> Recorder::add_topic(
                 state_segment.segment_id = 1;
                 state_segment.state = SegmentLifecycleState::Writing;
                 implementation->state_.segments.current = state_segment;
+                implementation->dispatch_segment_id_.store(1, std::memory_order_release);
                 lock.unlock();
             }
             const auto registered = writer->register_topic(info);
@@ -2196,6 +2271,7 @@ Completion<TopicInfo> Recorder::add_topic(
                                 std::chrono::system_clock::now().time_since_epoch())
                                 .count();
                         recorded.topic = frozen_info;
+                        recorded.written_counter = counters->written;
                         try {
                             *owned = *message;
                         } catch (...) {
@@ -2475,6 +2551,8 @@ State Recorder::state() const {
             }
             topic.messages.received =
                 entry.second.counters->received.load(std::memory_order_relaxed);
+            topic.messages.written =
+                entry.second.counters->written->load(std::memory_order_relaxed);
             topic.messages.dropped = entry.second.counters->dropped.load(std::memory_order_relaxed);
             topic.publishers.count =
                 entry.second.counters->publisher_count.load(std::memory_order_relaxed);
@@ -2500,6 +2578,14 @@ State Recorder::state() const {
             topic.frequency.gap = frequency.gap;
             break;
         }
+    }
+    if (snapshot.segments.current) {
+        snapshot.segments.current->written_messages =
+            implementation_->segment_written_messages_.load(std::memory_order_relaxed);
+        snapshot.segments.current->written_bytes =
+            implementation_->segment_written_bytes_.load(std::memory_order_relaxed);
+        snapshot.segments.current->has_live_messages =
+            implementation_->segment_has_live_messages_.load(std::memory_order_relaxed);
     }
     snapshot.shutting_down = implementation_->shutdown_requested_.load();
     return snapshot;

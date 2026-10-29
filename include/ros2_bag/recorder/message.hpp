@@ -1,6 +1,7 @@
 #ifndef ROS2_BAG_RECORDER_MESSAGE_HPP_
 #define ROS2_BAG_RECORDER_MESSAGE_HPP_
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -19,6 +20,9 @@ struct RecordedMessage {
     std::size_t payload_bytes = 0;
     std::int64_t receive_timestamp_ns = 0;
     bool replayed = false;
+
+    // The writer owns the final increment because admission is not proof of storage success.
+    std::shared_ptr<std::atomic<std::uint64_t>> written_counter;
 
     // Keeps the frozen topic identity alive after Remove while queued data drains.
     std::shared_ptr<const TopicInfo> topic;

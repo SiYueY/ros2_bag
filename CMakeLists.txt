@@ -67,6 +67,14 @@ if(BUILD_TESTING)
       target_compile_options(recorder_foundation_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
     endif()
     add_test(NAME recorder_foundation_unit COMMAND recorder_foundation_test)
+
+    add_executable(
+      recorder_data_path_benchmark
+      tests/performance/recorder_data_path_benchmark.cpp)
+    target_link_libraries(recorder_data_path_benchmark PRIVATE ros2_bag_recorder)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+      target_compile_options(recorder_data_path_benchmark PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    endif()
   endif()
   add_test(
     NAME result_compile_fail

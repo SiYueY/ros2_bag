@@ -180,7 +180,7 @@ Recorder 内部管理 Topic 订阅、队列预算、固定有界消息池、Writ
 
 Runtime 必须遵守“**先取得输出目录所有权锁，再执行恢复**”的顺序。输出目录进程级互斥由 Runtime 负责，不得隐含为 Recorder 的自动行为；其他嵌入 Recorder 的宿主同样必须保证输出目录所有权。
 
-**Recorder 内部时间事件的执行域：** Recorder 的唯一串行 mutation 域是所有 Task/Topic/Writer mutation 的领域线性化执行域，同时处理外部 Start/Stop/Pause/Resume/Add/Remove 与内部 Timed Stop、Rolling deadline、Disk Safety、Writer/Cleanup/Executor result、Shutdown。V1 的 Rolling/Timed deadline 由该 mutation loop 自身使用 steady-clock timed wait（例如 `condition_variable::wait_until`）维护，不增加 ROS Timer 或第二个 Recorder timer thread。Server 的独立 Control Worker 只负责网络 Admission、外部 FIFO 和等待 Recorder `Completion<T>`，不能与 Recorder 串行域形成第二个“关闭权”裁决点。唯一例外是不会推进完整领域状态机的**无阻塞安全 Gate**：Producer 准入可因 Timed hard deadline 或磁盘危险原子拒绝新消息，并仅向 Recorder 串行域发布/合并安全事件；Writer Close、Topic 状态、Manifest 终态仍只能由 Recorder 串行域裁决。Writer 本身由独立 Writer Thread 独占。Stop/Shutdown 必须真实等待对应 Completion 与 Recorder-owned native/worker work 结束后再回收 Recorder 和 ROS Context。
+**Recorder 内部时间事件的执行域：** Recorder 的唯一串行 mutation 域是所有 Task/Topic/Writer mutation 的领域线性化执行域，同时处理外部 Start/Stop/Pause/Resume/Add/Remove 与内部 Timed Stop、Rolling deadline、Disk Safety、Writer/Cleanup/Executor result、Shutdown。V1 的 Rolling/Timed deadline 由该 mutation loop 自身使用 steady-clock timed wait（例如 `condition_variable::wait_until`）维护，不增加 ROS Timer 或第二个 Recorder timer thread。Server 的独立 Control Worker 只负责网络 Admission、外部 FIFO 和等待 Recorder `Completion<T>`，不能与 Recorder 串行域形成第二个“关闭权”裁决点。唯一例外是不会推进完整领域状态机的**无阻塞安全 Gate**：Producer 准入可因 Timed hard deadline 或磁盘危险原子拒绝新消息，并仅向 Recorder 串行域发布/合并安全事件；Writer Close、Topic 状态、Manifest 终态仍只能由 Recorder 串行域裁决。Writer 控制操作通过 mutex 与 dispatch/storage 批量写入同步。Stop/Shutdown 必须真实等待对应 Completion 与 Recorder-owned native/worker work 结束后再回收 Recorder 和 ROS Context。
 
 ## 3.2 Server 与独立 Protocol
 
@@ -271,7 +271,7 @@ Recorder 高频数据路径采用以下结构：
 ROS 2 Executor / GenericSubscription
     → SerializedMessage / Pool
     → 有界 QueueBudget + MessageQueue
-    → Writer Thread / rosbag2_cpp
+    → dispatch/storage execution context / rosbag2_storage_mcap batch write
     → MCAP
 ```
 

@@ -24,7 +24,7 @@ Recorder 负责：
 - Topic 订阅的创建、销毁与生命周期；
 - Normal / Timed / Rolling 三种录制模式；
 - 消息准入、内存预算、消息池与队列；
-- 单 Writer Thread；
+- 单 dispatch/storage 执行上下文；
 - MCAP Segment 创建、写入、轮转和关闭；
 - Schema 解析与自包含定义；
 - Snapshot 与 Rolling Segment 重放；
@@ -68,7 +68,7 @@ Rolling 中多个 Segment 仍属于同一个 Task。
 6. **Effects 与 UNKNOWN 分离。** Effects 描述已经取得 Recorder 最终 Failure 时可证明的副作用范围；UNKNOWN 是 Server/Client 等观察者无法确认领域终态的观察结果，不是 Recorder 自身状态。
 7. **唯一串行 mutation 域。** Task、Topic、Writer、Manifest 的状态变化只有一个权威线性化顺序。
 8. **高频数据路径有界。** ROS callback 不做文件 I/O、网络 I/O、复杂 JSON 或无界等待。
-9. **Writer 单线程独占。** 所有 `rosbag2_cpp::Writer` API 只由 Writer Thread 调用。
+9. **存储调用串行。** 一个 dispatch/storage 执行上下文消费 `MessageQueue` 批次并直接调用 `rosbag2_storage_mcap` vector write；控制面通过 `Writer` mutex 同步。
 10. **持久化成功必须可证明，不确定时保守降级。** durable 证据不足不能伪造成功；一旦关键 durable outcome 无法确认，必须停止依赖该事实继续推进会扩大不确定性的 mutation。
 11. **Recovery 保守。** 不续录旧 Task、不恢复旧 Topic ACTIVE、不自动删除 INCOMPLETE。
 12. **V1.0 一次实现完整 Recorder。** Topic、Writer、Snapshot、Recovery、Cleanup、Resource Monitor 全部属于第一版。
@@ -275,7 +275,7 @@ add_subdirectory() 形成独立项目层次
 | `message_pool.*` | 固定有界消息节点池 |
 | `message_queue.*` | queue、消息/字节预算、ProducerToken、admission |
 | `snapshot.*` | Rolling Snapshot 缓存与 replay |
-| `writer.*` | 单 Writer Thread、Segment、Writer 内部控制与结果回报 |
+| `writer.*` | Writer mutex、Segment 与直接 MCAP batch write |
 | `schema.*` | ROS type → 完整 MCAP Schema |
 | `manifest.*` | `manifest.json` 数据、revision、durable commit |
 | `topic_events.*` | `topic_events.jsonl` Event 持久化，以及 `TopicOperationState` 查询解释 |
@@ -337,7 +337,7 @@ flowchart LR
     ROS["ROS 2 Topic"] --> TOPIC["Topic / Subscription"]
     TOPIC --> POOL["Message Pool"]
     POOL --> QUEUE["Message Queue"]
-    QUEUE --> WRITER["Writer Thread"]
+    QUEUE --> WRITER["dispatch/storage"]
     WRITER --> MCAP["MCAP Segment"]
     WRITER --> SNAP["Snapshot"]
 
@@ -348,7 +348,6 @@ flowchart LR
 
     MON["Resource Monitor"] --> REC
 
-    WRITER -. "WriterResult" .-> REC
     CLEAN -. "CleanupResult" .-> REC
     TOPIC -. "ExecutorResult" .-> REC
 ```
@@ -359,7 +358,7 @@ flowchart LR
 |---|---|---|---|
 | Recorder 串行 mutation 域 | Task/Topic/Writer/Manifest 状态裁决 | 本域自身 | 持热路径锁等待慢 I/O |
 | ROS Executor | discovery、Subscription create/remove、callback | 产生内部 ExecutorResult/事件，由 Recorder 串行域领取 | 直接 Stop/Rotate/Manifest commit |
-| Writer Thread | 独占 rosbag2 Writer | 产生 WriterResult，由 Recorder 串行域推进后续状态 | 其他线程并发访问 Writer；自行改 Task/Manifest 终态 |
+| dispatch/storage | 消费消息批次并直接调用 MCAP vector write | 成功后更新原子计数；首条 Live 以 critical mutation 回流 | 并发执行 Writer 控制操作；自行改 Task/Manifest 终态 |
 | Cleanup Thread | 按 durable DELETING 删除文件 | 产生 CleanupResult，由 Recorder 串行域重新验证 Manifest | 自行提交 REMOVED；阻塞 Recorder mutation 域 |
 | Resource Monitor | statvfs / CPU / RSS / FD / thread | 发布 bounded resource/disk snapshot 和安全事件 | 在 Recorder 热路径锁内采样 |
 | Runtime | output_root 锁、Recovery 调度、ROS Context/Executor 生命周期、最终 Shutdown | 调用 Recorder API / 观察 Completion | Recorder 未完成时提前销毁依赖 |
@@ -368,7 +367,7 @@ Cleanup 是 Recorder-owned 单线程 worker。`remove_all()` 等文件系统调�
 
 ### 内部结果回流原则
 
-Writer、ROS Executor、Cleanup 都可以异步执行慢操作，但**最终领域状态只能由 Recorder 串行 mutation 域修改**。
+ROS Executor、Cleanup 可以异步执行慢操作，但**最终领域状态只能由 Recorder 串行 mutation 域修改**。dispatch/storage 只写入数据和原子观测计数；首条 Live 通过 critical mutation 发布状态变化。
 
 统一模式：
 
@@ -381,16 +380,9 @@ Recorder starts/requests native work
 → commits next domain transition
 ```
 
-V1 不建立公共 `WriterResult/CleanupResult/ExecutorResult` API，但实现至少要携带以下核心字段：
+V1 不建立公共 `CleanupResult/ExecutorResult` API，但实现至少要携带以下核心字段：
 
 ```text
-WriterResult:
-  generation
-  segment_id when applicable
-  command/result kind
-  Result<... , Error>
-  first_live_written + first_live_steady_time when applicable
-
 CleanupResult:
   recording_id
   segment_id
@@ -524,7 +516,7 @@ durable INITIALIZING Manifest
 
 说明：
 
-- “Writer ready”表示 Writer Thread/控制通道已经可正确接受后续工作，**不要求为了 Start 成功强制创建一个空物理 Segment**；
+- “Writer ready”表示 dispatch/storage 执行上下文与 `Writer` mutex 已可正确接受后续工作，**不要求为了 Start 成功强制创建一个空物理 Segment**；
 - 如果没有预配置初始 Topic，则 Start 不需要为了等待未来动态 Topic 而停留在 Initializing；
 - Start Completion 绝不能早于 durable `TaskState::Recording`；
 - durable `TaskState::Recording` 成功但 `maybe_open_ingress()` 因 Disk/Timed 等安全条件不允许开放时，Start 不能伪造 Recording ingress；正常 Start 前置已要求 Disk fresh/safe，因此这种情况通常只来自并发安全事件，Recorder 应立即按最新安全事实转入 Paused/Stopping/Failed，而不是回滚 durable Recording。
@@ -2009,19 +2001,7 @@ release output_root lock too early
 
 ### Writer
 
-Writer Thread 完成控制工作或需要上报错误时，生成有界 `WriterResult` 内部事件。
-
-Recorder 串行域领取后重新核对：
-
-```text
-generation
-segment_id
-current Task / Segment state
-```
-
-再推进 Rotate、Close、Failure 等领域状态。
-
-Writer 不直接修改 Manifest TaskState。
+dispatch/storage 成功批量写入后只更新原子计数。Rolling 的首条成功 Live 写入提交一次 critical mutation；Recorder 串行域重新核对 generation、segment_id 和当前状态后推进 deadline。Rotate、Close 与 Failure 仍由 Recorder mutation flow 裁决，Writer 不直接修改 Manifest TaskState。
 
 ### Cleanup
 
@@ -2710,100 +2690,24 @@ steady_now > valid_until_steady_ns
 
 # 5. Writer、录制模式与 Schema
 
-## 5.1 Writer Thread
+## 5.1 Writer 调度与存储
 
-所有 `rosbag2_cpp::Writer` API：
+Recorder 拥有唯一的 dispatch/storage 执行上下文。该上下文以
+`pop_for(first)` 取得首条消息，再以有界 `pop_batch(rest)` 组成批次，直接调用
+`rosbag2_storage_mcap` 的 vector write 路径。不存在第二条 Writer command queue、
+Writer thread、逐消息 Completion 或 control cache。
 
-```text
-open
-register
-write
-rotate
-close
-metadata finalize
-statistics
-```
+Open、Topic 注册、Rotate 与 Close 属于 Recorder mutation flow 的控制面操作；它们通过
+`Writer` mutex 与批量写入同步，不创建额外的异步 ownership 层。
 
-只由 Writer Thread 调用。
+批量写入成功后，dispatch/storage 上下文只更新原子的 per-topic 与 per-segment
+计数。Rolling Segment 的第一条成功 Live 写入向 Recorder mutation 域提交一次携带
+generation/segment 隔离的 critical mutation；该路径不受 `operation_queue_capacity`
+限制。mutation 重新验证身份后设置 `State` 投影、steady deadline 与 worker 唤醒。
+仅在 worker 正在停止时该提交会被拒绝；此时 Shutdown 已拥有 finalization，拒绝不再相关。
 
-其他线程只能提交 Writer 内部工作。
-
-### Writer 内部命令
-
-真实存在跨线程工作队列，因此内部可以使用：
-
-```cpp
-enum class WriterCommand {
-    OpenSegment,
-    RegisterTopic,
-    Drain,
-    Rotate,
-    Close
-};
-```
-
-Writer Request：
-
-- 拥有自身数据；
-- 不引用调用线程栈；
-- waiter timeout 不销毁 Writer 正在访问的数据；
-- Writer 停止时未开始 Request 必须显式完成失败/取消。
-
-Recorder 顶层 API 仍不使用 Request/Response。
-
-### Fairness
-
-配置：
-
-```text
-writer.control_queue_capacity
-writer.max_control_batch
-message_queue.batch_size
-```
-
-持续数据不能永久饿死：
-
-```text
-Stop
-Register
-Rotate
-```
-
-持续 control 也不能永久饿死普通数据。
-
-
-
-### Writer control queue 满
-
-普通 Writer control request 的 enqueue 是 non-blocking/bounded：提交时立即检查容量；若满，调用方在提交点立即得到内部 `ResourceExhausted`，不先排队再异步等待“队列满结果”，也不阻塞提交线程。
-
-但以下安全终结动作不能因为普通 control queue 已满而永久丢失：
-
-```text
-Close required by Stop/Shutdown
-fatal Writer failure notification
-```
-
-V1.0 冻结“安全动作不可丢失”的行为，不强制具体采用 reserved slot 还是独立 system-control path。
-
-`control_queue_capacity=64` 是等待中的 control 总容量；`max_control_batch=8` 是 Writer 每轮最多连续处理的 control 数，用来和数据写入做公平调度，两者语义独立。
-
-### WriterResult 回流
-
-Writer control request 完成后生成 `WriterResult` 回到 Recorder 串行域。
-
-特别是第一条 Live message：Writer Thread 在**成功写入**后产生一次内部通知，至少携带：
-
-```text
-generation
-segment_id
-first_live_written = true
-steady time of successful write
-```
-
-Recorder 串行域重新验证当前 generation/segment，且仅在 `live_window_started_at` 尚未设置时接受该通知。
-
-只有成功写入 Live message 才能产生 `first_live_written=true`。如果第一条 Live write 本身失败，Writer 产生普通 Writer failure result；不得设置 live window。后续 Task 是否继续取决于该 Writer failure 的领域处理，不能因为“first live 没有通知”而偷偷继续等待下一条。
+Replay 写入计入物理 Segment 的消息和字节总数，但不会再次增加逻辑 per-topic
+live-write 计数。
 
 ## 5.2 Drain 与 Segment Close
 
@@ -3006,7 +2910,7 @@ Producer 不直接设置 `live_window_started_at`，因为“成功进入 Queue�
 ```text
 first Live message reaches Writer
 → Writer write succeeds
-→ WriterResult(first_live_written, segment_id, steady_time)
+→ critical Recorder mutation(first_live_written, generation, segment_id)
 → Recorder serial mutation domain
 → revalidate generation + segment_id
 → if live_window_started_at is null: set it and arm deadline
@@ -3036,7 +2940,7 @@ notify_one()
 
 当 wait_until 因 deadline 到达返回时，**同一个串行 mutation loop**把它当作 `RotateDue` 内部事件处理，不需要再把 timer 事件转发到第二条普通队列，因此不会产生“第二个 Timer thread 与 Recorder mutation loop 谁先入队”的额外状态机。
 
-first-live WriterResult 到达时必须重新验证：
+first-live critical mutation 到达时必须重新验证：
 
 ```text
 generation == current generation
@@ -4433,7 +4337,6 @@ storage
 | topics | discovery=2000ms, discovery_max_results=4096, discovery_max_endpoint_profiles=64, active=64, distinct=256, recent_removed_instances=32, publisher_visibility_max_age_ms=5000 |
 | message_queue | 64MiB, 65536 messages, batch=256, wait=20ms, drop_newest |
 | message_pool | global_mutex, capacity_factor=1.25, max_capacity=1,000,000 |
-| writer | control_queue=64, max_control_batch=8 |
 | snapshot | max_messages_per_topic=1024, max_bytes_per_topic=8MiB, max_total_bytes=16MiB |
 | cleanup | queue=16, warning=30s, retry=2s |
 | resource | enabled=true, sample=2s |
@@ -4588,7 +4491,7 @@ Pool fixed bounded
 ### Writer
 
 ```text
-single Writer Thread
+single dispatch/storage execution context
 Stop/Rotate require Drain
 close != durable task completion
 ```
@@ -4661,7 +4564,7 @@ no detach
 - Snapshot per-topic-then-global deterministic eviction；
 - Snapshot internal sequence monotonicity；
 - replayed message 永不重新进入 Snapshot、无 replay feedback loop；
-- live_window_started_at WriterResult 回流；
+- live_window_started_at critical mutation 回流；
 - Rolling Pause 期间 rotate_pending 与 Resume-before-open；
 - replay-only Segment Stop；
 - Manifest revision；
@@ -4875,7 +4778,7 @@ V1.0 必须同时满足：
 26. drop counter 分类固定可观察。
 27. Timed deadline 在 producer fast path 直接检查。
 28. DiskAdmission payload 无 C++ data race；snapshot contention 只影响当前 message。
-29. Writer 单线程独占 rosbag2 Writer；普通 control queue 满在提交点立即失败，安全终结动作不可丢失。
+29. 单 dispatch/storage 执行上下文直接执行 MCAP batch write；Writer 控制操作通过 mutex 同步，不建立 control queue。
 30. first-live 通知只来自成功 Live write；stale generation/segment 通知被忽略。
 31. Rolling timer 使用 Recorder mutation loop 的 steady `condition_variable::wait_until` 或等价单线程 timed wait，不新增 Timer Thread。
 32. Pause 期间 deadline 到达只设置 rotate_pending，Resume reopen ingress 前完成必要 Rotate。
