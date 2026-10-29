@@ -24,13 +24,13 @@ struct ManifestData {
 class Manifest {
 public:
     static Result<Manifest, Error> create(
-        const std::filesystem::path& task_directory,
-        ManifestData data);
+        const std::filesystem::path& task_directory, ManifestData data);
     static Result<Manifest, Error> load(const std::filesystem::path& task_directory);
 
     const ManifestData& data() const noexcept;
     const std::filesystem::path& task_directory() const noexcept;
     Result<void, Error> commit(ManifestData data);
+    bool poisoned() const noexcept { return poisoned_; }
 
 private:
     Manifest(std::filesystem::path task_directory, ManifestData data);
@@ -39,11 +39,11 @@ private:
     static std::string serialize(const ManifestData& data);
     static Result<ManifestData, Error> deserialize(std::string_view content);
     static Result<void, Error> write_durable(
-        const std::filesystem::path& path,
-        std::string_view content);
+        const std::filesystem::path& path, std::string_view content);
 
     std::filesystem::path task_directory_;
     ManifestData data_;
+    bool poisoned_ = false;
 };
 
 }  // namespace ros2_bag::recorder

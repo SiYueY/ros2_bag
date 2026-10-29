@@ -1809,6 +1809,10 @@ equivalent non-droppable mechanism
 
 不能与普通外部操作竞争到完全丢失。
 
+Cleanup 投递额度覆盖 queued、active 和等待 mutation 领取的 result；只有 mutation
+领取结果后才归还额度。这样结果通道可以预分配固定容量，worker 投递无需等待 mutation，
+也不会因外部队列已满丢失结果或与 Stop/Shutdown 的 join 形成互相等待。
+
 V1 冻结的是“这些安全/结果事件不可丢失”而不是某一种队列布局。允许 reserved slot、独立内部队列、sticky atomic flag + wakeup 等等价实现；代码 review 必须证明容量满和 Shutdown 竞态下仍不会丢事件。这里不为了让文档看起来更具体而冻结一个并无领域语义的队列结构。
 
 同 generation 的：
@@ -2940,6 +2944,11 @@ notify_one()
 
 当 wait_until 因 deadline 到达返回时，**同一个串行 mutation loop**把它当作 `RotateDue` 内部事件处理，不需要再把 timer 事件转发到第二条普通队列，因此不会产生“第二个 Timer thread 与 Recorder mutation loop 谁先入队”的额外状态机。
 
+mutation loop 每轮都检查已到期的 Timed、Rolling 和 Retention deadline，
+不能只依赖 `wait_until()` 的 timeout 分支；普通请求持续到达不能饿死 deadline。
+first-live 通知携带成功写入时的 steady timestamp，以该时刻建立 live window，
+不能因通知等待 mutation 而延后窗口起点。
+
 first-live critical mutation 到达时必须重新验证：
 
 ```text
@@ -3454,6 +3463,14 @@ REMOVE_PREPARED
 TOPIC_REMOVED
 REMOVE_FAILED
 ```
+
+### 首次文件创建与路径安全
+
+Start 在 durable INITIALIZING 之后、进入 Recording 之前创建空的 `topic_events.jsonl`，
+并依次 fsync 文件和 Task directory，证明文件名与内容均已持久化。
+后续 append 只打开既有 regular file，不使用 `O_CREAT`，拒绝最终路径 symlink；
+Task directory 同样必须为受控真实目录。不能用首次 append 的 `fsync(file)`
+替代首次 directory entry 的 durability 证明。
 
 ### TopicOperationState
 

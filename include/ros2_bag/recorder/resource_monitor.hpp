@@ -46,15 +46,14 @@ public:
     using SampleCallback = std::function<void(DiskSample)>;
 
     ResourceMonitor(
-        DiskMonitorConfig config,
-        DiskAdmissionState& admission,
-        SampleCallback callback);
+        DiskMonitorConfig config, DiskAdmissionState& admission, SampleCallback callback);
     ~ResourceMonitor();
 
     ResourceMonitor(const ResourceMonitor&) = delete;
     ResourceMonitor& operator=(const ResourceMonitor&) = delete;
 
     void stop();
+    static DiskSample sample_now(const DiskMonitorConfig& config);
 
 private:
     void run();

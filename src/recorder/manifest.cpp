@@ -8,6 +8,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <new>
 #include <nlohmann/json.hpp>
 #include <sstream>
 #include <system_error>
@@ -241,8 +242,7 @@ Result<ManifestData, Error> Manifest::deserialize(std::string_view content) {
 
         if (data.manifest_revision == 0) {
             return Result<ManifestData, Error>(
-                unexpect,
-                storage_error("invalid manifest revision"));
+                unexpect, storage_error("invalid manifest revision"));
         }
         return Result<ManifestData, Error>(std::move(data));
     } catch (const std::exception& exception) {
@@ -251,9 +251,10 @@ Result<ManifestData, Error> Manifest::deserialize(std::string_view content) {
 }
 
 Result<void, Error> Manifest::write_durable(
-    const std::filesystem::path& path,
-    std::string_view content) {
+    const std::filesystem::path& path, std::string_view content) {
     const auto temporary = path.string() + ".tmp";
+    const auto parent_path = path.parent_path();
+    auto uncertain = storage_error("manifest rename durability is uncertain", Effects::Possible);
     const int file =
         ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
     if (file < 0) {
@@ -291,42 +292,84 @@ Result<void, Error> Manifest::write_durable(
         return Result<void, Error>(unexpect, storage_error(message));
     }
 
-    const int directory = ::open(path.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    const int directory =
+        ::open(parent_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (directory < 0 || ::fsync(directory) != 0) {
         if (directory >= 0) {
             ::close(directory);
         }
-        return Result<void, Error>(
-            unexpect,
-            storage_error("manifest rename durability is uncertain", Effects::Possible));
+        return Result<void, Error>(unexpect, std::move(uncertain));
     }
     ::close(directory);
     return Result<void, Error>();
 }
 
 Result<Manifest, Error> Manifest::create(
-    const std::filesystem::path& task_directory,
-    ManifestData data) {
-    std::error_code error;
-    std::filesystem::create_directories(task_directory, error);
-    if (error) {
-        return Result<Manifest, Error>(unexpect, storage_error(error.message()));
-    }
-    if (data.manifest_revision != 1) {
-        return Result<Manifest, Error>(
-            unexpect,
-            storage_error("first manifest revision must be one"));
-    }
-
-    const auto serialized = serialize(data);
-    const auto persisted = write_durable(task_directory / "manifest.json", serialized);
-    if (!persisted) {
-        if (persisted.error().effects == Effects::None) {
-            std::filesystem::remove_all(task_directory, error);
+    const std::filesystem::path& task_directory, ManifestData data) {
+    bool created = false;
+    try {
+        if (data.manifest_revision != 1) {
+            return Result<Manifest, Error>(
+                unexpect, storage_error("first manifest revision must be one"));
         }
-        return Result<Manifest, Error>(unexpect, persisted.error());
+        const auto serialized = serialize(data);
+        const auto manifest_path = task_directory / "manifest.json";
+        Manifest result(task_directory, std::move(data));
+        // Include every ancestor: the output root itself can have been created by
+        // this first Start, and syncing only its contents does not persist its name.
+        std::vector<std::filesystem::path> ancestors;
+        auto parent_path = std::filesystem::absolute(task_directory).parent_path();
+        while (true) {
+            ancestors.push_back(parent_path);
+            const auto parent = parent_path.parent_path();
+            if (parent == parent_path) {
+                break;
+            }
+            parent_path = parent;
+        }
+        auto uncertain = storage_error("task directory durability is uncertain", Effects::Possible);
+        std::error_code error;
+        std::filesystem::create_directories(task_directory.parent_path(), error);
+        if (!error && !std::filesystem::create_directory(task_directory, error)) {
+            return Result<Manifest, Error>(
+                unexpect, storage_error("task directory already exists"));
+        }
+        if (error) {
+            return Result<Manifest, Error>(unexpect, storage_error(error.message()));
+        }
+        created = true;
+
+        auto persisted = write_durable(manifest_path, serialized);
+        if (!persisted) {
+            if (persisted.error().effects == Effects::None) {
+                std::filesystem::remove_all(task_directory, error);
+            }
+            return Result<Manifest, Error>(unexpect, std::move(persisted.error()));
+        }
+        for (const auto& ancestor : ancestors) {
+            const int parent =
+                ::open(ancestor.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            const bool durable = parent >= 0 && ::fsync(parent) == 0;
+            if (parent >= 0) {
+                ::close(parent);
+            }
+            if (!durable) {
+                return Result<Manifest, Error>(unexpect, std::move(uncertain));
+            }
+        }
+        return Result<Manifest, Error>(std::move(result));
+    } catch (const std::bad_alloc&) {
+        if (created) {
+            try {
+                std::error_code ignored;
+                std::filesystem::remove_all(task_directory, ignored);
+            } catch (...) {
+                // Preserve allocation failure if orphan cleanup also fails.
+            }
+        }
+        return Result<Manifest, Error>(
+            unexpect, Error{ErrorCode::ResourceExhausted, Effects::None, {}});
     }
-    return Result<Manifest, Error>(Manifest(task_directory, std::move(data)));
 }
 
 Result<Manifest, Error> Manifest::load(const std::filesystem::path& task_directory) {
@@ -336,8 +379,7 @@ Result<Manifest, Error> Manifest::load(const std::filesystem::path& task_directo
     if (filesystem_error || !std::filesystem::is_regular_file(status) ||
         std::filesystem::is_symlink(status)) {
         return Result<Manifest, Error>(
-            unexpect,
-            storage_error("manifest is not a safe regular file"));
+            unexpect, storage_error("manifest is not a safe regular file"));
     }
 
     std::ifstream stream(path);
@@ -359,16 +401,19 @@ Result<Manifest, Error> Manifest::load(const std::filesystem::path& task_directo
 }
 
 Result<void, Error> Manifest::commit(ManifestData data) {
-    if (data_.manifest_revision == std::numeric_limits<std::uint64_t>::max()) {
+    if (poisoned_ || data_.manifest_revision == std::numeric_limits<std::uint64_t>::max()) {
+        poisoned_ = true;
         return Result<void, Error>(unexpect, storage_error("invalid manifest revision transition"));
     }
     if (data.manifest_revision != data_.manifest_revision + 1) {
+        poisoned_ = true;
         return Result<void, Error>(unexpect, storage_error("invalid manifest revision transition"));
     }
 
     const auto serialized = serialize(data);
     const auto persisted = write_durable(task_directory_ / "manifest.json", serialized);
     if (!persisted) {
+        poisoned_ = persisted.error().effects == Effects::Possible;
         return persisted;
     }
     data_ = std::move(data);

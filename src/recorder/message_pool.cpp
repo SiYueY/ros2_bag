@@ -45,14 +45,11 @@ std::shared_ptr<rclcpp::SerializedMessage> MessagePool::acquire() {
         --active_operations_;
     }
 
-    try {
-        return std::shared_ptr<rclcpp::SerializedMessage>(
-            std::addressof(nodes_.at(index)->message),
-            [this, index](rclcpp::SerializedMessage*) { release(index); });
-    } catch (...) {
-        release(index);
-        throw;
-    }
+    // shared_ptr invokes the supplied deleter if control-block allocation
+    // throws. Releasing again in a catch would double-return the pool node.
+    return std::shared_ptr<rclcpp::SerializedMessage>(
+        std::addressof(nodes_.at(index)->message),
+        [this, index](rclcpp::SerializedMessage*) { release(index); });
 }
 
 void MessagePool::begin_stop() {
@@ -65,9 +62,8 @@ void MessagePool::begin_stop() {
 
 bool MessagePool::wait_stopped_for(std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lock(mutex_);
-    return stopped_condition_.wait_for(lock, timeout, [this] {
-        return lifecycle_ == Lifecycle::Stopped;
-    });
+    return stopped_condition_.wait_for(
+        lock, timeout, [this] { return lifecycle_ == Lifecycle::Stopped; });
 }
 
 PoolState MessagePool::state() const {

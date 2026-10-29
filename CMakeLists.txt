@@ -1,5 +1,4 @@
-# Next-generation C++ implementation baseline. Recorder implementation targets
-# intentionally do not exist on this branch yet.
+# Unified C++17 build with Recorder implementation and verification targets.
 cmake_minimum_required(VERSION 3.16)
 project(ros2_bag VERSION 0.0.0 LANGUAGES CXX)
 
@@ -67,6 +66,19 @@ if(BUILD_TESTING)
       target_compile_options(recorder_foundation_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
     endif()
     add_test(NAME recorder_foundation_unit COMMAND recorder_foundation_test)
+
+    add_executable(recorder_correctness_test tests/unit/recorder/correctness_test.cpp)
+    target_link_libraries(recorder_correctness_test PRIVATE ros2_bag_recorder)
+    target_compile_options(recorder_correctness_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    target_link_options(recorder_correctness_test PRIVATE
+      -Wl,--wrap=fsync -Wl,--wrap=statvfs
+      -Wl,--wrap=_ZN8ros2_bag8recorder6Writer4openERKNSt10filesystem7__cxx114pathE
+      -Wl,--wrap=_ZN8ros2_bag8recorder6Writer14register_topicERKNS0_9TopicInfoE
+      -Wl,--wrap=_ZN8ros2_bag8recorder6Writer11write_batchERKSt6vectorINS0_15RecordedMessageESaIS3_EE
+      -Wl,--wrap=_ZN8ros2_bag8recorder6Writer5closeEv
+      -Wl,--wrap=_ZNSt6thread15_M_start_threadESt10unique_ptrINS_6_StateESt14default_deleteIS1_EEPFvvE)
+    add_test(NAME recorder_correctness_unit COMMAND recorder_correctness_test)
+    set_tests_properties(recorder_correctness_unit PROPERTIES TIMEOUT 90)
 
     add_executable(
       recorder_data_path_benchmark

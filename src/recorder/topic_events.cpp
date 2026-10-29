@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #include <cerrno>
 #include <cstring>
@@ -36,9 +37,7 @@ bool write_all(const int file, const char* bytes, std::size_t remaining) {
 }  // namespace
 
 TopicEvents::TopicEvents(
-    std::filesystem::path path,
-    std::string recording_id,
-    std::uint64_t generation,
+    std::filesystem::path path, std::string recording_id, std::uint64_t generation,
     std::uint64_t next_sequence)
 : path_(std::move(path)),
   recording_id_(std::move(recording_id)),
@@ -58,11 +57,16 @@ bool TopicEvents::terminal_matches(TopicEventType prepared, TopicEventType termi
 }
 
 Result<std::vector<TopicEvent>, Error> TopicEvents::read_events(const std::filesystem::path& path) {
+    std::error_code path_error;
+    const auto status = std::filesystem::symlink_status(path, path_error);
+    if (path_error || !std::filesystem::is_regular_file(status)) {
+        return Result<std::vector<TopicEvent>, Error>(
+            unexpect, storage_error("topic events is not a safe regular file"));
+    }
     std::ifstream input(path);
     if (!input) {
         return Result<std::vector<TopicEvent>, Error>(
-            unexpect,
-            storage_error("cannot open topic event file"));
+            unexpect, storage_error("cannot open topic event file"));
     }
 
     std::vector<TopicEvent> events;
@@ -132,8 +136,7 @@ Result<void, Error> TopicEvents::validate_chain(const std::vector<TopicEvent>& e
         if (prepared) {
             if (operations.find(event.operation_id) != operations.end()) {
                 return Result<void, Error>(
-                    unexpect,
-                    storage_error("duplicate topic operation prepared event"));
+                    unexpect, storage_error("duplicate topic operation prepared event"));
             }
             operations.emplace(
                 event.operation_id,
@@ -150,8 +153,7 @@ Result<void, Error> TopicEvents::validate_chain(const std::vector<TopicEvent>& e
         }
         if (!terminal_matches(operation->second.prepared, event.type)) {
             return Result<void, Error>(
-                unexpect,
-                storage_error("mismatched topic event transition"));
+                unexpect, storage_error("mismatched topic event transition"));
         }
         if (operation->second.topic_id != event.topic_id) {
             return Result<void, Error>(unexpect, storage_error("topic event id changed"));
@@ -166,13 +168,31 @@ Result<void, Error> TopicEvents::validate_chain(const std::vector<TopicEvent>& e
 }
 
 Result<TopicEvents, Error> TopicEvents::open(
-    const std::filesystem::path& task_directory,
-    std::string recording_id,
+    const std::filesystem::path& task_directory, std::string recording_id,
     std::uint64_t generation) {
     const auto path = task_directory / "topic_events.jsonl";
-    if (!std::filesystem::exists(path)) {
+    const auto status = std::filesystem::symlink_status(task_directory);
+    if (!std::filesystem::is_directory(status)) {
+        return Result<TopicEvents, Error>(unexpect, storage_error("unsafe task directory"));
+    }
+    const int file =
+        ::open(path.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0644);
+    if (file < 0) {
+        return Result<TopicEvents, Error>(unexpect, storage_error("cannot open topic events"));
+    }
+    struct stat metadata {};
+    const bool file_durable =
+        ::fstat(file, &metadata) == 0 && S_ISREG(metadata.st_mode) && ::fsync(file) == 0;
+    ::close(file);
+    const int directory =
+        ::open(task_directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    const bool durable = file_durable && directory >= 0 && ::fsync(directory) == 0;
+    if (directory >= 0) {
+        ::close(directory);
+    }
+    if (!durable) {
         return Result<TopicEvents, Error>(
-            TopicEvents(path, std::move(recording_id), generation, 1));
+            unexpect, storage_error("topic event file durability is uncertain", Effects::Possible));
     }
 
     const auto events = read_events(path);
@@ -182,8 +202,7 @@ Result<TopicEvents, Error> TopicEvents::open(
     for (const auto& event : events.value()) {
         if (event.recording_id != recording_id || event.generation != generation) {
             return Result<TopicEvents, Error>(
-                unexpect,
-                storage_error("topic event identity mismatch"));
+                unexpect, storage_error("topic event identity mismatch"));
         }
     }
 
@@ -198,8 +217,7 @@ Result<TopicEvents, Error> TopicEvents::open(
     }
     if (next == 0) {
         return Result<TopicEvents, Error>(
-            unexpect,
-            storage_error("topic event sequence exhausted"));
+            unexpect, storage_error("topic event sequence exhausted"));
     }
 
     return Result<TopicEvents, Error>(TopicEvents(path, std::move(recording_id), generation, next));
@@ -210,14 +228,11 @@ Result<std::uint64_t, Error> TopicEvents::append(TopicEvent event) {
         return Result<std::uint64_t, Error>(
             unexpect,
             Error{
-                ErrorCode::EventCommitFailed,
-                Effects::Possible,
-                "topic event chain is uncertain"});
+                ErrorCode::EventCommitFailed, Effects::Possible, "topic event chain is uncertain"});
     }
     if (next_sequence_ == std::numeric_limits<std::uint64_t>::max()) {
         return Result<std::uint64_t, Error>(
-            unexpect,
-            storage_error("topic event sequence exhausted"));
+            unexpect, storage_error("topic event sequence exhausted"));
     }
 
     event.event_seq = next_sequence_;
@@ -244,12 +259,15 @@ Result<std::uint64_t, Error> TopicEvents::append(TopicEvent event) {
     }
 
     const std::string line = value.dump() + "\n";
-    const int file = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    const int file =
+        ::open(path_.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0644);
     if (file < 0) {
         return Result<std::uint64_t, Error>(unexpect, storage_error(std::strerror(errno)));
     }
 
-    const bool durable = write_all(file, line.data(), line.size()) && ::fsync(file) == 0;
+    struct stat metadata {};
+    const bool durable = ::fstat(file, &metadata) == 0 && S_ISREG(metadata.st_mode) &&
+                         write_all(file, line.data(), line.size()) && ::fsync(file) == 0;
     const int saved_errno = errno;
     ::close(file);
     if (!durable) {
@@ -288,8 +306,7 @@ Result<TopicOperationState, Error> TopicEvents::operation_state(
         if (prepared_event) {
             if (prepared) {
                 return Result<TopicOperationState, Error>(
-                    unexpect,
-                    storage_error("duplicate prepared event"));
+                    unexpect, storage_error("duplicate prepared event"));
             }
             prepared = event;
             continue;
@@ -297,18 +314,15 @@ Result<TopicOperationState, Error> TopicEvents::operation_state(
 
         if (!prepared) {
             return Result<TopicOperationState, Error>(
-                unexpect,
-                storage_error("invalid topic event chain"));
+                unexpect, storage_error("invalid topic event chain"));
         }
         if (!terminal_matches(prepared->type, event.type)) {
             return Result<TopicOperationState, Error>(
-                unexpect,
-                storage_error("invalid topic event chain"));
+                unexpect, storage_error("invalid topic event chain"));
         }
         if (event.topic_id != prepared->topic_id || event.topic_epoch != prepared->topic_epoch) {
             return Result<TopicOperationState, Error>(
-                unexpect,
-                storage_error("invalid topic event chain"));
+                unexpect, storage_error("invalid topic event chain"));
         }
 
         if (event.type == TopicEventType::TopicAdded ||
